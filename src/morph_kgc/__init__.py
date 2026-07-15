@@ -1,133 +1,92 @@
 __author__ = "Julián Arenas-Guerrero"
-__credits__ = ["Julián Arenas-Guerrero"]
 __copyright__ = "Copyright © 2020 Julián Arenas-Guerrero"
-
 __license__ = "Apache-2.0"
 __maintainer__ = "Julián Arenas-Guerrero"
 __email__ = "arenas.guerrero.julian@outlook.com"
 
+"""
+morph-kgc — public library API
+================================
+The four public ``materialize*`` wrappers accept any of the input shapes
+supported by the new ``config`` sub-package:
 
-import sys
+- a file path (str / Path) to an INI config file
+- a raw INI string
+- a plain Python dict (flat or sectioned)
+- an already-constructed ``MorphConfig`` instance
+
+All execution logic lives in ``execution.pipeline.run_pipeline``.  Nothing
+related to DataFrames, mapping parsing, or source dispatching lives here.
+
+Usage::
+
+    import morph_kgc
+
+    # From an INI file
+    graph = morph_kgc.materialize("config.ini")
+
+    # From a dict (flat or sectioned)
+    graph = morph_kgc.materialize({
+        "CONFIGURATION": {"output_format": "N-QUADS"},
+        "MY_SOURCE":     {"mappings": "mapping.ttl", "db_url": "sqlite:///db"},
+    })
+
+    # Passing in-memory data
+    triples = morph_kgc.materialize_set("config.ini", python_source={"df": my_df})
+"""
+
 import logging
-import multiprocessing as mp
+import sys
+from typing import Any
 
-from rdflib import Graph
-from pyoxigraph import Store
-from io import BytesIO
-from itertools import repeat
-
-from .args_parser import load_config_from_command_line
-from .mapping.mapping_parser import retrieve_mappings, MappingParser
-from .materializer import _materialize_mapping_group_to_set
-from .args_parser import load_config_from_argument
-from .constants import RML_TRIPLES_MAP_CLASS, LOGGING_NAMESPACE
-from .mapping.yarrrml import load_yarrrml
-from pathlib import Path
-
+from .config.model import MorphConfig
+from .config.loaders import load_config
+from .constants.misc import LOGGING_NAMESPACE
+from .materializer.pipeline import materialize_pipeline
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
 
-def materialize_set(config, python_source=None):
-    config = load_config_from_argument(config)
+# ── Library-mode parallelization guard ───────────────────────────────────────
+# mp.Pool requires the 'fork' start method, only available on Linux.
+# Cap processes=1 when running as a library on macOS/Windows (see issue #94).
 
-    # parallelization when running as a library is only enabled for Linux see #94
-    if 'linux' not in sys.platform:
+def _apply_library_process_guard(config: MorphConfig) -> MorphConfig:
+    if "linux" not in sys.platform and config.is_multiprocessing_enabled():
         LOGGER.info(
-            f'Parallelization is not supported for {sys.platform} when running as a library. '
-            f'If you need to speed up your data integration pipeline, please run through the command line.')
-        config.set_number_of_processes('1')
-
-    rml_df, fnml_df, http_api_df = retrieve_mappings(config)
-    config.set('CONFIGURATION', 'http_api_df', http_api_df.to_csv())
-
-    # keep only asserted mapping rules
-    asserted_mapping_df = rml_df.loc[rml_df['triples_map_type'] == RML_TRIPLES_MAP_CLASS]
-    mapping_groups = [group for _, group in asserted_mapping_df.groupby(by='mapping_partition')]
-
-    if config.is_multiprocessing_enabled():
-        LOGGER.debug(f'Parallelizing with {config.get_number_of_processes()} cores.')
-
-        pool = mp.Pool(config.get_number_of_processes())
-        triples = set().union(*pool.starmap(_materialize_mapping_group_to_set,
-                                            zip(mapping_groups, repeat(rml_df), repeat(fnml_df), repeat(config),
-                                                repeat(python_source))))
-        pool.close()
-        pool.join()
-    else:
-        triples = set()
-        for mapping_group in mapping_groups:
-            triples.update(_materialize_mapping_group_to_set(mapping_group, rml_df, fnml_df, config, python_source))
-
-    LOGGER.info(f'Number of triples generated in total: {len(triples)}.')
-
-    return triples
+            "Parallelization is not supported for %r when running as a library "
+            "(see issue #94). Use the command line for multi-process "
+            "materialization.", sys.platform
+        )
+        # MorphConfig is a mutable dataclass — reassign the field directly.
+        object.__setattr__(config, "number_of_processes", 1)
+    return config
 
 
-def materialize(config, python_source=None):
-    triples = materialize_set(config, python_source)
+# ── Public API ────────────────────────────────────────────────────────────────
 
-    graph = Graph()
-    if triples:
-        rdf_ntriples = '.\n'.join(triples) + '.'
-        graph.parse(data=rdf_ntriples, format='nquads')
-
-    return graph
-
-
-def materialize_oxigraph(config, python_source=None):
-    triples = materialize_set(config, python_source)
-
-    graph = Store()
-    if triples:
-        rdf_ntriples = '.\n'.join(triples) + '.'
-        graph.bulk_load(BytesIO(rdf_ntriples.encode()), 'application/n-quads')
-
-    return graph
+def materialize_set(config: Any, python_source: dict | None = None) -> set[str]:
+    """
+    Materialize and return all triples as ``set[str]`` of N-Triples/N-Quads
+    lines (without the trailing `` .``).
+    """
+    cfg = _apply_library_process_guard(load_config(config))
+    return materialize_pipeline(cfg, python_source=python_source, output="set")
 
 
-def materialize_kafka(config, python_source=None):
-    from kafka import KafkaProducer
-
-    kafka_producer = None
-
-    try:
-        triples = materialize_set(config, python_source)
-        output_kafka_server = config.get_output_kafka_server()
-        output_kafka_topic = config.get_output_kafka_topic()
-
-        if not output_kafka_server or not output_kafka_topic:
-            LOGGER.error('Output Kafka server or topic is empty.')
-            sys.exit()
-
-        kafka_producer = KafkaProducer(bootstrap_servers=output_kafka_server)
-
-        if triples:
-            rdf_ntriples = '.\n'.join(triples) + '.'
-
-            # send the RDF triples to Kafka
-            kafka_producer.send(output_kafka_topic, value=rdf_ntriples.encode('utf-8'))
-
-        LOGGER.info(f'RDF triples materialized and sent to Kafka topic: {output_kafka_topic}.')
-    except Exception as e:
-            LOGGER.error(f'Error during materialization or Kafka publishing: {e}')
-    finally:
-        # close the Kafka producer
-        if kafka_producer:
-            kafka_producer.close()
+def materialize(config: Any, python_source: dict | None = None):
+    """
+    Materialize and return an ``rdflib.Graph`` populated with all generated
+    triples.
+    """
+    cfg = _apply_library_process_guard(load_config(config))
+    return materialize_pipeline(cfg, python_source=python_source, output="graph")
 
 
-def translate_to_rml(mapping_path):
-    parser = MappingParser(config=None)
-    mapping_graph = Graph()
-    mapping_path = Path(mapping_path)
-
-    if mapping_path.suffix in ['.ttl', '.rdf', '.nt']:
-        mapping_graph.parse(mapping_path, format='ttl')
-    elif mapping_path.suffix in ['.yml', '.yaml', '.yarrrml']:
-        mapping_graph = load_yarrrml(mapping_path)
-
-    mapping_graph = parser._normalize_mapping_graph(mapping_graph)
-    mapping_graph = parser._complete_and_validate_mapping(mapping_graph)
-
-    return mapping_graph
+def materialize_oxigraph(config: Any, python_source: dict | None = None):
+    """
+    Materialize and return a ``pyoxigraph.Store`` populated with all
+    generated triples.
+    """
+    cfg = _apply_library_process_guard(load_config(config))
+    return materialize_pipeline(cfg, python_source=python_source, output="oxigraph")

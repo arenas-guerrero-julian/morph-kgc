@@ -129,21 +129,13 @@ def get_references_in_fnml_execution(fnml_df, execution):
     return references
 
 
-def remove_non_printable_characters(string):
-    """
-    Eliminates from the input string all the characters that are not printable.
-    """
-
-    return ''.join(char for char in string if char.isprintable())
-
-
 def prepare_output_files(config, rml_df):
     """
     Remove the files that will be used to store the final knowledge graph. If a file path contains directories that do
     not exist, they are created.
     """
 
-    output_dir = config.get_output_dir()
+    output_dir = config.output_dir
     if output_dir:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -236,12 +228,12 @@ def normalize_oracle_identifier_casing(dataframe, references):
 
 
 def remove_null_values_from_dataframe(data, config, references, column=None):
-    if config.get_na_values():  # if there is some NULL values to replace
+    if config.na_values:  # if there is some NULL values to replace
         if column:
             # only replace nulls in the given column
-            data[column] = data[column].replace(config.get_na_values(), None)
+            data[column] = data[column].replace(config.na_values, None)
         else:
-            data = data.replace(config.get_na_values(), None)
+            data = data.replace(config.na_values, None)
         data = data.dropna(axis=0, how='any', subset=references if isinstance(references, str) else list(references))
 
     return data
@@ -270,7 +262,7 @@ def triples_to_file(triples, config, mapping_group=None):
     """
 
     from .constants import JELLY
-    if config.get_output_format() == JELLY:
+    if config.output_format == JELLY:
         raise RuntimeError(
             "triples_to_file() must not be used with output_format=JELLY. Use RDFLib/pyjelly serializer instead."
         )
@@ -283,36 +275,3 @@ def triples_to_file(triples, config, mapping_group=None):
         f.flush()
         os.fsync(f.fileno())
         f.close()
-
-
-def triples_to_kafka(triples, config):
-    """
-    Writes triples to Kafka.
-    """
-    from kafka import KafkaProducer
-
-    kafka_producer = None
-    output_kafka_server = config.get_output_kafka_server()
-    output_kafka_topic = config.get_output_kafka_topic()
-
-    if not output_kafka_server or not output_kafka_topic:
-        LOGGER.error('Output Kafka server or topic is empty.')
-        sys.exit()
-    try:
-        kafka_producer = KafkaProducer(bootstrap_servers=output_kafka_server)
-
-        if triples:
-            rdf_ntriples = '.\n'.join(triples)
-            rdf_ntriples += '.'
-
-            # send the triples to Kafka
-            kafka_producer.send(output_kafka_topic, value=rdf_ntriples.encode('utf-8'))
-
-        return len(triples)
-    except Exception as e:
-            LOGGER.error(f'Error during materialization or Kafka publishing: {e}')
-            return f'Error: {e}'
-    finally:
-        # close the Kafka producer
-        if kafka_producer:
-            kafka_producer.close()

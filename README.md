@@ -19,7 +19,7 @@
 - Transformation functions with **[RML-FNML](https://w3id.org/rml/fnml/spec)**, including **Python UDFs**.
 - [RDF-star](https://w3c.github.io/rdf-star/cg-spec/2021-12-17.html) generation with **[RML-star](https://w3id.org/rml/star/spec)**.
 - **[RML views](https://2023.eswc-conferences.org/wp-content/uploads/2023/05/paper_Arenas-Guerrero_2023_Boosting.pdf)** over tabular data sources and [JSON](https://www.json.org) files.
-- Integration with **[RDFLib](https://rdflib.readthedocs.io)**, **[Oxigraph](https://pyoxigraph.readthedocs.io/en)** and [Kafka](https://kafka-python.readthedocs.io).
+- Integration with **[RDFLib](https://rdflib.readthedocs.io)**, **[Oxigraph](https://pyoxigraph.readthedocs.io/en)**.
 - **Optimized** to materialize large knowledge graphs.
 - **Remote** data and mapping files.
 - Input data formats:
@@ -28,7 +28,7 @@
     - **Hierarchical files**: [JSON](https://www.json.org), [XML](https://www.w3.org/TR/xml/).
     - **In-memory data structures**: [Python Dictionaries](https://docs.python.org/3/tutorial/datastructures.html#dictionaries), [DataFrames](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html).
     - **Cloud data lake solutions**: [Databricks](https://www.databricks.com/), [Snowflake](https://www.snowflake.com/).
-    - **Property graph databases**: [Neo4j](https://neo4j.com/), [Kùzu](https://github.com/kuzudb/kuzu).
+    - **Property graph databases**: [Neo4j](https://neo4j.com/).
 
 ## Documentation :bookmark_tabs:
 
