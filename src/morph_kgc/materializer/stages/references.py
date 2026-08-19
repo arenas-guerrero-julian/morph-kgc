@@ -103,3 +103,20 @@ def collect_references(
                 refs.extend(collect_references(parent_rule, rml_mapping, only_subject_map=True))
 
     return set(refs)
+
+
+def collect_parent_references_in_join_conditions(
+    join_conditions: list[JoinCondition],
+) -> set[str]:
+    """
+    Return the set of parent references used in the given join conditions.
+
+    For each JoinCondition(child_value=..., parent_value=...), this returns
+    {parent_value}.
+    """
+    refs: set[str] = set()
+
+    for jc in join_conditions:
+        refs.add(jc.parent_value)
+
+    return refs

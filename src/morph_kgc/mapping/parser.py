@@ -12,7 +12,16 @@ from typing import Optional
 from ..constants import *
 from ..utils import *
 from ..source.relational import get_rdb_reference_datatype
-from .model import RMLMapping, RMLRule, LogicalSource, TermMap, JoinCondition, FNMLRule, HTTPAPIEntry
+from .model import (
+    RMLMapping,
+    RMLRule,
+    LogicalSource,
+    TermMap,
+    JoinCondition,
+    FNMLRule,
+    HTTPAPIEntry,
+)
+from ..functions.model import FNMLExecution, InputBinding, ValueBinding
 from .normalizer import normalize_mapping_graph, validate_mapping
 from .formats.rml import load_rml_graph
 from .formats.r2rml import r2rml_to_rml
@@ -353,6 +362,149 @@ def _build_join_conditions(join_dict_entry) -> list[JoinCondition]:
 # Graph → RMLMapping conversion
 ##############################################################################
 
+def _parse_fnml_execution(
+    mapping_graph,
+    execution_node,
+    cache,
+    visiting=None,
+):
+    if visiting is None:
+        visiting = set()
+
+    execution_id = str(execution_node)
+
+    if execution_id in cache:
+        return cache[execution_id]
+
+    if execution_id in visiting:
+        raise ValueError(
+            f"Cyclic FNML execution detected at {execution_id!r}."
+        )
+
+    visiting.add(execution_id)
+
+    function_map = mapping_graph.value(
+        execution_node,
+        rdflib.URIRef(RML_FUNCTION_MAP),
+    )
+    if function_map is None:
+        raise ValueError(
+            f"Execution {execution_id!r} has no rml:functionMap."
+        )
+
+    function_iri = mapping_graph.value(
+        function_map,
+        rdflib.URIRef(RML_CONSTANT),
+    )
+    if function_iri is None:
+        raise ValueError(
+            f"Execution {execution_id!r} has no function IRI."
+        )
+
+    execution = FNMLExecution(
+        execution_id=execution_id,
+        function_iri=str(function_iri),
+        inputs=[],
+    )
+
+    cache[execution_id] = execution
+
+    for input_node in mapping_graph.objects(
+        execution_node,
+        rdflib.URIRef(RML_INPUT),
+    ):
+        parameter_map = mapping_graph.value(
+            input_node,
+            rdflib.URIRef(RML_PARAMETER_MAP),
+        )
+        if parameter_map is None:
+            raise ValueError(
+                f"Execution {execution_id!r} has an input "
+                "without rml:parameterMap."
+            )
+
+        parameter_iri = mapping_graph.value(
+            parameter_map,
+            rdflib.URIRef(RML_CONSTANT),
+        )
+        if parameter_iri is None:
+            raise ValueError(
+                f"Execution {execution_id!r} has a parameter map "
+                "without rml:constant."
+            )
+
+        input_binding = InputBinding(
+            parameter_iri=str(parameter_iri),
+            values=[],
+        )
+
+        for value_map in mapping_graph.objects(
+            input_node,
+            rdflib.URIRef(RML_VALUE_MAP),
+        ):
+            input_binding.values.append(
+                _parse_fnml_value_map(
+                    mapping_graph,
+                    value_map,
+                    cache,
+                    visiting,
+                )
+            )
+
+        execution.inputs.append(input_binding)
+
+    visiting.remove(execution_id)
+    return execution
+
+
+def _parse_fnml_value_map(
+    mapping_graph,
+    value_map,
+    cache,
+    visiting,
+):
+    candidates = []
+
+    for map_type in (
+        RML_CONSTANT,
+        RML_TEMPLATE,
+        RML_REFERENCE,
+        RML_EXECUTION,
+    ):
+        for map_value in mapping_graph.objects(
+            value_map,
+            rdflib.URIRef(map_type),
+        ):
+            candidates.append((map_type, map_value))
+
+    if len(candidates) != 1:
+        raise ValueError(
+            f"Expected one value-map predicate for {value_map!r}, "
+            f"found {candidates!r}."
+        )
+
+    map_type, map_value = candidates[0]
+
+    if map_type == RML_EXECUTION:
+        nested_execution = _parse_fnml_execution(
+            mapping_graph=mapping_graph,
+            execution_node=map_value,
+            cache=cache,
+            visiting=visiting,
+        )
+
+        return ValueBinding(
+            map_type=map_type,
+            map_value=str(map_value),
+            nested_execution=nested_execution,
+        )
+
+    return ValueBinding(
+        map_type=map_type,
+        map_value=str(map_value),
+    )
+
+
 def _graph_to_rml_mapping(
     mapping_graph: rdflib.Graph,
     section_name: str,
@@ -423,13 +575,30 @@ def _graph_to_rml_mapping(
     fnml_rules: list[FNMLRule] = []
     for row in fnml_qr.bindings:
         s = _str_row(row)
-        fnml_rules.append(FNMLRule(
-            function_execution  = _req(s, 'function_execution'),
-            function_map_value  = _req(s, 'function_map_value'),
-            parameter_map_value = s.get('parameter_map_value'),
-            value_map_type      = s.get('value_map_type'),
-            value_map_value     = s.get('value_map_value'),
-        ))
+        fnml_rules.append(
+            FNMLRule(
+                function_execution=_req(s, "function_execution"),
+                function_map_value=_req(s, "function_map_value"),
+                parameter_map_value=s.get("parameter_map_value"),
+                value_map_type=s.get("value_map_type"),
+                value_map_value=s.get("value_map_value"),
+            )
+        )
+
+    # Build the execution registry (nested FNMLExecution objects).
+    fnml_executions: dict[str, FNMLExecution] = {}
+
+    for execution_node in set(
+        mapping_graph.subjects(
+            rdflib.URIRef(RML_FUNCTION_MAP),
+            None,
+        )
+    ):
+        _parse_fnml_execution(
+            mapping_graph=mapping_graph,
+            execution_node=execution_node,
+            cache=fnml_executions,
+        )
 
     # ── HTTP-API entries ──────────────────────────────────────────────────
     http_api_entries: list[HTTPAPIEntry] = []
@@ -443,9 +612,10 @@ def _graph_to_rml_mapping(
         ))
 
     return RMLMapping(
-        rules            = rules,
-        fnml_rules       = fnml_rules,
-        http_api_entries = http_api_entries,
+        rules=rules,
+        fnml_rules=fnml_rules,
+        fnml_executions=fnml_executions,
+        http_api_entries=http_api_entries,
     )
 
 
@@ -503,6 +673,7 @@ class MappingParser:
             partial = self._parse_data_source_mapping_files(section_name)
             self.rml_mapping.rules.extend(partial.rules)
             self.rml_mapping.fnml_rules.extend(partial.fnml_rules)
+            self.rml_mapping.fnml_executions.update(partial.fnml_executions)
             self.rml_mapping.http_api_entries.extend(partial.http_api_entries)
 
     def _parse_data_source_mapping_files(self, section_name: str) -> RMLMapping:
@@ -511,7 +682,8 @@ class MappingParser:
         g = normalize_mapping_graph(g)
         g = _translate_fnml_to_rml(g)
         g = validate_mapping(g)
-        return _graph_to_rml_mapping(g, section_name)
+        mapping = _graph_to_rml_mapping(g, section_name)
+        return mapping
 
     def _load_mapping_graph(self, section_name: str) -> rdflib.Graph:
         g = rdflib.Graph()

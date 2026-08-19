@@ -19,7 +19,8 @@ from collections.abc import Callable
 
 from .udf_loader import load_udfs
 from .bif_decorator import *
-from .grel import * # needed to populate bif_dict
+
+from .grel import *     # needed to populate bif_dict
 
 
 class FunctionRegistry:

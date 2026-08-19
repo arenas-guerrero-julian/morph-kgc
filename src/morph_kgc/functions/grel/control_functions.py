@@ -21,6 +21,7 @@ def controls_if(boolean_expression, value_true, value_false=None):
         else:
             return value_false
 
+
 @bif(
     fun_id="https://github.com/morph-kgc/morph-kgc/function/built-in.ttl#controls_if_cast",
     string="http://users.ugent.be/~bjdmeest/function/grel.ttl#bool_b",
@@ -43,36 +44,36 @@ def controls_if_cast(string, value_true, value_false=None):
 @bif(
     fun_id="http://users.ugent.be/~bjdmeest/function/grel.ttl#boolean_and",
     bool_input="http://users.ugent.be/~bjdmeest/function/grel.ttl#param_rep_b",
-    
 )
 def boolean_and(bool_input:list|str):
     if type(bool_input) == str:
         bool_input = [bool_input]
     return str(all([True if i.lower() in ["true", 1] else False for i in bool_input])).lower()
 
+
 @bif(
     fun_id="http://users.ugent.be/~bjdmeest/function/grel.ttl#boolean_or",
     bool_input="http://users.ugent.be/~bjdmeest/function/grel.ttl#param_rep_b",
-    
 )
 def boolean_and(bool_input:list|str):
     if type(bool_input) == str:
         bool_input = [bool_input]
     return str(any([True if i.lower() in ["true", 1] else False for i in bool_input])).lower()
+
+
 @bif(
     fun_id="http://users.ugent.be/~bjdmeest/function/grel.ttl#boolean_xor",
     bool_input="http://users.ugent.be/~bjdmeest/function/grel.ttl#param_rep_b",
-    
 )
 def boolean_xor(bool_input:list|str):
     if type(bool_input) == str:
         bool_input = [bool_input]
     return str(reduce(xor, [True if i.lower() in ["true", 1] else False for i in bool_input])).lower()
 
+
 @bif(
     fun_id="http://users.ugent.be/~bjdmeest/function/grel.ttl#boolean_not",
     bool_input="http://users.ugent.be/~bjdmeest/function/grel.ttl#bool_b",
-    
 )
 def boolean_not(bool_input):
     return str(not (True if bool_input.lower() in ["true", 1] else False)).lower()

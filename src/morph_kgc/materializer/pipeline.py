@@ -35,7 +35,7 @@ from ..mapping.parser import MappingParser
 from ..mapping.model import RMLMapping, RMLRule
 from .executor import Executor, make_executor
 from .stages.load import load_data
-from .stages.references import collect_references
+from .stages.references import collect_references, collect_parent_references_in_join_conditions
 from .stages.terms import materialize_terms
 from .stages.join import merge_data
 from .stages.assemble import assemble_triples
@@ -86,6 +86,7 @@ def materialize_rule(
     if om is not None and om.join_conditions:
         parent_rule = rml_mapping.get_rule(om.map_value)
         parent_refs = collect_references(parent_rule, rml_mapping, only_subject_map=True)
+        parent_refs.update(collect_parent_references_in_join_conditions(rule.object_.join_conditions))
         parent_data = load_data(config, parent_rule, parent_refs, python_source)
         data = merge_data(data, parent_data, om.join_conditions)
         data = materialize_terms(data, rule, rml_mapping, config, columns_alias="parent_")

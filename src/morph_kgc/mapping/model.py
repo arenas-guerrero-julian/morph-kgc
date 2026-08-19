@@ -22,6 +22,7 @@ __license__ = "Apache-2.0"
 
 from dataclasses import dataclass, field
 from typing import Optional
+from ..functions.model import FNMLExecution
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +167,7 @@ class HTTPAPIEntry:
 class RMLMapping:
     rules:            list[RMLRule]      = field(default_factory=list)
     fnml_rules:       list[FNMLRule]     = field(default_factory=list)
+    fnml_executions: dict[str, FNMLExecution] = field(default_factory=dict)
     http_api_entries: list[HTTPAPIEntry] = field(default_factory=list)
 
     def __len__(self):  return len(self.rules)

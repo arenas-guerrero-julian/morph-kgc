@@ -158,7 +158,13 @@ def _apply_fnml(
 ) -> pd.DataFrame:
     """Write serialised RDF term into data[position] for FNML execution maps."""
     fnml_df = _fnml_to_df(rml_mapping.fnml_rules)
-    data = execute_fnml(data, fnml_df, fnml_execution, config)
+    data =  execute_fnml(
+        data,
+        fnml_df,
+        fnml_execution,
+        config,
+        execution_registry=rml_mapping.fnml_executions,
+    )
     data[fnml_execution] = data[fnml_execution].astype(str)
 
     t = termtype.strip()

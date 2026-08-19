@@ -9,10 +9,6 @@ Parameter Resolver
 Converts FNMLExecution.inputs into the concrete per-row parameter arrays
 that the function callable expects.
 
-This was previously an inline block inside execute_fnml().  Extracting it
-here makes the execution step read top-to-bottom and allows independent
-unit-testing of the parameter-preparation logic.
-
 Public API
 ----------
 resolve_params(data, execution, config) -> dict[str, list]

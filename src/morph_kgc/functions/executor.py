@@ -33,7 +33,11 @@ from .param_resolver import resolve_params
 
 # ── legacy bridge ─────────────────────────────────────────────────────────────
 
-def _fnml_df_to_execution(fnml_df: pd.DataFrame, execution_id: str) -> FNMLExecution:
+def _fnml_df_to_execution(
+    fnml_df: pd.DataFrame,
+    execution_id: str,
+    execution_registry: dict[str, FNMLExecution] | None = None,
+) -> FNMLExecution:
     """
     Convert the legacy fnml_df slice for *execution_id* into an FNMLExecution.
     Called only by the bridge path; the new parser produces FNMLExecution directly.
@@ -52,10 +56,29 @@ def _fnml_df_to_execution(fnml_df: pd.DataFrame, execution_id: str) -> FNMLExecu
             continue
         if param not in inputs:
             inputs[param] = InputBinding(parameter_iri=param)
+        nested_execution = None
+
+        if row["value_map_type"] == RML_EXECUTION:
+            if execution_registry is None:
+                raise ValueError(
+                    "An execution registry is required for nested FNML functions."
+                )
+
+            nested_execution = execution_registry.get(
+                row["value_map_value"]
+            )
+
+            if nested_execution is None:
+                raise KeyError(
+                    f"Nested execution {row['value_map_value']!r} "
+                    "was not found in the execution registry."
+                )
+
         inputs[param].values.append(
             ValueBinding(
-                map_type  = row["value_map_type"],
-                map_value = row["value_map_value"],
+                map_type=row["value_map_type"],
+                map_value=row["value_map_value"],
+                nested_execution=nested_execution,
             )
         )
 
@@ -82,9 +105,23 @@ def _execute(
     # results are available as columns in data before resolving parameters.
     for ib in execution.inputs:
         for vb in ib.values:
-            if vb.map_type == RML_EXECUTION:
-                nested = _find_nested(execution, vb.map_value)
-                data   = _execute(data, nested, config, in_recursion=True)
+            if vb.map_type != RML_EXECUTION:
+                continue
+
+            nested = vb.nested_execution
+
+            if nested is None:
+                raise KeyError(
+                    f"Nested execution {vb.map_value!r} was not attached "
+                    f"to execution {execution.execution_id!r}."
+                )
+
+            data = _execute(
+                data,
+                nested,
+                config,
+                in_recursion=True,
+            )
 
     params     = resolve_params(data, execution, config, decorator_params)
     exec_res   = []
@@ -105,33 +142,15 @@ def _execute(
     return data
 
 
-def _find_nested(parent: FNMLExecution, nested_id: str) -> FNMLExecution:
-    """
-    Locate a nested FNMLExecution that was attached to the parent during
-    parsing. Raises KeyError when not found — indicates a mapping error.
-    """
-    for ib in parent.inputs:
-        for vb in ib.values:
-            if vb.map_type == RML_EXECUTION and hasattr(vb, "_resolved"):
-                if vb._resolved.execution_id == nested_id:
-                    return vb._resolved
-    # Fallback: nested executions are evaluated with their own FNMLExecution
-    # objects in the new model.  If we reach here the caller used the legacy
-    # bridge — raise so the bridge can handle it.
-    raise KeyError(
-        f"Nested execution {nested_id!r} not pre-resolved on parent "
-        f"{parent.execution_id!r}.  Use the legacy bridge path."
-    )
-
-
 # ── public API ────────────────────────────────────────────────────────────────
 
 def execute_fnml(
     data: pd.DataFrame,
     execution_or_df,
     execution_id: str | None = None,
-    config = None,
+    config=None,
     in_recursion: bool = False,
+    execution_registry: dict[str, FNMLExecution] | None = None,
 ) -> pd.DataFrame:
     """
     Execute an FNML function and write the result into data[execution_id].
@@ -155,6 +174,10 @@ def execute_fnml(
                 "execution_id must be provided when calling execute_fnml "
                 "with a DataFrame (legacy bridge mode)."
             )
-        execution = _fnml_df_to_execution(execution_or_df, execution_id)
+        execution = _fnml_df_to_execution(
+            execution_or_df,
+            execution_id,
+            execution_registry,
+        )
 
     return _execute(data, execution, config, in_recursion)
