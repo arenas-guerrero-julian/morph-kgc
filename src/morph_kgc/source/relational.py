@@ -212,7 +212,7 @@ def get_rdb_reference_datatype(config, logical_source, reference: str) -> str | 
         return None  # cannot inspect arbitrary SQL queries
 
     return _get_column_table_datatype(
-        config, logical_source.name, ls_value, reference
+        config, logical_source.config_section_name, ls_value, reference
     )
 
 # ── Adapter ───────────────────────────────────────────────────────────────────
@@ -231,7 +231,7 @@ class RelationalAdapter:
         if sql_query is None:
             return pd.DataFrame(columns=list(references))
 
-        conn, dialect = _relational_db_connection(config, rml_rule.logical_source.name)
+        conn, dialect = _relational_db_connection(config, rml_rule.logical_source.config_section_name)
         sql_query = _replace_query_enclosing_characters(sql_query, dialect)
 
         LOGGER.debug(

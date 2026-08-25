@@ -97,7 +97,7 @@ class LogicalSource:
     format_: str     # RDB, CSV, JSON, XML, PARQUET, …
     value_type: str  # rml:query, rml:tableName, rml:source
     value: str       # file path, table name, SPARQL endpoint URL, …
-    name: str        # config-file section name (data-source identifier)
+    config_section_name: str        # config-file section name
     iterator: Optional[str] = None
     reference_formulation: Optional[str] = None
 

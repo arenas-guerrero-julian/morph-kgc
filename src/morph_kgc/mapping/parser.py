@@ -528,11 +528,11 @@ def _graph_to_rml_mapping(
             triples_map_id   = _req(s, 'triples_map_id'),
             triples_map_type = _req(s, 'triples_map_type'),
             logical_source=LogicalSource(
-                format_     = '',   # resolved later in _complete_source_types
-                value_type  = _req(s, 'logical_source_type'),
-                value       = _req(s, 'logical_source_value'),
-                name        = section_name,
-                iterator    = s.get('iterator'),
+                format_                    = '',   # resolved later in _complete_source_types
+                value_type                 = _req(s, 'logical_source_type'),
+                value                      = _req(s, 'logical_source_value'),
+                config_section_name        = section_name,
+                iterator                   = s.get('iterator'),
                 reference_formulation    = s.get('reference_formulation'),
             ),
             subject=TermMap(
@@ -734,13 +734,13 @@ class MappingParser:
             if self.config.has_file_path(section):
                 fp = self.config.get_file_path(section)
                 for rule in self.rml_mapping.rules:
-                    if rule.logical_source.name == section:
+                    if rule.logical_source.config_section_name == section:
                         rule.logical_source.value_type  = RML_SOURCE
                         rule.logical_source.value = fp
 
     def _complete_source_types(self):
         for rule in self.rml_mapping.rules:
-            section  = rule.logical_source.name
+            section  = rule.logical_source.config_section_name
             ls       = rule.logical_source
             ref_form = ls.reference_formulation
 
@@ -888,7 +888,7 @@ class MappingParser:
 
         for rule in self.rml_mapping.rules:
             tid = rule.triples_map_id
-            src = rule.logical_source.name
+            src = rule.logical_source.config_section_name
             if tid in seen and seen[tid] != src:
                 raise Exception(
                     f'Triples map {tid!r} appears in more than one data source '

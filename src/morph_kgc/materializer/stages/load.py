@@ -27,7 +27,7 @@ def _fetch(config, rule: RMLRule, references: set[str], python_source) -> pd.Dat
 
 def _preprocess(data: pd.DataFrame, rule: RMLRule, references: set[str], config) -> pd.DataFrame:
     if rule.logical_source.format_ == RDB:
-        db_url = config.get_db_url(rule.logical_source.name)
+        db_url = config.get_db_url(rule.logical_source.config_section_name)
         if db_url.lower().startswith(ORACLE.lower()):
             data = normalize_oracle_identifier_casing(data, references)
     data = data.map(str)

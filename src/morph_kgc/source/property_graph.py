@@ -16,7 +16,7 @@ from typing import Any
 import pandas as pd
 
 def _fetch_pg(config, rml_rule) -> pd.DataFrame:
-    db_url = config.get_db_url(rml_rule.logical_source.name)
+    db_url = config.get_db_url(rml_rule.logical_source.config_section_name)
     query = rml_rule.logical_source.value
 
     import neo4j
