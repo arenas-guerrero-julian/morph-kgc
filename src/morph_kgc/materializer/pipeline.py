@@ -25,10 +25,8 @@ from io import BytesIO
 
 from rdflib import Graph
 
-from ..config.loaders import load_config
 from ..constants import (
     LOGGING_NAMESPACE,
-    RML_ASSERTED_TRIPLES_MAP_CLASS,
     RML_TRIPLES_MAP_CLASS,
 )
 from ..mapping.parser import MappingParser
@@ -149,14 +147,14 @@ def _asserted_groups(rml_mapping: RMLMapping) -> list[list[RMLRule]]:
     Return only the rule groups whose triples_map_type indicates asserted triples.
 
     In RML 1.2:
-      - rml:TriplesMap and rml:AssertedTriplesMap  -> asserted (included)
-      - rml:NonAssertedTriplesMap                  -> triple-term only (excluded)
+      - rml:TriplesMap               -> asserted (included)
+      - rml:NonAssertedTriplesMap    -> triple-term only (excluded)
 
     Groups are already built by the partitioner; we filter at the group level
     so that non-asserted rules are available for triple-term resolution inside
     materialize_group_* but never trigger their own top-level materialisation.
     """
-    asserted_types = {RML_TRIPLES_MAP_CLASS, RML_ASSERTED_TRIPLES_MAP_CLASS}
+    asserted_types = {RML_TRIPLES_MAP_CLASS}
     groups: dict[str, list[RMLRule]] = {}
 
     for rule in rml_mapping.rules:

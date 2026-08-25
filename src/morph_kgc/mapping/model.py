@@ -1,5 +1,5 @@
 """
-model.py – Typed dataclasses to represent parsed RML 1.2 rules.
+Typed dataclasses to represent parsed RML 1.2 rules.
 
 Hierarchy
 ---------
@@ -116,8 +116,7 @@ class RMLRule:
     triples_map_id : str
         IRI (or blank-node string) of the originating ``rml:TriplesMap``.
     triples_map_type : str
-        One of ``rml:TriplesMap`` (≡ ``rml:AssertedTriplesMap``) or
-        ``rml:NonAssertedTriplesMap``.
+        One of ``rml:TriplesMap`` or ``rml:NonAssertedTriplesMap``.
     logical_source : LogicalSource
     subject : TermMap
     predicate : Optional[TermMap]

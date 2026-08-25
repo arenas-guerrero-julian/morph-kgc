@@ -20,7 +20,6 @@ from .defaults import (
     DEFAULT_NA_VALUES,
     DEFAULT_MAPPING_PARTITIONING,
     DEFAULT_INFER_SQL_DATATYPES,
-    DEFAULT_ENFORCE_SQL_FILTER_NULL,
     DEFAULT_NUMBER_OF_PROCESSES,
     DEFAULT_UDFS,
     DEFAULT_API_TOKEN,
@@ -53,7 +52,7 @@ class DataSourceConfig:
 
     name: str
     mappings: list[str]
-    # Relational databases
+    # Databases
     db_url: str = ""
     connect_args: str = ""
     # File-based sources
@@ -101,19 +100,16 @@ class MorphConfig:
     output_dir: str = DEFAULT_OUTPUT_DIR
     output_format: str = DEFAULT_OUTPUT_FORMAT
 
-    # -- Serialization -------------------------------------------------------
+    # -- Data sources and serialization --------------------------------------
     safe_percent_encoding: str = DEFAULT_SAFE_PERCENT_ENCODING
     # Stored internally as list[str]; the loaders pass a comma-separated string
     # which ``__post_init__`` splits.
     literal_escaping_chars: list[str] = field(default_factory=list)
-
-    # -- Data sources (global) -----------------------------------------------
     na_values: list[str] = field(default_factory=list)
 
     # -- Mapping -------------------------------------------------------------
     mapping_partitioning: str = DEFAULT_MAPPING_PARTITIONING
     infer_sql_datatypes: bool = DEFAULT_INFER_SQL_DATATYPES
-    enforce_sql_filter_null: bool = DEFAULT_ENFORCE_SQL_FILTER_NULL
 
     # -- Execution -----------------------------------------------------------
     number_of_processes: int = DEFAULT_NUMBER_OF_PROCESSES
@@ -219,7 +215,7 @@ class MorphConfig:
             LOGGER.debug("DATA SOURCE '%s': mappings=%s", name, ds.mappings)
 
     # -----------------------------------------------------------------------
-    # Convenience predicates (mirror the original Config boolean methods)
+    # Convenience predicates
     # -----------------------------------------------------------------------
 
     def is_multiprocessing_enabled(self) -> bool:
@@ -241,27 +237,23 @@ class MorphConfig:
     def get_output_file_path(self, mapping_group: Optional[str] = None) -> str:
         """
         Returns the resolved output file path for a given mapping partition
-        group name.  Mirrors ``Config.get_output_file_path`` from the original
-        implementation.
+        group name.
         """
         extension = OUTPUT_FORMAT_FILE_EXTENSION[self.output_format]
 
         if self.output_dir:
-            file_name = mapping_group or self.output_file or "knowledge-graph"
+            file_name = mapping_group or self.output_file or DEFAULT_OUTPUT_FILE
             return Path(self.output_dir, file_name).with_suffix(extension).as_posix()
 
-        file_name = self.output_file or "knowledge-graph"
+        file_name = self.output_file or DEFAULT_OUTPUT_FILE
         return Path(file_name).with_suffix(extension).as_posix()
 
     # -----------------------------------------------------------------------
-    # Data source accessors (preserve the original interface used downstream)
+    # Data source accessors
     # -----------------------------------------------------------------------
 
     def get_data_sources_sections(self) -> list[str]:
         return list(self.data_sources.keys())
-
-    def has_multiple_data_sources(self) -> bool:
-        return len(self.data_sources) > 1
 
     def get_mappings_files(self, source_name: str) -> list[str]:
         return self.data_sources[source_name].mappings

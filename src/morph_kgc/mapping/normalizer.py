@@ -1,9 +1,5 @@
 """
-normalizer.py – Graph-level normalization of an RML 1.2 mapping graph.
-
-All functions that used to be private helpers inside ``mapping_parser.py``
-have been moved here and made public so they can be unit-tested and reused
-independently.
+Graph-level normalization of an RML 1.2 mapping graph.
 """
 
 __author__ = "Julián Arenas-Guerrero"
@@ -12,10 +8,8 @@ __license__ = "Apache-2.0"
 import rdflib
 
 from ..constants import (
-    RDF_TYPE,
     RDF_REIFIES,
     RML_TRIPLES_MAP_CLASS,
-    RML_ASSERTED_TRIPLES_MAP_CLASS,
     RML_NON_ASSERTED_TRIPLES_MAP_CLASS,
     RML_TRIPLE_TERM_MAP_CLASS,
     RML_TRIPLE_TERM,
@@ -148,7 +142,7 @@ def _expand_reifying_map_shortcut(mapping_graph: rdflib.Graph) -> rdflib.Graph:
     Expand ``?tmReif rml:reifyingMap ?tmBase``
     →  a full ``rdf:reifies`` predicate-object map with an ``rml:TripleTermMap``.
 
-    The shortcut is only legal when both triples maps share the same
+    The shortcut is only valid when both triples maps share the same
     logical source, so no join condition is added.
     """
 
@@ -313,15 +307,13 @@ def complete_triples_map_class(mapping_graph: rdflib.Graph) -> rdflib.Graph:
     Normalization policy:
     - Untyped triples maps become:
       * rml:NonAssertedTriplesMap if they have no predicate-object maps
-      * rml:AssertedTriplesMap otherwise
-    - Existing rml:AssertedTriplesMap / rml:NonAssertedTriplesMap typings are preserved
-    - Generic rml:TriplesMap typing is removed from the output graph
+      * rml:TriplesMap otherwise
+    - Existing rml:TriplesMap / rml:NonAssertedTriplesMap typings are preserved
     """
 
     RDF_TYPE = rdflib.RDF.type
     RML_POM_REF = rdflib.term.URIRef(RML_PREDICATE_OBJECT_MAP)
     RML_TM_REF = rdflib.term.URIRef(RML_TRIPLES_MAP_CLASS)
-    RML_ASSERTED_TM_REF = rdflib.term.URIRef(RML_ASSERTED_TRIPLES_MAP_CLASS)
     RML_NON_ASSERTED_TM_REF = rdflib.term.URIRef(RML_NON_ASSERTED_TRIPLES_MAP_CLASS)
 
     # All candidate triples maps: resources with a subject map
@@ -334,24 +326,25 @@ def complete_triples_map_class(mapping_graph: rdflib.Graph) -> rdflib.Graph:
     for (tm,) in list(mapping_graph.query(q)):
         types = set(mapping_graph.objects(tm, RDF_TYPE))
 
-        has_asserted = RML_ASSERTED_TM_REF in types
+        has_asserted = RML_TM_REF in types
         has_non_asserted = RML_NON_ASSERTED_TM_REF in types
+
+        # Infer subtype for previously untyped triples maps
+        has_pom = (tm, RML_POM_REF, None) in mapping_graph
+
+        # If typed but has no pom, replace TM class to non-asserted
+        if has_asserted and not has_pom:
+            mapping_graph.add((tm, RDF_TYPE, RML_NON_ASSERTED_TM_REF))
+            mapping_graph.remove((tm, RDF_TYPE, RML_TM_REF))
 
         # If already explicitly typed, leave it as is
         if has_asserted or has_non_asserted:
             continue
 
-        # Infer subtype for previously untyped triples maps
-        has_pom = (tm, RML_POM_REF, None) in mapping_graph
-
         if has_pom:
-            mapping_graph.add((tm, RDF_TYPE, RML_ASSERTED_TM_REF))
+            mapping_graph.add((tm, RDF_TYPE, RML_TM_REF))
         else:
             mapping_graph.add((tm, RDF_TYPE, RML_NON_ASSERTED_TM_REF))
-
-    # Remove generic rml:TriplesMap typing from all triples maps
-    for (tm,) in list(mapping_graph.query(q)):
-        mapping_graph.remove((tm, RDF_TYPE, RML_TM_REF))
 
     return mapping_graph
 

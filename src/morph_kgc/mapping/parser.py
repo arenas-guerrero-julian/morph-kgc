@@ -193,8 +193,6 @@ _FNML_PARSING_QUERY = """
 
 ##############################################################################
 # FNML graph-level translation
-# (tightly coupled to the graph before SPARQL extraction;
-#  does not belong in normalizer.py)
 ##############################################################################
 
 _FNML_FUNCTION_QUERY = """
@@ -789,12 +787,11 @@ class MappingParser:
 
     def _normalize_rml_12_triple_terms(self):
         """
-        Expand ``rml:tripleTermMap`` references (RML 1.2 replacement for.
+        Expand ``rml:tripleTermMap`` references.
 
         Iterates until fixed-point because a triple-term map can itself
         reference another triple-term map.
         """
-        # TODO: triple-term map pointing to a triples map with no predicate-object maps MUST NOT generate triples
         num_before = len(self.rml_mapping.rules)
         while True:
             self._expand_triple_term_references()

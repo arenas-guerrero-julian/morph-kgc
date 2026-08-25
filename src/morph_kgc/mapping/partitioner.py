@@ -9,7 +9,7 @@ import multiprocessing as mp
 from itertools import permutations
 
 from ..constants import *
-from .model import RMLMapping, RMLRule, TermMap
+from .model import RMLMapping, RMLRule
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
@@ -91,8 +91,7 @@ def _graph_invariant(rule: RMLRule) -> str:
 
 def _literal_type(rule: RMLRule) -> str:
     """
-    Return the literal type discriminator used for object partitioning.
-    Mirrors the DataFrame logic:
+    Return the literal type discriminator used for object partitioning:
       - if lang_datatype_map_type is REFERENCE or TEMPLATE → use lang_datatype
       - otherwise → use lang_datatype_map_value
     """
@@ -105,13 +104,12 @@ def _literal_type(rule: RMLRule) -> str:
 
 
 ##############################################################################
-# Internal data record (replaces DataFrame row access)
+# Internal data record
 ##############################################################################
 
 class _PartitionRecord:
     """
     Lightweight record holding one rule plus derived partition fields.
-    Avoids any Pandas dependency.
     """
     __slots__ = (
         'rule',

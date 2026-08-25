@@ -14,17 +14,17 @@ DEFAULT_OUTPUT_DIR: str = ""
 DEFAULT_OUTPUT_FORMAT: str = "N-TRIPLES"
 
 # ---------------------------------------------------------------------------
-# Serialization
+# Data sources and Serialization
 # ---------------------------------------------------------------------------
+# Set of ASCII characters that should not be percent encoded.
+# All characters are encoded by default.
 DEFAULT_SAFE_PERCENT_ENCODING: str = ""
 # Comma-separated list stored as a string so it survives round-trips through
 # INI files. The model converts it to list[str] on construction.
 # See issue #321: ",\,\n,\r are always escaped.
 DEFAULT_LITERAL_ESCAPING_CHARS: str = '",\n,\r'
-
-# ---------------------------------------------------------------------------
-# Data sources
-# ---------------------------------------------------------------------------
+# Set of values to be interpreted as NULL when retrieving data from the input
+# sources. The set of values must be separated by commas.
 # Empty string is valid (disables NA handling).
 DEFAULT_NA_VALUES: str = ",nan"
 
@@ -33,7 +33,6 @@ DEFAULT_NA_VALUES: str = ",nan"
 # ---------------------------------------------------------------------------
 DEFAULT_MAPPING_PARTITIONING: str = "PARTIAL-AGGREGATIONS"
 DEFAULT_INFER_SQL_DATATYPES: bool = False
-DEFAULT_ENFORCE_SQL_FILTER_NULL: bool = False
 
 # ---------------------------------------------------------------------------
 # Execution

@@ -1,6 +1,4 @@
 """
-config/loaders.py
-~~~~~~~~~~~~~~~~~
 Pure functions that construct a ``MorphConfig`` from different input sources:
 
     load_from_file(path)       ← INI config file path
@@ -41,7 +39,6 @@ from .defaults import (
     DEFAULT_NA_VALUES,
     DEFAULT_MAPPING_PARTITIONING,
     DEFAULT_INFER_SQL_DATATYPES,
-    DEFAULT_ENFORCE_SQL_FILTER_NULL,
     DEFAULT_NUMBER_OF_PROCESSES,
     DEFAULT_UDFS,
     DEFAULT_API_TOKEN,
@@ -59,19 +56,13 @@ _CONFIGURATION_KEYS = {
     "output_dir",
     "output_format",
     "safe_percent_encoding",
-    "only_printable_chars",
     "literal_escaping_chars",
     "na_values",
     "mapping_partitioning",
     "infer_sql_datatypes",
-    "enforce_sql_filter_null",
     "number_of_processes",
     "udfs",
     "api_token",
-    "output_kafka_server",
-    "output_kafka_topic",
-    "read_parsed_mappings_path",
-    "write_parsed_mappings_path",
     "logging_level",
     "logging_file",
 }
@@ -244,7 +235,6 @@ def _extract_configuration_options(parser: ConfigParser) -> dict[str, Any]:
         "na_values": get_nullable("na_values", DEFAULT_NA_VALUES),
         "mapping_partitioning": get("mapping_partitioning", DEFAULT_MAPPING_PARTITIONING),
         "infer_sql_datatypes": getbool("infer_sql_datatypes", DEFAULT_INFER_SQL_DATATYPES),
-        "enforce_sql_filter_null": getbool("enforce_sql_filter_null", DEFAULT_ENFORCE_SQL_FILTER_NULL),
         "number_of_processes": getint("number_of_processes", DEFAULT_NUMBER_OF_PROCESSES),
         "udfs": get_nullable("udfs", DEFAULT_UDFS),
         "api_token": get_nullable("api_token", DEFAULT_API_TOKEN),

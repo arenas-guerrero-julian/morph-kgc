@@ -22,7 +22,6 @@ RML_GRAPH_MAP_CLASS = f"{RML_NAMESPACE}GraphMap"
 RML_JOIN_CLASS = f"{RML_NAMESPACE}Join"
 
 # ── RML 1.2 triples-map subclasses ───────────────────────────────────────────
-RML_ASSERTED_TRIPLES_MAP_CLASS     = f"{RML_NAMESPACE}AssertedTriplesMap"
 RML_NON_ASSERTED_TRIPLES_MAP_CLASS = f"{RML_NAMESPACE}NonAssertedTriplesMap"
 
 # ── RML 1.2 triple-term map ───────────────────────────────────────────────────
