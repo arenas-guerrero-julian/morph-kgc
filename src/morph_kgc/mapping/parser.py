@@ -8,6 +8,7 @@ __license__ = "Apache-2.0"
 
 import copy
 from typing import Optional
+from collections import defaultdict
 
 from ..constants import *
 from ..utils import *
@@ -20,6 +21,7 @@ from .model import (
     JoinCondition,
     FNMLRule,
     HTTPAPIEntry,
+    HTTPAPIHeader,
 )
 from ..functions.model import FNMLExecution, InputBinding, ValueBinding
 from .normalizer import normalize_mapping_graph, validate_mapping
@@ -245,16 +247,18 @@ WHERE {
 
 # SPARQL query that extracts all HTTP-API source descriptions from the graph.
 _HTTP_API_QUERY = """
-PREFIX rml: <http://w3id.org/rml/>
-PREFIX htv: <http://www.w3.org/2011/http#>
+PREFIX rml:   <http://w3id.org/rml/>
+PREFIX htv:   <http://www.w3.org/2011/http#>
+PREFIX rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
 SELECT DISTINCT ?source ?absolute_path ?field_name ?field_value
 WHERE {
   ?source htv:absoluteURI ?absolute_path .
+
   OPTIONAL {
-    ?source   htv:headers   ?headers .
-    ?headers  htv:fieldName  ?field_name .
-    ?headers  htv:fieldValue ?field_value .
+    ?source htv:headers/rdf:rest*/rdf:first ?headerNode .
+    ?headerNode htv:fieldName ?field_name .
+    ?headerNode htv:fieldValue ?field_value .
   }
 }
 """
@@ -599,15 +603,31 @@ def _graph_to_rml_mapping(
         )
 
     # ── HTTP-API entries ──────────────────────────────────────────────────
-    http_api_entries: list[HTTPAPIEntry] = []
+    http_api_map: dict[tuple[str, str], list[tuple[str | None, str | None]]] = defaultdict(list)
+
     for row in mapping_graph.query(_HTTP_API_QUERY).bindings:
         s = _str_row(row)
-        http_api_entries.append(HTTPAPIEntry(
-            source        = _req(s, 'source'),
-            absolute_path = _req(s, 'absolute_path'),
-            field_name    = s.get('field_name'),
-            field_value   = s.get('field_value'),
-        ))
+        source = _req(s, "source")
+        absolute_path = _req(s, "absolute_path")
+        field_name = s.get("field_name")
+        field_value = s.get("field_value")
+
+        http_api_map[(source, absolute_path)].append((field_name, field_value))
+
+    http_api_entries: list[HTTPAPIEntry] = []
+    for (source, absolute_path), pairs in http_api_map.items():
+        headers = [
+            HTTPAPIHeader(field_name=fn, field_value=fv)
+            for fn, fv in pairs
+            if fn is not None and fv is not None
+        ]
+        http_api_entries.append(
+            HTTPAPIEntry(
+                source=source,
+                absolute_path=absolute_path,
+                headers=headers,
+            )
+        )
 
     return RMLMapping(
         rules=rules,

@@ -122,11 +122,6 @@ class MorphConfig:
     logging_level: str = DEFAULT_LOGGING_LEVEL
     logging_file: str = DEFAULT_LOGGING_FILE
 
-    # Internal: serialized http_api_df (set by the engine, not by the user).
-    # Kept here to preserve the existing inter-module contract during
-    # incremental refactoring.
-    _http_api_df_csv: str = field(default="", repr=False)
-
     # -----------------------------------------------------------------------
 
     def __post_init__(self) -> None:
@@ -275,16 +270,6 @@ class MorphConfig:
 
     def has_connect_args(self, source_name: str) -> bool:
         return self.data_sources[source_name].has_connect_args()
-
-    # -----------------------------------------------------------------------
-    # Internal engine setter (used by __init__.py during materialization)
-    # -----------------------------------------------------------------------
-
-    def set_http_api_df_csv(self, csv: str) -> None:
-        self._http_api_df_csv = csv
-
-    def get_http_api_df_csv(self) -> str:
-        return self._http_api_df_csv
 
 
 # ---------------------------------------------------------------------------

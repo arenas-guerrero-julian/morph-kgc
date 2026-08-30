@@ -226,6 +226,7 @@ class RelationalAdapter:
         rml_rule: Any,
         references: set[str],
         python_source: dict | None = None,
+        rml_mapping: Any | None = None,
     ) -> pd.DataFrame:
         sql_query = _build_sql_query(config, rml_rule, references)
         if sql_query is None:

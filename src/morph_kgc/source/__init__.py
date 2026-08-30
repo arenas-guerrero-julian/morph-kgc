@@ -10,7 +10,7 @@ DataSourceAdapters so callers only need:
     from morph_kgc.source import get_adapter
 
     adapter = get_adapter(source_type)          # KeyError if unknown
-    data    = adapter.get_data(config, rule, refs, python_source)
+    data    = adapter.get_data(config, rule, refs, python_source, rml_mapping)
 
 External packages can register new adapters without modifying this file::
 

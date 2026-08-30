@@ -38,5 +38,6 @@ class PropertyGraphAdapter:
         rml_rule: Any,
         references: set[str],
         python_source: dict | None = None,
+        rml_mapping: Any | None = None,
     ) -> pd.DataFrame:
         return _fetch_pg(config, rml_rule)

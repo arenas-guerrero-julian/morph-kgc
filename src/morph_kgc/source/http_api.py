@@ -14,11 +14,11 @@ The source type string "HTTPAPI" is registered in source/__init__.py.
 import importlib.util
 import os
 import sys
-from io import StringIO
 from typing import Any
 
 import pandas as pd
 from jsonpath import JSONPath
+from ..utils import normalize_hierarchical_data
 
 
 def _load_module_from_path(module_name: str, file_path: str):
@@ -30,52 +30,66 @@ def _load_module_from_path(module_name: str, file_path: str):
     return module
 
 
-def _fetch_http_api(config, rml_rule, references: set[str]) -> pd.DataFrame:
+def _fetch_http_api(config, rml_rule, references: set[str], rml_mapping) -> pd.DataFrame:
     import requests
 
-    http_api_df = pd.read_csv(StringIO(config.get("CONFIGURATION", "http_api_df")))
-    df = http_api_df[http_api_df["source"] == rml_rule.logical_source.value]
+    source_name = rml_rule.logical_source.value
 
-    absolute_path = list(df["absolute_path"])[0]
+    # Find the matching HTTPAPIEntry
+    entry = next(
+        (e for e in rml_mapping.http_api_entries if e.source == source_name),
+        None,
+    )
+    if entry is None:
+        raise KeyError(f"HTTP API entry {source_name!r} not found in mapping.")
+
+    absolute_path = entry.absolute_path
+
     payload: dict = {}
     headers: dict = {}
 
-    if "field_name" in df.columns:
-        for _, row in df.iterrows():
-            if row["field_name"] in os.environ:
-                field_value = row["field_value"].format(**os.environ)
-            else:
-                mod = _load_module_from_path("dynamic_api_token", config.get_api_token())
-                field_value = mod.get_api_token(arg1=row["field_value"])
+    for header in entry.headers:
+        field_name = header.field_name
+        field_value_raw = header.field_value
 
-            if row["field_name"].lower() in ["authorization", "accept", "keyid", "user-agent"]:
-                headers[row["field_name"]] = field_value
-            else:
-                payload[row["field_name"]] = field_value
+        # Skip malformed entries if any
+        if not field_name or not field_value_raw:
+            continue
+
+        if field_name in os.environ:
+            field_value = field_value_raw.format(**os.environ)
+        else:
+            mod = _load_module_from_path("dynamic_api_token", config.api_token)
+            field_value = mod.get_api_token(arg1=field_value_raw)
+
+        if field_name.lower() in ["authorization", "accept", "keyid", "user-agent"]:
+            headers[field_name] = field_value
+        else:
+            payload[field_name] = field_value
 
     json_data = requests.get(absolute_path, params=payload, headers=headers).json()
 
-    def _has_filter(ref: str) -> bool:
-        return "[?(" in ref
+    jsonpath_expression = rml_rule.logical_source.iterator + '.('
+    # add top level object of the references to reduce intermediate results (THIS IS NOT STRICTLY NECESSARY)
+    for reference in references:
+        jsonpath_expression += reference.split('.')[0] + ','
+    jsonpath_expression = jsonpath_expression[:-1] + ')'
 
-    simple_refs = [r for r in references if not _has_filter(r)]
-    filter_refs = [r for r in references if _has_filter(r)]
+    jsonpath_result = JSONPath(jsonpath_expression).parse(json_data)
+    # normalize and remove nulls
+    json_df = pd.json_normalize([
+        json_object
+        for json_object in normalize_hierarchical_data(jsonpath_result)
+        if None not in json_object.values()
+           and all(reference.split('.')[0] in json_object for reference in references)
+    ])
 
-    records = [
-        {r: match.object for r in simple_refs
-         for match in [next(iter(JSONPath(r).parse(item)), None)]
-         if match is not None}
-        for item in (json_data if isinstance(json_data, list) else [json_data])
-    ]
+    # add columns with null values for those references in the mapping rule that are not present in the data file
+    missing_references_in_df = list(set(references).difference(set(json_df.columns)))
+    json_df[missing_references_in_df] = None
+    json_df.dropna(axis=0, how='any', inplace=True)
 
-    result_df = pd.DataFrame(records, columns=list(simple_refs))
-
-    for fref in filter_refs:
-        matches = [m.object for m in JSONPath(fref).parse(json_data)]
-        if matches:
-            result_df[fref] = matches[0] if len(matches) == 1 else str(matches)
-
-    return result_df
+    return json_df
 
 class HttpApiAdapter:
     """DataSourceAdapter for HTTP API sources."""
@@ -86,5 +100,6 @@ class HttpApiAdapter:
         rml_rule: Any,
         references: set[str],
         python_source: dict | None = None,
+        rml_mapping: Any | None = None,
     ) -> pd.DataFrame:
-        return _fetch_http_api(config, rml_rule, references)
+        return _fetch_http_api(config, rml_rule, references, rml_mapping)

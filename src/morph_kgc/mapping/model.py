@@ -150,12 +150,18 @@ class FNMLRule:
 
 
 @dataclass(slots=True)
+class HTTPAPIHeader:
+    """A single header (field_name / field_value) for an HTTP API source."""
+    field_name:  str
+    field_value: str
+
+
+@dataclass(slots=True)
 class HTTPAPIEntry:
     """One HTTP-API source description."""
     source:        str
     absolute_path: str
-    field_name:    Optional[str] = None
-    field_value:   Optional[str] = None
+    headers:       list[HTTPAPIHeader] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

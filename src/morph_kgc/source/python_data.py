@@ -71,6 +71,7 @@ class PythonDataAdapter:
         rml_rule: Any,
         references: set[str],
         python_source: dict | None = None,
+        rml_mapping: Any | None = None,
     ) -> pd.DataFrame:
         refs        = list(references)
         source_key  = rml_rule.logical_source.value[1:-1]   # strip enclosing braces/quotes

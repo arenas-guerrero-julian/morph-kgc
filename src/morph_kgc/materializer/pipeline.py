@@ -75,7 +75,7 @@ def materialize_rule(
         (without a trailing newline).
     """
     references = collect_references(rule, rml_mapping)
-    data = load_data(config, rule, references, python_source)
+    data = load_data(config, rule, references, python_source, rml_mapping)
 
     if data.empty:
         return set()
@@ -85,7 +85,7 @@ def materialize_rule(
         parent_rule = rml_mapping.get_rule(om.map_value)
         parent_refs = collect_references(parent_rule, rml_mapping, only_subject_map=True)
         parent_refs.update(collect_parent_references_in_join_conditions(rule.object_.join_conditions))
-        parent_data = load_data(config, parent_rule, parent_refs, python_source)
+        parent_data = load_data(config, parent_rule, parent_refs, python_source, rml_mapping)
         data = merge_data(data, parent_data, om.join_conditions)
         data = materialize_terms(data, rule, rml_mapping, config, columns_alias="parent_")
     else:

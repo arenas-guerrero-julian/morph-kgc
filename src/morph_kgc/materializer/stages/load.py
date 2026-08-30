@@ -20,9 +20,9 @@ from ...utils import normalize_oracle_identifier_casing, remove_null_values_from
 from ...source import get_adapter
 
 
-def _fetch(config, rule: RMLRule, references: set[str], python_source) -> pd.DataFrame:
+def _fetch(config, rule: RMLRule, references: set[str], python_source, rml_mapping) -> pd.DataFrame:
     adapter = get_adapter(rule.logical_source.format_)
-    return adapter.get_data(config, rule, references, python_source)
+    return adapter.get_data(config, rule, references, python_source, rml_mapping)
 
 
 def _preprocess(data: pd.DataFrame, rule: RMLRule, references: set[str], config) -> pd.DataFrame:
@@ -42,7 +42,8 @@ def load_data(
     rule: RMLRule,
     references: set[str],
     python_source=None,
+    rml_mapping=None,
 ) -> pd.DataFrame:
     """Fetch and preprocess source data for *rule*."""
-    data = _fetch(config, rule, references, python_source)
+    data = _fetch(config, rule, references, python_source, rml_mapping)
     return _preprocess(data, rule, references, config)
