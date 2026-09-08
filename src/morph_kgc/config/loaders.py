@@ -9,7 +9,8 @@ Pure functions that construct a ``MorphConfig`` from different input sources:
 Each function is responsible for:
   1. Parsing the raw input into sections + key/value pairs.
   2. Resolving mapping file paths (files, directories, URLs).
-  3. Constructing ``DataSourceConfig`` objects for every non-CONFIGURATION section.
+  3. Constructing ``DataSourceConfig`` objects for every data-source section and
+     ``ResourceConfig`` objects for every ``[RESOURCE:<name>]`` section.
   4. Building and returning a validated ``MorphConfig``.
 
 Having the loaders as standalone functions (rather than classmethods) makes
@@ -42,10 +43,12 @@ from .defaults import (
     DEFAULT_NUMBER_OF_PROCESSES,
     DEFAULT_UDFS,
     DEFAULT_API_TOKEN,
+    DEFAULT_STATE_DIR,
     DEFAULT_LOGGING_LEVEL,
     DEFAULT_LOGGING_FILE,
 )
-from .model import DataSourceConfig, MorphConfig
+from ..constants.misc import RESOURCE_SECTION_PREFIX
+from .model import DataSourceConfig, MorphConfig, ResourceConfig
 
 # Name of the mandatory INI section that holds engine-level options.
 _CONFIGURATION_SECTION = "CONFIGURATION"
@@ -63,6 +66,7 @@ _CONFIGURATION_KEYS = {
     "number_of_processes",
     "udfs",
     "api_token",
+    "state_dir",
     "logging_level",
     "logging_file",
 }
@@ -70,16 +74,27 @@ _CONFIGURATION_KEYS = {
 # Keys that belong to data-source sections.
 _DATA_SOURCE_KEYS = {"mappings", "db_url", "connect_args", "file_path"}
 
+# Section-name prefix that marks an accessed resource instead of a data source,
+# e.g. ``[RESOURCE:disease_vocabulary]``.
+_RESOURCE_SECTION_PREFIX = RESOURCE_SECTION_PREFIX
+
+# Resource keys that are modelled as named ``ResourceConfig`` fields. Every
+# other key of the section is kept in ``ResourceConfig.options``.
+_RESOURCE_KEYS = {"resource_type", "url", "username", "password"}
+
 
 # ---------------------------------------------------------------------------
 # Public entry points
 # ---------------------------------------------------------------------------
 
-def load_config(source: str | os.PathLike | dict[str, Any]) -> MorphConfig:
+def load_config(source: MorphConfig | str | os.PathLike | dict[str, Any]) -> MorphConfig:
     """
     Accept a MorphConfig, a file path, a raw INI string, or a dict and
     return a validated MorphConfig.
     """
+    if isinstance(source, MorphConfig):
+        return source
+
     if isinstance(source, dict):
         return load_from_dict(source)
 
@@ -186,11 +201,13 @@ def _build_config(parser: ConfigParser) -> MorphConfig:
 
     Steps:
       1. Extract CONFIGURATION section options (with defaults).
-      2. Iterate over all other sections → build ``DataSourceConfig`` objects.
+      2. Iterate over all other sections → build ``DataSourceConfig`` and
+         ``ResourceConfig`` objects.
       3. Instantiate ``MorphConfig`` (triggers validation in ``__post_init__``).
     """
     cfg = _extract_configuration_options(parser)
     cfg["data_sources"] = _extract_data_sources(parser)
+    cfg["resources"] = _extract_resources(parser)
     return MorphConfig(**cfg)
 
 
@@ -238,6 +255,7 @@ def _extract_configuration_options(parser: ConfigParser) -> dict[str, Any]:
         "number_of_processes": getint("number_of_processes", DEFAULT_NUMBER_OF_PROCESSES),
         "udfs": get_nullable("udfs", DEFAULT_UDFS),
         "api_token": get_nullable("api_token", DEFAULT_API_TOKEN),
+        "state_dir": get_nullable("state_dir", DEFAULT_STATE_DIR),
         "logging_level": get("logging_level", DEFAULT_LOGGING_LEVEL),
         "logging_file": get_nullable("logging_file", DEFAULT_LOGGING_FILE),
     }
@@ -252,6 +270,8 @@ def _extract_data_sources(parser: ConfigParser) -> dict[str, DataSourceConfig]:
     for section in parser.sections():
         if section.upper() == _CONFIGURATION_SECTION:
             continue
+        if _is_resource_section(section):
+            continue
 
         mappings_raw = parser.get(section, "mappings", fallback="")
         mappings = _resolve_mapping_paths(mappings_raw)
@@ -265,6 +285,57 @@ def _extract_data_sources(parser: ConfigParser) -> dict[str, DataSourceConfig]:
         )
 
     return sources
+
+
+def _is_resource_section(section: str) -> bool:
+    """True when *section* declares an accessed resource, not a data source."""
+    return section.upper().startswith(_RESOURCE_SECTION_PREFIX)
+
+
+def _resource_section_name(section: str) -> str:
+    """``[RESOURCE:disease_vocabulary]`` → ``disease_vocabulary``."""
+    return section[len(_RESOURCE_SECTION_PREFIX):].strip()
+
+
+def _extract_resources(parser: ConfigParser) -> dict[str, ResourceConfig]:
+    """
+    Builds a ``ResourceConfig`` for every ``[RESOURCE:<name>]`` section.
+
+    Keys other than ``resource_type``, ``url``, ``username`` and ``password``
+    are kept verbatim in ``ResourceConfig.options``, so resource types defined
+    by user stateful functions need no engine changes.
+    """
+    resources: dict[str, ResourceConfig] = {}
+
+    for section in parser.sections():
+        if not _is_resource_section(section):
+            continue
+
+        name = _resource_section_name(section)
+        if not name:
+            raise ValueError(
+                f"Section '[{section}]' declares a resource without a name. "
+                f"Use '[{_RESOURCE_SECTION_PREFIX}<name>]'."
+            )
+        if name in resources:
+            raise ValueError(f"Resource '{name}' is declared more than once.")
+
+        options = {
+            key: value
+            for key, value in parser.items(section)
+            if key not in _RESOURCE_KEYS
+        }
+
+        resources[name] = ResourceConfig(
+            name=name,
+            resource_type=parser.get(section, "resource_type", fallback="").strip().upper(),
+            url=parser.get(section, "url", fallback="").strip(),
+            username=parser.get(section, "username", fallback=""),
+            password=parser.get(section, "password", fallback=""),
+            options=options,
+        )
+
+    return resources
 
 
 def _resolve_mapping_paths(raw: str) -> list[str]:

@@ -2,7 +2,10 @@ __author__ = "Julián Arenas-Guerrero"
 __license__ = "Apache-2.0"
 
 """
-FNML / FnO namespace constants.
+The grammar of a function call. The RDF predicates the parser looks for when reading a mapping graph:
+rml:functionExecution, rml:input, rml:functionMap, rml:parameterMap, rml:inputValueMap, their shortcut forms, the FnO 
+ontology terms, and the legacy fnml: namespace used as translation targets. These describe how a function call is 
+written in RML — they're identical no matter which function is being called. Consumed by code that parses mappings.
 
 FnO  — https://w3id.org/function/ontology#
 FNML — via RML namespace http://w3id.org/rml/

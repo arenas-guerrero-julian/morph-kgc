@@ -29,6 +29,7 @@ from ..constants import (
     LOGGING_NAMESPACE,
     RML_TRIPLES_MAP_CLASS,
 )
+from ..functions.state import initialize_contexts, release_contexts
 from ..mapping.parser import MappingParser
 from ..mapping.model import RMLMapping, RMLRule
 from .executor import Executor, make_executor
@@ -234,20 +235,29 @@ def materialize_pipeline(
 
     LOGGER.debug(f"Using executor: {type(executor).__name__}.")
 
-    # ── 6. Materialize + Serialize ────────────────────────────────────────
-    if output == "file":
-        results = executor.run(
-            groups, materialize_group_to_file, rml_mapping, config
-        )
-        total = sum(r for r in results if isinstance(r, int))
-        LOGGER.info(f"{total} triples written to file.")
-        return total
+    # ── 6. Shared context of stateful functions ───────────────────────────
+    # Initialized before any triple is materialized, and persisted to disk so
+    # that the worker processes read it back instead of rebuilding it.
+    context_session = initialize_contexts(config, rml_mapping)
 
-    # "set", "graph", "oxigraph" — all collect into a set first
-    results = executor.run(
-        groups, materialize_group_to_set, rml_mapping, config,
-        python_source=python_source,
-    )
+    try:
+        # ── 7. Materialize + Serialize ────────────────────────────────────
+        if output == "file":
+            results = executor.run(
+                groups, materialize_group_to_file, rml_mapping, config
+            )
+            total = sum(r for r in results if isinstance(r, int))
+            LOGGER.info(f"{total} triples written to file.")
+            return total
+
+        # "set", "graph", "oxigraph" — all collect into a set first
+        results = executor.run(
+            groups, materialize_group_to_set, rml_mapping, config,
+            python_source=python_source,
+        )
+    finally:
+        release_contexts(context_session)
+
     triples = _collect(results)
     LOGGER.info(f"{len(triples)} triples generated in total.")
 

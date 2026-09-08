@@ -42,5 +42,17 @@ Note that the **_paths_ parameters in the configuration file need to be updated*
 ### In-memory Data Structures
 Examples for [Python Dictionaries](https://docs.python.org/3/tutorial/datastructures.html#dictionaries) and [DataFrames](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html) can be found in [`dict`](https://github.com/morph-kgc/morph-kgc/tree/main/examples/dict) and [`dataframe`](https://github.com/morph-kgc/morph-kgc/tree/main/examples/dataframe) directories.
 
+### Reconciliation and Stateful Functions
+The directory [`reconciliation`](https://github.com/morph-kgc/morph-kgc/tree/main/examples/reconciliation) shows how to reconcile values of the input data against a SKOS vocabulary or a SPARQL endpoint. Both are _stateful_ functions: the vocabulary is fetched (or the endpoint queried) once, before any triple is materialized, and the resulting index is shared by every mapping rule and worker process.
+
+The accessed resource is declared in the configuration file with a `[RESOURCE:<name>]` section, so that URLs and credentials stay out of the mapping. The directory contains:
+- The `data` and `vocabulary` files.
+- The `mapping` file.
+- The `configuration` file, with the resource to reconcile against.
+- A `run.py` script and a `README` describing every option.
+
+[`stateful_udfs.py`](https://github.com/morph-kgc/morph-kgc/blob/main/examples/stateful_udfs.py) shows how to give a user-defined function a shared context of its own with the `@stateful_udf` decorator.
+
+
 ### Configuration Files
 The directory [`configuration-file`](https://github.com/morph-kgc/morph-kgc/tree/main/examples/configuration-file) contains some configuration files to run Morph-KGC with. [`default_config.ini`](https://github.com/morph-kgc/morph-kgc/blob/main/examples/configuration-file/default_config.ini) contains all possible configuration options along with their default values. Options that are not provided in the `CONFIGURATION` section will use the default values. You can see all the information about configuration files in the **[documentation](https://morph-kgc.readthedocs.io/en/latest/documentation/#configuration)**.

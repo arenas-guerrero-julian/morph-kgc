@@ -44,6 +44,9 @@ DEFAULT_NUMBER_OF_PROCESSES: int = 2 * mp.cpu_count()
 # ---------------------------------------------------------------------------
 DEFAULT_UDFS: str = ""
 DEFAULT_API_TOKEN: str = ""
+# Directory where the shared context of stateful functions is persisted.
+# Empty means a temporary directory created (and removed) for every run.
+DEFAULT_STATE_DIR: str = ""
 
 # ---------------------------------------------------------------------------
 # Logging

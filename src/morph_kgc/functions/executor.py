@@ -29,6 +29,7 @@ from ..utils import remove_null_values_from_dataframe
 from .model         import FNMLExecution, InputBinding, ValueBinding
 from .registry      import FunctionRegistry
 from .param_resolver import resolve_params
+from .state         import get_context
 
 
 # ── legacy bridge ─────────────────────────────────────────────────────────────
@@ -99,7 +100,7 @@ def _execute(
 ) -> pd.DataFrame:
     """Internal: evaluate *execution* against *data* rows."""
 
-    function, decorator_params = FunctionRegistry.get(execution.function_iri, config)
+    registered = FunctionRegistry.get(execution.function_iri, config)
 
     # Recursively evaluate any nested function executions first so their
     # results are available as columns in data before resolving parameters.
@@ -123,10 +124,21 @@ def _execute(
                 in_recursion=True,
             )
 
-    params     = resolve_params(data, execution, config, decorator_params)
-    exec_res   = []
+    params   = resolve_params(data, execution, config, registered.parameters)
+    function = registered.function
+
+    # The shared context of a stateful function is read once per execution and
+    # handed to the transformation function on every row.
+    fixed_params = {}
+    if registered.is_stateful:
+        fixed_params[registered.context_parameter] = get_context(
+            execution.function_iri, config
+        )
+
+    exec_res = []
     for i in range(len(data)):
         row_params = {k: v[i] for k, v in params.items()}
+        row_params.update(fixed_params)
         exec_res.append(function(**row_params))
 
     data[execution.execution_id] = exec_res

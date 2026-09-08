@@ -23,6 +23,7 @@ from .defaults import (
     DEFAULT_NUMBER_OF_PROCESSES,
     DEFAULT_UDFS,
     DEFAULT_API_TOKEN,
+    DEFAULT_STATE_DIR,
     DEFAULT_LOGGING_LEVEL,
     DEFAULT_LOGGING_FILE,
 )
@@ -73,6 +74,103 @@ class DataSourceConfig:
 
 
 # ---------------------------------------------------------------------------
+# Per-resource configuration
+# ---------------------------------------------------------------------------
+
+# Resource types understood by the built-in reconciliation functions. Any other
+# value is accepted as well, so that user-defined stateful functions can declare
+# resource types of their own.
+SKOS_VOCABULARY_RESOURCE = "SKOS_VOCABULARY"
+SPARQL_ENDPOINT_RESOURCE = "SPARQL_ENDPOINT"
+
+
+@dataclass(frozen=True)
+class ResourceConfig:
+    """
+    Holds all options for a single ``[RESOURCE:<name>]`` INI section.
+
+    A resource describes something the engine accesses while materializing but
+    that is not a data source: a SKOS vocabulary to reconcile against, a SPARQL
+    endpoint to query, ... Keeping them in the configuration file (instead of
+    in the mapping) decouples the mapping from deployment-specific details such
+    as URLs and credentials.
+
+    ``resource_type``, ``url``, ``username`` and ``password`` are common to all
+    resources; every other option of the section is kept verbatim in
+    ``options`` so that user-defined resource types need no engine changes.
+    """
+
+    name: str
+    resource_type: str = ""
+    url: str = ""
+    username: str = ""
+    password: str = ""
+    options: dict = field(default_factory=dict)
+
+    # -- Option accessors ---------------------------------------------------
+
+    def get(self, key: str, default: str = "") -> str:
+        """Return the (extra) option *key*, or *default* when not declared."""
+        value = self.options.get(key.lower())
+        return default if value is None or value == "" else value
+
+    def get_int(self, key: str, default: int) -> int:
+        value = self.get(key)
+        if not value:
+            return default
+        try:
+            return int(value)
+        except ValueError:
+            raise ValueError(
+                f"Option '{key}' of resource '{self.name}' must be an integer, "
+                f"got '{value}'."
+            )
+
+    def get_list(self, key: str) -> list[str]:
+        """Split a comma-separated option into a list of trimmed values."""
+        return [item.strip() for item in self.get(key).split(",") if item.strip()]
+
+    def has_credentials(self) -> bool:
+        return bool(self.username) or bool(self.password)
+
+    def identifiers(self) -> tuple[str, ...]:
+        """
+        Values, besides the section name, a mapping may use to name this
+        resource: the IRI that identifies it and the URL it is accessed at.
+        They differ when a vocabulary is published under a canonical IRI but
+        downloaded from somewhere else.
+        """
+        return tuple(
+            identifier
+            for identifier in (self.get("iri"), self.url)
+            if identifier
+        )
+
+    # -- Environment-variable expansion -------------------------------------
+
+    def get_url(self) -> str:
+        return self._expand_env("url", self.url)
+
+    def get_username(self) -> str:
+        return self._expand_env("username", self.username)
+
+    def get_password(self) -> str:
+        return self._expand_env("password", self.password)
+
+    def _expand_env(self, key: str, value: str) -> str:
+        """Expand ``{ENV_VAR}`` placeholders, as done for ``db_url``."""
+        if "{" not in value and "}" not in value:
+            return value
+        try:
+            return value.format(**os.environ)
+        except KeyError as exc:
+            raise ValueError(
+                f"Option '{key}' of resource '{self.name}' references the "
+                f"environment variable {exc.args[0]!r}, which is not set."
+            ) from exc
+
+
+# ---------------------------------------------------------------------------
 # Main configuration model
 # ---------------------------------------------------------------------------
 
@@ -94,6 +192,9 @@ class MorphConfig:
 
     # -- Data sources (required) ---------------------------------------------
     data_sources: dict[str, DataSourceConfig] = field(default_factory=dict)
+
+    # -- Accessed resources ([RESOURCE:<name>] sections) ----------------------
+    resources: dict[str, ResourceConfig] = field(default_factory=dict)
 
     # -- Output --------------------------------------------------------------
     output_file: str = DEFAULT_OUTPUT_FILE
@@ -117,6 +218,7 @@ class MorphConfig:
     # -- Functions / UDFs ----------------------------------------------------
     udfs: str = DEFAULT_UDFS
     api_token: str = DEFAULT_API_TOKEN
+    state_dir: str = DEFAULT_STATE_DIR
 
     # -- Logging -------------------------------------------------------------
     logging_level: str = DEFAULT_LOGGING_LEVEL
@@ -208,6 +310,11 @@ class MorphConfig:
         )
         for name, ds in self.data_sources.items():
             LOGGER.debug("DATA SOURCE '%s': mappings=%s", name, ds.mappings)
+        for name, resource in self.resources.items():
+            LOGGER.debug(
+                "RESOURCE '%s': resource_type=%s, url=%s",
+                name, resource.resource_type, resource.url,
+            )
 
     # -----------------------------------------------------------------------
     # Convenience predicates
@@ -270,6 +377,48 @@ class MorphConfig:
 
     def has_connect_args(self, source_name: str) -> bool:
         return self.data_sources[source_name].has_connect_args()
+
+    # -----------------------------------------------------------------------
+    # Resource accessors
+    # -----------------------------------------------------------------------
+
+    def get_resources_sections(self) -> list[str]:
+        return list(self.resources.keys())
+
+    def has_resource(self, resource_name: str) -> bool:
+        return resource_name in self.resources
+
+    def get_resource(self, resource_name: str) -> ResourceConfig:
+        """Return the resource declared as ``[RESOURCE:<resource_name>]``."""
+        return self.resources[resource_name]
+
+    def get_resources_of_type(self, resource_type: str) -> dict[str, ResourceConfig]:
+        """Return every declared resource whose ``resource_type`` matches."""
+        resource_type = resource_type.strip().upper()
+        return {
+            name: resource
+            for name, resource in self.resources.items()
+            if resource.resource_type == resource_type
+        }
+
+    def find_resource(self, reference: str) -> Optional[ResourceConfig]:
+        """
+        Resolve a resource by section name or, failing that, by the IRI that
+        identifies it (its ``iri`` option, falling back to its ``url``).
+
+        Resolving by IRI lets a mapping name the accessed vocabulary or
+        endpoint directly, while where it is fetched from and the credentials
+        it needs stay in the configuration file.
+        """
+        resource = self.resources.get(reference)
+        if resource is not None:
+            return resource
+
+        for resource in self.resources.values():
+            if reference in resource.identifiers():
+                return resource
+
+        return None
 
 
 # ---------------------------------------------------------------------------
