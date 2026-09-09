@@ -16,7 +16,7 @@ import pandas as pd
 import multiprocessing as mp
 
 from itertools import product
-from .constants import AUXILIAR_UNIQUE_REPLACING_STRING, LOGGING_NAMESPACE, RML_EXECUTION, RML_TEMPLATE, RML_REFERENCE
+from .constants import AUXILIAR_UNIQUE_REPLACING_STRING, LOGGING_NAMESPACE
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
@@ -88,14 +88,6 @@ def get_rml_rule(rml_df, triples_map_id):
     return rml_rule
 
 
-def get_fnml_execution(fnml_df, execution_id):
-    """
-    Retrieves FNML execution by its id.
-    """
-
-    return fnml_df[fnml_df['function_execution'] == execution_id]
-
-
 def get_references_in_template(template):
     """
     Retrieves all reference identifiers in a template-valued term map. References are returned in order of appearance
@@ -109,22 +101,6 @@ def get_references_in_template(template):
     references = [
         reference.replace(AUXILIAR_UNIQUE_REPLACING_STRING, '\\{').replace(AUXILIAR_UNIQUE_REPLACING_STRING, '\\}') for
         reference in references]
-
-    return references
-
-
-def get_references_in_fnml_execution(fnml_df, execution):
-    execution_rule_df = fnml_df[fnml_df['function_execution'] == execution]
-
-    references = []
-    for i, parameter in execution_rule_df.iterrows():
-        if parameter['value_map_type'] == RML_TEMPLATE:
-            references.extend(get_references_in_template(parameter['value_map_value']))
-        elif parameter['value_map_type'] == RML_REFERENCE:
-            # a list with one value
-            references.extend([parameter['value_map_value']])
-        elif parameter['value_map_type'] == RML_EXECUTION:
-            references.extend(get_references_in_fnml_execution(fnml_df, parameter['value_map_value']))
 
     return references
 

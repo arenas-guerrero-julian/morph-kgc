@@ -140,16 +140,6 @@ class RMLRule:
 
 
 @dataclass(slots=True)
-class FNMLRule:
-    """One FNML function-mapping entry."""
-    function_execution:   str
-    function_map_value:   str
-    parameter_map_value:  Optional[str] = None
-    value_map_type:       Optional[str] = None
-    value_map_value:      Optional[str] = None
-
-
-@dataclass(slots=True)
 class HTTPAPIHeader:
     """A single header (field_name / field_value) for an HTTP API source."""
     field_name:  str
@@ -171,8 +161,7 @@ class HTTPAPIEntry:
 @dataclass
 class RMLMapping:
     rules:            list[RMLRule]      = field(default_factory=list)
-    fnml_rules:       list[FNMLRule]     = field(default_factory=list)
-    fnml_executions: dict[str, FNMLExecution] = field(default_factory=dict)
+    fnml_executions:  dict[str, FNMLExecution] = field(default_factory=dict)
     http_api_entries: list[HTTPAPIEntry] = field(default_factory=list)
 
     def __len__(self):  return len(self.rules)

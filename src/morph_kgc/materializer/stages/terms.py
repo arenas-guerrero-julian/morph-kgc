@@ -27,25 +27,9 @@ from ...constants import (
     RML_LANGUAGE_MAP, RML_DATATYPE_MAP,
     XSD_BOOLEAN, XSD_DATETIME, XSD_INTEGER,
 )
-from ...mapping.model import RMLMapping, RMLRule, FNMLRule
+from ...mapping.model import RMLMapping, RMLRule
 from ...utils import get_references_in_template
 from ...functions import execute_fnml
-
-
-# ── FNML bridge ───────────────────────────────────────────────────────────────
-
-def _fnml_to_df(fnml_rules: list[FNMLRule]) -> pd.DataFrame:
-    """Build the narrow DataFrame that execute_fnml() expects, on demand."""
-    return pd.DataFrame([
-        {
-            "function_execution":  e.function_execution,
-            "function_map_value":  e.function_map_value,
-            "parameter_map_value": e.parameter_map_value,
-            "value_map_type":      e.value_map_type,
-            "value_map_value":     e.value_map_value,
-        }
-        for e in fnml_rules
-    ])
 
 
 # ── Literal escaping ──────────────────────────────────────────────────────────
@@ -157,14 +141,11 @@ def _apply_fnml(
     datatype: str = "",
 ) -> pd.DataFrame:
     """Write serialised RDF term into data[position] for FNML execution maps."""
-    fnml_df = _fnml_to_df(rml_mapping.fnml_rules)
-    data =  execute_fnml(
-        data,
-        fnml_df,
-        fnml_execution,
-        config,
-        execution_registry=rml_mapping.fnml_executions,
-    )
+    execution = rml_mapping.fnml_executions.get(fnml_execution)
+    if execution is None:
+        raise KeyError(f'Function execution {fnml_execution!r} not found in the mapping.')
+
+    data = execute_fnml(data, execution, config)
     data[fnml_execution] = data[fnml_execution].astype(str)
 
     t = termtype.strip()

@@ -19,7 +19,6 @@ from .model import (
     LogicalSource,
     TermMap,
     JoinCondition,
-    FNMLRule,
     HTTPAPIEntry,
     HTTPAPIHeader,
 )
@@ -45,10 +44,9 @@ def retrieve_mappings(config) -> RMLMapping:
     -------
     RMLMapping
         An :class:`~mapping.model.RMLMapping` instance containing typed
-        :class:`~mapping.model.RMLRule` objects, plus
-        :class:`~mapping.model.FNMLRule` and
-        :class:`~mapping.model.HTTPAPIEntry` lists populated directly from
-        the SPARQL query results.
+        :class:`~mapping.model.RMLRule` objects, plus the
+        :class:`~functions.model.FNMLExecution` registry and the
+        :class:`~mapping.model.HTTPAPIEntry` list.
     """
     parser = MappingParser(config)
     start = time.time()
@@ -160,35 +158,6 @@ _RML_JOIN_CONDITION_PARSING_QUERY = """
         ?term_map rml:joinCondition ?join_condition .
         ?join_condition rml:child  ?child_value ;
                         rml:parent ?parent_value .
-    }
-"""
-
-
-##############################################################################
-########################   FNML PARSING QUERY   ##############################
-##############################################################################
-
-_FNML_PARSING_QUERY = """
-    prefix rml: <http://w3id.org/rml/>
-
-    SELECT DISTINCT
-        ?function_execution ?function_map_value
-        ?parameter_map_value ?value_map_type ?value_map_value
-
-    WHERE {
-        ?function_execution rml:functionMap ?function_map .
-        ?function_map rml:constant ?function_map_value .
-
-        OPTIONAL {
-            ?function_execution rml:input ?input .
-            ?input rml:parameterMap  ?parameter_map .
-            ?parameter_map rml:constant ?parameter_map_value .
-            ?input rml:inputValueMap ?value_map .
-            ?value_map ?value_map_type ?value_map_value .
-            FILTER ( ?value_map_type IN (
-                rml:constant, rml:template, rml:reference,
-                rml:functionExecution ) ) .
-        }
     }
 """
 
@@ -519,7 +488,6 @@ def _graph_to_rml_mapping(
     """
     rml_qr  = mapping_graph.query(_RML_PARSING_QUERY)
     join_qr = mapping_graph.query(_RML_JOIN_CONDITION_PARSING_QUERY)
-    fnml_qr = mapping_graph.query(_FNML_PARSING_QUERY)
 
     jc_dict = _get_join_conditions_dict(join_qr)
 
@@ -573,21 +541,8 @@ def _graph_to_rml_mapping(
             ) if s.get('graph_map_type') else None,
         ))
 
-    # ── FNML rules ────────────────────────────────────────────────────────
-    fnml_rules: list[FNMLRule] = []
-    for row in fnml_qr.bindings:
-        s = _str_row(row)
-        fnml_rules.append(
-            FNMLRule(
-                function_execution=_req(s, "function_execution"),
-                function_map_value=_req(s, "function_map_value"),
-                parameter_map_value=s.get("parameter_map_value"),
-                value_map_type=s.get("value_map_type"),
-                value_map_value=s.get("value_map_value"),
-            )
-        )
-
-    # Build the execution registry (nested FNMLExecution objects).
+    # ── FNML executions ───────────────────────────────────────────────────
+    # The execution registry holds the (possibly nested) FNMLExecution objects.
     fnml_executions: dict[str, FNMLExecution] = {}
 
     for execution_node in set(
@@ -631,7 +586,6 @@ def _graph_to_rml_mapping(
 
     return RMLMapping(
         rules=rules,
-        fnml_rules=fnml_rules,
         fnml_executions=fnml_executions,
         http_api_entries=http_api_entries,
     )
@@ -690,7 +644,6 @@ class MappingParser:
         for section_name in self.config.get_data_sources_sections():
             partial = self._parse_data_source_mapping_files(section_name)
             self.rml_mapping.rules.extend(partial.rules)
-            self.rml_mapping.fnml_rules.extend(partial.fnml_rules)
             self.rml_mapping.fnml_executions.update(partial.fnml_executions)
             self.rml_mapping.http_api_entries.extend(partial.http_api_entries)
 
@@ -901,8 +854,8 @@ class MappingParser:
         more than one data source section.
 
         Also checks FNML integrity: every ``rml:functionExecution`` reference
-        in a subject or object map must resolve to a known
-        ``FNMLRule.function_execution``.
+        in a subject or object map must resolve to an execution of the
+        mapping's FNML execution registry.
         """
         seen: dict[str, str] = {}  # triples_map_id → logical_source.name
 
@@ -917,9 +870,7 @@ class MappingParser:
                 )
             seen[tid] = src
 
-        known_executions = {
-            entry.function_execution for entry in self.rml_mapping.fnml_rules
-        }
+        known_executions = set(self.rml_mapping.fnml_executions)
         for rule in self.rml_mapping.rules:
             for label, tm in (('subject', rule.subject), ('object', rule.object_)):
                 if tm and tm.map_type == RML_EXECUTION:
