@@ -12,12 +12,14 @@ The source type string "HTTPAPI" is registered in source/__init__.py.
 """
 
 import importlib.util
+import json
 import os
 import sys
 from typing import Any
 
 import pandas as pd
 from jsonpath import JSONPath
+from ..http import fetch
 from ..utils import normalize_hierarchical_data
 
 
@@ -31,8 +33,6 @@ def _load_module_from_path(module_name: str, file_path: str):
 
 
 def _fetch_http_api(config, rml_rule, references: set[str], rml_mapping) -> pd.DataFrame:
-    import requests
-
     source_name = rml_rule.logical_source.value
 
     # Find the matching HTTPAPIEntry
@@ -67,7 +67,19 @@ def _fetch_http_api(config, rml_rule, references: set[str], rml_mapping) -> pd.D
         else:
             payload[field_name] = field_value
 
-    json_data = requests.get(absolute_path, params=payload, headers=headers).json()
+    response = fetch(
+        absolute_path,
+        params      = payload,
+        headers     = headers,
+        description = "HTTP API",
+    )
+
+    try:
+        json_data = json.loads(response.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"The HTTP API '{absolute_path}' did not answer with JSON: {exc}."
+        ) from exc
 
     jsonpath_expression = rml_rule.logical_source.iterator + '.('
     # add top level object of the references to reduce intermediate results (THIS IS NOT STRICTLY NECESSARY)

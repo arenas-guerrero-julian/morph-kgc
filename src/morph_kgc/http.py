@@ -6,26 +6,29 @@ __license__ = "Apache-2.0"
 """
 HTTP access
 ===========
-Minimal HTTP client for the resources declared in ``[RESOURCE:<name>]`` config
-sections, and for the stateful functions that access them. It is built on
-``urllib`` so that fetching a vocabulary or querying a SPARQL endpoint needs no
-dependency beyond the standard library.
+The HTTP client of the engine: the resources declared in ``[RESOURCE:<name>]``
+config sections and the stateful functions that access them, and the HTTP API
+data sources. It is built on ``urllib`` so that fetching a vocabulary, querying
+a SPARQL endpoint or reading an HTTP API needs no dependency beyond the
+standard library.
 
 Supports HTTP Basic Authentication (preemptive: the ``Authorization`` header is
 sent with the first request, as required by endpoints that answer 401 without a
-``WWW-Authenticate`` challenge) and local paths, which are read from disk.
+``WWW-Authenticate`` challenge), query parameters, caller-supplied headers,
+transparent gzip decompression, and local paths, which are read from disk.
 
 Public API
 ----------
 fetch(url, ...)  -> Response(body: bytes, content_type: str)
 """
 
+import gzip
 import logging
 import os
 from base64 import b64encode
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from .constants import LOGGING_NAMESPACE
@@ -33,6 +36,10 @@ from .constants import LOGGING_NAMESPACE
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
 DEFAULT_TIMEOUT = 30
+
+# Only gzip is advertised: it is what servers actually serve, and it is the one
+# content encoding that the standard library can undo.
+ACCEPTED_ENCODING = "gzip"
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,8 @@ def fetch(
     username: str = "",
     password: str = "",
     accept: str = "",
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
     data: bytes | None = None,
     content_type: str = "",
     method: str = "",
@@ -73,25 +82,32 @@ def fetch(
     Retrieve *url* and return its body.
 
     Local paths are read from disk; everything else goes over the network with,
-    when credentials are given, HTTP Basic Authentication.
+    when credentials are given, HTTP Basic Authentication. *params* are added to
+    the query string, *headers* take precedence over the ones derived from the
+    other arguments, and gzipped responses are decompressed.
     """
     if not is_remote(url):
         return _read_file(url, description)
 
-    headers = basic_auth_header(username, password)
+    request_headers = basic_auth_header(username, password)
+    request_headers["Accept-Encoding"] = ACCEPTED_ENCODING
     if accept:
-        headers["Accept"] = accept
+        request_headers["Accept"] = accept
     if content_type:
-        headers["Content-Type"] = content_type
+        request_headers["Content-Type"] = content_type
+    if headers:
+        request_headers.update(headers)
 
-    request = Request(url, data=data, headers=headers, method=method or None)
+    url = _with_params(url, params)
+    request = Request(url, data=data, headers=request_headers, method=method or None)
 
     LOGGER.debug(f"Fetching {description} from '{url}'.")
 
     try:
         with urlopen(request, timeout=timeout) as response:      # noqa: S310
+            content_encoding = response.headers.get("Content-Encoding", "")
             return Response(
-                body=response.read(),
+                body=_decompress(response.read(), content_encoding, url, description),
                 content_type=response.headers.get_content_type() or "",
             )
     except HTTPError as exc:
@@ -105,6 +121,32 @@ def fetch(
     except URLError as exc:
         raise ValueError(
             f"Could not retrieve the {description} '{url}': {exc.reason}."
+        ) from exc
+
+
+def _with_params(url: str, params: dict[str, str] | None) -> str:
+    """Add *params* to the query string of *url*, keeping the ones already there."""
+    if not params:
+        return url
+
+    url_parts = urlsplit(url)
+    query = urlencode(params)
+    if url_parts.query:
+        query = f"{url_parts.query}&{query}"
+
+    return urlunsplit(url_parts._replace(query=query))
+
+
+def _decompress(body: bytes, content_encoding: str, url: str, description: str) -> bytes:
+    """Undo the content encoding of a response body."""
+    if content_encoding.lower() != "gzip":
+        return body
+
+    try:
+        return gzip.decompress(body)
+    except (OSError, EOFError) as exc:
+        raise ValueError(
+            f"Could not decompress the {description} '{url}': {exc}."
         ) from exc
 
 
