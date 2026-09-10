@@ -15,7 +15,7 @@ supported by the new ``config`` sub-package:
 - a plain Python dict (flat or sectioned)
 - an already-constructed ``MorphConfig`` instance
 
-All execution logic lives in ``execution.pipeline.run_pipeline``.  Nothing
+All execution logic lives in ``materializer.pipeline.materialize_pipeline``.  Nothing
 related to DataFrames, mapping parsing, or source dispatching lives here.
 
 Usage::

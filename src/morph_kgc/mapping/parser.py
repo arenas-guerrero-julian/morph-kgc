@@ -6,7 +6,6 @@ and partitioning of RML 1.2 mapping rules.
 __author__ = "Julián Arenas-Guerrero"
 __license__ = "Apache-2.0"
 
-import copy
 from typing import Optional
 from collections import defaultdict
 
@@ -674,7 +673,6 @@ class MappingParser:
         self._complete_rml_source_with_config_file_paths()
         self._complete_source_types()
         self._remove_delimiters_from_mappings()
-        self._normalize_rml_12_triple_terms()
         self._remove_self_joins_no_condition()
 
     def _drop_duplicates(self):
@@ -758,47 +756,6 @@ class MappingParser:
             elif rule.object_ and rule.object_.map_type == RML_REFERENCE:
                 rule.object_.map_value = _get_undelimited_identifier(rule.object_.map_value)
 
-    def _normalize_rml_12_triple_terms(self):
-        """
-        Expand ``rml:tripleTermMap`` references.
-
-        Iterates until fixed-point because a triple-term map can itself
-        reference another triple-term map.
-        """
-        num_before = len(self.rml_mapping.rules)
-        while True:
-            self._expand_triple_term_references()
-            num_after = len(self.rml_mapping.rules)
-            if num_after == num_before:
-                break
-            num_before = num_after
-
-    def _expand_triple_term_references(self):
-        tm_to_rules: dict[str, list[RMLRule]] = {}
-        for rule in self.rml_mapping.rules:
-            tm_to_rules.setdefault(rule.triples_map_id, []).append(rule)
-
-        new_rules: list[RMLRule] = []
-        for rule in self.rml_mapping.rules:
-            position = 'object_'
-            tm_map: Optional[TermMap] = getattr(rule, position)
-            if tm_map and tm_map.map_type == RML_TRIPLE_TERM_MAP:
-                for ref_rule in tm_to_rules.get(tm_map.map_value, []):
-                    new_rule = copy.deepcopy(rule)
-                    new_tm_map = copy.deepcopy(tm_map)
-                    new_tm_map.map_value = ref_rule.triples_map_id
-                    setattr(new_rule, position, new_tm_map)
-                    new_rules.append(new_rule)
-
-        if new_rules:
-            self.rml_mapping.rules = [
-                r for r in self.rml_mapping.rules
-                if not (
-                    (r.subject  and r.subject.map_type  == RML_TRIPLE_TERM_MAP) or
-                    (r.object_  and r.object_.map_type  == RML_TRIPLE_TERM_MAP)
-                )
-            ] + new_rules
-
     def _remove_self_joins_no_condition(self):
         for rule in self.rml_mapping.rules:
             if rule.object_ and rule.object_.map_type == RML_PARENT_TRIPLES_MAP:
@@ -879,3 +836,77 @@ class MappingParser:
                             f'Triples map {rule.triples_map_id!r} references unknown '
                             f'function execution {tm.map_value!r} in {label} map.'
                         )
+
+        self._validate_triple_term_maps()
+        self._validate_direction_maps()
+
+    def _validate_triple_term_maps(self):
+        """
+        Check the RML 1.2 rules on ``rml:tripleTermMap`` that hold for the
+        mapping as a whole: every reference resolves, and the directed graph of
+        references across all triples maps is acyclic. A cycle would describe a
+        triple term that contains itself.
+        """
+        known_triples_maps = {rule.triples_map_id for rule in self.rml_mapping.rules}
+        references: dict[str, set[str]] = defaultdict(set)
+
+        for rule in self.rml_mapping.rules:
+            object_map = rule.object_
+            if object_map is None or object_map.map_type != RML_TRIPLE_TERM_MAP:
+                continue
+            if object_map.map_value not in known_triples_maps:
+                raise Exception(
+                    f'Triples map {rule.triples_map_id!r} has an rml:tripleTermMap '
+                    f'pointing to unknown triples map {object_map.map_value!r}.'
+                )
+            references[rule.triples_map_id].add(object_map.map_value)
+
+        visiting: list[str] = []
+        visited: set[str] = set()
+
+        def walk(triples_map_id: str):
+            if triples_map_id in visiting:
+                cycle = ' -> '.join(visiting[visiting.index(triples_map_id):] + [triples_map_id])
+                raise Exception(
+                    f'The rml:tripleTermMap references of the mapping form a cycle: '
+                    f'{cycle}. This graph must be acyclic.'
+                )
+            if triples_map_id in visited:
+                return
+            visiting.append(triples_map_id)
+            for referenced in references[triples_map_id]:
+                walk(referenced)
+            visiting.pop()
+            visited.add(triples_map_id)
+
+        for triples_map_id in list(references):
+            walk(triples_map_id)
+
+    def _validate_direction_maps(self):
+        """
+        Check the RML 1.2 rules on base directions: a direction is only
+        meaningful next to a language, and a constant one must be a direction
+        token that RDF 1.2 defines. Reference- and template-valued direction
+        maps are checked per row while the terms are materialized.
+        """
+        for rule in self.rml_mapping.rules:
+            object_map = rule.object_
+            if object_map is None or object_map.direction_map_type is None:
+                continue
+
+            if object_map.lang_datatype != RML_LANGUAGE_MAP:
+                raise Exception(
+                    f'The object map of triples map {rule.triples_map_id!r} has a base '
+                    f'direction but no language. rml:directionMap and rml:direction '
+                    f'require rml:languageMap or rml:language on the same object map.'
+                )
+
+            if (
+                object_map.direction_map_type == RML_CONSTANT
+                and object_map.direction_map_value not in VALID_DIRECTIONS
+            ):
+                raise Exception(
+                    f'Invalid base direction {object_map.direction_map_value!r} in triples '
+                    f'map {rule.triples_map_id!r}. A direction must be one of '
+                    f'{" or ".join(VALID_DIRECTIONS)}.'
+                )

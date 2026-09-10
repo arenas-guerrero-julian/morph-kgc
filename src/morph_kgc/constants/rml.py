@@ -33,6 +33,11 @@ RML_TRIPLE_TERM              = f"{RML_NAMESPACE}TripleTerm"      # rml:termType 
 RML_DIRECTION_MAP      = f"{RML_NAMESPACE}directionMap"
 RML_DIRECTION_SHORTCUT = f"{RML_NAMESPACE}direction"
 
+# The only base directions RDF 1.2 defines.
+RML_DIRECTION_LTR = "ltr"
+RML_DIRECTION_RTL = "rtl"
+VALID_DIRECTIONS  = (RML_DIRECTION_LTR, RML_DIRECTION_RTL)
+
 # ── RML 1.2 reifyingMap shortcut ─────────────────────────────────────────────
 RML_REIFYING_MAP = f"{RML_NAMESPACE}reifyingMap"
 

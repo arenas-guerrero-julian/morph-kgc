@@ -105,7 +105,7 @@ def get_references_in_template(template):
     return references
 
 
-def prepare_output_files(config, rml_df):
+def prepare_output_files(config, rml_mapping):
     """
     Remove the files that will be used to store the final knowledge graph. If a file path contains directories that do
     not exist, they are created.
@@ -116,7 +116,7 @@ def prepare_output_files(config, rml_df):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        mapping_groups_names = set(rml_df['mapping_partition'])
+        mapping_groups_names = {rule.mapping_partition for rule in rml_mapping.rules}
         for mapping_group_name in mapping_groups_names:
             mapping_group_file_path = config.get_output_file_path(mapping_group_name)
             if os.path.exists(mapping_group_file_path):

@@ -49,6 +49,23 @@ def _refs_from_fnml(rml_mapping: RMLMapping, execution_id: str) -> list[str]:
     return _refs_from_execution(execution) if execution is not None else []
 
 
+def _refs_from_annotation(
+    map_type: str | None,
+    map_value: str | None,
+    rml_mapping: RMLMapping,
+) -> list[str]:
+    """Source references used by a language, datatype or direction term map."""
+    if not map_value:
+        return []
+    if map_type == RML_TEMPLATE:
+        return get_references_in_template(map_value)
+    if map_type == RML_REFERENCE:
+        return [map_value]
+    if map_type == RML_EXECUTION:
+        return _refs_from_fnml(rml_mapping, map_value)
+    return []
+
+
 def _refs_from_term_map(tm: TermMap | None, rml_mapping: RMLMapping) -> list[str]:
     if tm is None:
         return []
@@ -79,22 +96,28 @@ def collect_references(
 
     if not only_subject_map and rule.object_ is not None:
         om = rule.object_
-        if om.lang_datatype_map_type == RML_TEMPLATE and om.lang_datatype_map_value:
-            refs.extend(get_references_in_template(om.lang_datatype_map_value))
-        elif om.lang_datatype_map_type == RML_REFERENCE and om.lang_datatype_map_value:
-            refs.append(om.lang_datatype_map_value)
-        elif om.lang_datatype_map_type == RML_EXECUTION and om.lang_datatype_map_value:
-            refs.extend(_refs_from_fnml(rml_mapping, om.lang_datatype_map_value))
+        refs.extend(_refs_from_annotation(
+            om.lang_datatype_map_type, om.lang_datatype_map_value, rml_mapping,
+        ))
+        refs.extend(_refs_from_annotation(
+            om.direction_map_type, om.direction_map_value, rml_mapping,
+        ))
 
     if not only_subject_map and rule.object_ is not None:
         om = rule.object_
 
         if om.map_type == RML_TRIPLE_TERM_MAP:
-            base_rule = rml_mapping.get_rule(om.map_value)  # rml:tripleTermMap target
-            refs.extend(collect_references(base_rule, rml_mapping))  # full pattern, not subject-only
             if om.join_conditions:
+                # the base triples map is read from its own logical source, so
+                # only the child side of the join comes from this rule's data
                 child_refs, _ = join_pairs(om.join_conditions)
                 refs.extend(child_refs)
+            else:
+                # same logical iteration: the base triples map's term maps are
+                # evaluated on this rule's own data, so every reference of
+                # every one of its rules must be present here
+                for base_rule in rml_mapping.get_rules(om.map_value):
+                    refs.extend(collect_references(base_rule, rml_mapping))
 
         elif om.map_type == RML_PARENT_TRIPLES_MAP:
             parent_rule = rml_mapping.get_rule(om.map_value)

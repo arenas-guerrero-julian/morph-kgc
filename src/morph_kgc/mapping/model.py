@@ -173,3 +173,15 @@ class RMLMapping:
             if rule.triples_map_id == triples_map_id:
                 return rule
         raise KeyError(f"Triples map {triples_map_id!r} not found.")
+
+    def get_rules(self, triples_map_id: str) -> list[RMLRule]:
+        """
+        Every rule of a triples map, one per predicate-object map.
+
+        A triple-term map needs all of them: RML 1.2 has each predicate-object
+        map of the base triples map contribute its own triple term.
+        """
+        rules = [rule for rule in self.rules if rule.triples_map_id == triples_map_id]
+        if not rules:
+            raise KeyError(f"Triples map {triples_map_id!r} not found.")
+        return rules

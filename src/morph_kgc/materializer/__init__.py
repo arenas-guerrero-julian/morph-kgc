@@ -9,15 +9,13 @@ Unified submodule that replaces the former separate ``execution`` and
 
 Public surface
 --------------
-from morph_kgc.materializer import (
-    materialize_set,
-    materialize,
-    materialize_oxigraph,
-)
+from morph_kgc.materializer import materialize_pipeline
 
-For advanced use (custom executors, output routing):
+The ``materialize_set`` / ``materialize`` / ``materialize_oxigraph`` wrappers
+that most callers want live in ``morph_kgc`` itself. For advanced use (custom
+executors, output routing):
 
-from morph_kgc.materializer.pipeline import run_pipeline
+from morph_kgc.materializer.pipeline import materialize_pipeline
 from morph_kgc.materializer.executor import make_executor, Executor
 """
 

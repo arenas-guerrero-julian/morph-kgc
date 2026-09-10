@@ -7,6 +7,8 @@ __license__ = "Apache-2.0"
 Layout
 ------
 Section A — Group-level materialization
+    _triple_term_chains()           the base rules an rml:tripleTermMap resolves to
+    _join_triple_term_chain()       joins the sources a chain of triple terms spans
     materialize_rule()              one rule  -> set[str] of N-Triples/N-Quads
     materialize_group_to_set()      one partition -> set[str]
     materialize_group_to_file()     one partition -> int  (triples written)
@@ -28,10 +30,12 @@ from rdflib import Graph
 from ..constants import (
     LOGGING_NAMESPACE,
     RML_TRIPLES_MAP_CLASS,
+    RML_TRIPLE_TERM_MAP,
 )
 from ..functions.state import initialize_contexts, release_contexts
 from ..mapping.parser import MappingParser
 from ..mapping.model import RMLMapping, RMLRule
+from ..utils import prepare_output_files
 from .executor import Executor, make_executor
 from .stages.load import load_data
 from .stages.references import collect_references, collect_parent_references_in_join_conditions
@@ -44,6 +48,36 @@ LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 # =============================================================================
 # Section A — Group-level materialization
 # =============================================================================
+
+def _triple_term_chains(term_map, rml_mapping: RMLMapping) -> list[list[RMLRule]]:
+    """
+    Every chain of base rules an ``rml:tripleTermMap`` resolves to, one per
+    triple term it generates.
+
+    RML 1.2 has each predicate-object map of the base triples map contribute
+    its own triple term, so a base triples map with several of them yields
+    several chains. The first rule of a chain supplies the triple term itself
+    and any further ones supply the nested triple terms of its object. A base
+    triples map with no predicate-object map contributes no chain at all, which
+    is how "a triple-term map pointing to a triples map with no
+    predicate-object maps generates no triple term" falls out.
+    """
+    chains: list[list[RMLRule]] = []
+
+    for base_rule in rml_mapping.get_rules(term_map.map_value):
+        if base_rule.predicate is None or base_rule.object_ is None:
+            continue
+        nested_map = base_rule.object_
+        if nested_map.map_type == RML_TRIPLE_TERM_MAP:
+            chains.extend(
+                [base_rule] + nested
+                for nested in _triple_term_chains(nested_map, rml_mapping)
+            )
+        else:
+            chains.append([base_rule])
+
+    return chains
+
 
 def materialize_rule(
     rule: RMLRule,
@@ -75,6 +109,81 @@ def materialize_rule(
         Each element is a complete, serialized N-Triple / N-Quad line
         (without a trailing newline).
     """
+    object_map = rule.object_
+
+    if object_map is not None and object_map.map_type == RML_TRIPLE_TERM_MAP:
+        # one pass per triple term the base triples map contributes
+        triples: set[str] = set()
+        for chain in _triple_term_chains(object_map, rml_mapping):
+            triples |= _materialize(
+                rule, rml_mapping, config, python_source, nest_level, chain,
+            )
+        return triples
+
+    return _materialize(rule, rml_mapping, config, python_source, nest_level, None)
+
+
+def _join_triple_term_chain(
+    data,
+    rule: RMLRule,
+    chain: list[RMLRule],
+    rml_mapping: RMLMapping,
+    config,
+    python_source,
+):
+    """
+    Bring in the logical source of every base rule in *chain* whose triple-term
+    map joins against it, and report the column prefix each base rule's term
+    maps must read.
+
+    RML 1.2 evaluates the child maps of a join condition over the logical
+    source of the triples map carrying the triple-term map, and the parent maps
+    over the logical source of the base triples map. Down a chain of nested
+    triple terms that child source is the level above, so each join merges onto
+    the columns the previous one brought in. A level without a join condition
+    stays on the data at hand, which is what "evaluated on the current logical
+    iteration" means there.
+    """
+    # the term map that introduces each base rule: the rule's own object map
+    # for the first, then the object map of the base rule above it
+    term_maps = [rule.object_] + [base_rule.object_ for base_rule in chain[:-1]]
+
+    aliases: list[str] = []
+    current_alias = ""
+    joins = 0
+
+    for term_map, base_rule in zip(term_maps, chain):
+        if term_map.join_conditions:
+            joins += 1
+            parent_alias = "parent_" if joins == 1 else f"parent{joins}_"
+
+            parent_refs = collect_references(base_rule, rml_mapping)
+            parent_refs.update(
+                collect_parent_references_in_join_conditions(term_map.join_conditions)
+            )
+            parent_data = load_data(
+                config, base_rule, parent_refs, python_source, rml_mapping,
+            )
+            data = merge_data(
+                data, parent_data, term_map.join_conditions,
+                parent_prefix=parent_alias, child_prefix=current_alias,
+            )
+            current_alias = parent_alias
+
+        aliases.append(current_alias)
+
+    return data, aliases
+
+
+def _materialize(
+    rule: RMLRule,
+    rml_mapping: RMLMapping,
+    config,
+    python_source,
+    nest_level: int,
+    triple_term_chain: list[RMLRule] | None,
+) -> set[str]:
+    """Materialize *rule*, building one specific triple term when given a chain."""
     references = collect_references(rule, rml_mapping)
     data = load_data(config, rule, references, python_source, rml_mapping)
 
@@ -82,13 +191,27 @@ def materialize_rule(
         return set()
 
     om = rule.object_
-    if om is not None and om.join_conditions:
+
+    if triple_term_chain is not None:
+        data, aliases = _join_triple_term_chain(
+            data, rule, triple_term_chain, rml_mapping, config, python_source,
+        )
+        if data.empty:
+            return set()
+        data = materialize_terms(
+            data, rule, rml_mapping, config,
+            triple_term_chain=triple_term_chain, triple_term_aliases=aliases,
+        )
+
+    elif om is not None and om.join_conditions:
+        # a referencing object map derives its term from the parent's subject alone
         parent_rule = rml_mapping.get_rule(om.map_value)
         parent_refs = collect_references(parent_rule, rml_mapping, only_subject_map=True)
-        parent_refs.update(collect_parent_references_in_join_conditions(rule.object_.join_conditions))
+        parent_refs.update(collect_parent_references_in_join_conditions(om.join_conditions))
         parent_data = load_data(config, parent_rule, parent_refs, python_source, rml_mapping)
         data = merge_data(data, parent_data, om.join_conditions)
         data = materialize_terms(data, rule, rml_mapping, config, columns_alias="parent_")
+
     else:
         data = materialize_terms(data, rule, rml_mapping, config)
 
@@ -124,11 +247,16 @@ def materialize_group_to_file(
     if not triples:
         return 0
 
-    output_path = config.get_output_file_path()
-    separator = "\n"
+    # Rules are partitioned by mapping_partition, so every rule in the group
+    # writes to the same file. With no output_dir the name is ignored and all
+    # groups append to the single configured output file.
+    mapping_group = group[0].mapping_partition if group else None
+    output_path = config.get_output_file_path(mapping_group)
 
+    # The materialized triples carry no statement terminator, and in N-Quads
+    # output they end with the graph term, which is empty for the default graph.
     with open(output_path, "a", encoding="utf-8") as fh:
-        fh.write(separator.join(triples) + separator)
+        fh.write("".join(f"{triple.rstrip()} .\n" for triple in triples))
 
     return len(triples)
 
@@ -243,6 +371,8 @@ def materialize_pipeline(
     try:
         # ── 7. Materialize + Serialize ────────────────────────────────────
         if output == "file":
+            # Always wipe the output files first: the groups append to them.
+            prepare_output_files(config, rml_mapping)
             results = executor.run(
                 groups, materialize_group_to_file, rml_mapping, config
             )

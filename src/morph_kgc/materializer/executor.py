@@ -24,7 +24,7 @@ Protocol
 Runtime typing via typing.Protocol so callers can accept any executor
 without importing concrete classes::
 
-    def run_pipeline(config, executor: Executor | None = None): ...
+    def materialize_pipeline(config, executor: Executor | None = None): ...
 """
 
 import asyncio
