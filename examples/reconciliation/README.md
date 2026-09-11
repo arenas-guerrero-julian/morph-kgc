@@ -13,11 +13,14 @@ is downloaded (or the endpoint queried) a single time and the resulting index is
 shared by every mapping rule and every worker process. No repeated API call is
 made while generating triples.
 
-Run this example with:
+This example reconciles against a SKOS vocabulary. Run it with:
 
 ```bash
 python run.py
 ```
+
+[`../reconciliation-sparql`](../reconciliation-sparql) is the same example
+reconciling against a SPARQL endpoint.
 
 ## The accessed resource lives in the configuration file
 
