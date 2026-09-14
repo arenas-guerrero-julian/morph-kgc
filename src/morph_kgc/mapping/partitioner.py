@@ -6,6 +6,7 @@ __email__ = "arenas.guerrero.julian@outlook.com"
 import logging
 import multiprocessing as mp
 
+from copy import copy
 from itertools import permutations
 
 from ..constants import *
@@ -110,9 +111,15 @@ def _literal_type(rule: RMLRule) -> str:
 class _PartitionRecord:
     """
     Lightweight record holding one rule plus derived partition fields.
+
+    ``index`` is the position of the rule in the mapping. The maximal partition
+    reorders records while it groups them, and runs each candidate ordering on
+    copies (in a worker process, on copies of copies), so the index is what ties
+    a computed partition label back to the rule it belongs to.
     """
     __slots__ = (
         'rule',
+        'index',
         'subject_invariant',
         'predicate_invariant',
         'object_invariant',
@@ -121,8 +128,9 @@ class _PartitionRecord:
         'mapping_partition',
     )
 
-    def __init__(self, rule: RMLRule, all_rules: list[RMLRule]):
+    def __init__(self, rule: RMLRule, all_rules: list[RMLRule], index: int):
         self.rule               = rule
+        self.index              = index
         self.subject_invariant  = _subject_invariant(rule)
         self.predicate_invariant= _predicate_invariant(rule)
         self.object_invariant   = _object_invariant(rule, all_rules)
@@ -138,13 +146,19 @@ class _PartitionRecord:
 def _generate_maximal_partition_for_a_position_ordering(
     records: list[_PartitionRecord],
     position_ordering: tuple[str, ...],
-) -> list[_PartitionRecord]:
+) -> list[tuple[int, str]]:
     """
     Apply one S/P/O/G ordering to a copy of the records list and return the
-    result.  Module-level so multiprocessing can pickle it.
+    partition label of every rule as ``(rule index, label)``.  Module-level so
+    multiprocessing can pickle it.
+
+    Only the labels are returned: the records this works on are copies (of
+    copies, in a worker process), so the objects themselves cannot be handed
+    back to the caller — the indices are what reconnect the labels to the rules.
     """
-    import copy
-    records = copy.deepcopy(records)
+    # Shallow copies: the ordering mutates `mapping_partition` and reorders the
+    # list, but only ever reads through `rule`, which is shared with the caller.
+    records = [copy(record) for record in records]
 
     for position in position_ordering:
 
@@ -262,7 +276,8 @@ def _generate_maximal_partition_for_a_position_ordering(
                     current_invariant = inv
                     rec.mapping_partition = f'{rec.mapping_partition}-{current_group}'
 
-    return records
+    # Strip the leading '-' every position prepends to the label it builds.
+    return [(record.index, record.mapping_partition.lstrip('-')) for record in records]
 
 
 ##############################################################################
@@ -276,8 +291,8 @@ class MappingPartitioner:
         self.config      = config
         # Build records once; invariants are computed here, not on demand.
         self._records: list[_PartitionRecord] = [
-            _PartitionRecord(rule, rml_mapping.rules)
-            for rule in rml_mapping.rules
+            _PartitionRecord(rule, rml_mapping.rules, index)
+            for index, rule in enumerate(rml_mapping.rules)
         ]
 
     def __len__(self):
@@ -294,7 +309,7 @@ class MappingPartitioner:
         """
         if self.config.is_partial_aggregations_partitioning():
             self._generate_partial_aggregations_partition()
-        elif self.config.is_maximal_partitioning:
+        elif self.config.is_maximal_partitioning():
             self._generate_maximal_partition()
         elif self.config.is_no_partitioning():
             for rec in self._records:
@@ -326,31 +341,30 @@ class MappingPartitioner:
         position_orderings = list(permutations(['S', 'P', 'O', 'G']))
 
         if self.config.is_multiprocessing_enabled():
-            pool = mp.Pool(self.config.get_number_of_processes())
-            candidate_lists = pool.starmap(
-                _generate_maximal_partition_for_a_position_ordering,
-                zip(
-                    [self._records.copy()] * len(position_orderings),
-                    position_orderings,
-                ),
-            )
+            with mp.Pool(self.config.number_of_processes) as pool:
+                candidate_labels = pool.starmap(
+                    _generate_maximal_partition_for_a_position_ordering,
+                    zip(
+                        [self._records] * len(position_orderings),
+                        position_orderings,
+                    ),
+                )
         else:
-            candidate_lists = [
+            candidate_labels = [
                 _generate_maximal_partition_for_a_position_ordering(
-                    self._records.copy(), ordering
+                    self._records, ordering
                 )
                 for ordering in position_orderings
             ]
 
-        best_records = max(
-            candidate_lists,
-            key=lambda recs: len({r.mapping_partition for r in recs}),
+        # The ordering that splits the mapping into the most groups wins.
+        best_labels = max(
+            candidate_labels,
+            key=lambda labels: len({label for _, label in labels}),
         )
-        # Strip the leading '-' introduced by the recursive join approach.
-        for rec in best_records:
-            rec.mapping_partition = rec.mapping_partition.lstrip('-')
 
-        self._records = best_records
+        for index, label in best_labels:
+            self._records[index].mapping_partition = label
 
     def _generate_partial_aggregations_partition(self):
         """
