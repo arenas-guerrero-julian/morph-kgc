@@ -1,0 +1,4 @@
+<http://example.com#car_1> <http://example.com#upperName> "VENUS" .
+<http://example.com#car_1> <http://example.com#brand> "Toyota" .
+<http://example.com#car_2> <http://example.com#upperName> "MARS" .
+<http://example.com#car_2> <http://example.com#brand> "Honda" .

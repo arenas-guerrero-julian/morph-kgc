@@ -246,12 +246,15 @@ def _translate_fnml_to_rml(mapping_graph: rdflib.Graph) -> rdflib.Graph:
         if prev_caller != row.functionCaller:
             prev_caller = row.functionCaller
             blank_exec = rdflib.BNode()
+            # The caller is a blank node whenever the calling term map is
+            # written inline, so it is used as returned: wrapping it in URIRef
+            # would attach the execution to a node absent from the graph.
             mapping_graph.add((
-                rdflib.URIRef(row.functionCaller),
+                row.functionCaller,
                 rdflib.term.URIRef(RML_EXECUTION),
                 blank_exec,
             ))
-        mapping_graph.add((blank_exec, rdflib.URIRef(FNML_FUNCTION_MAP), blanknode_fnmap))
+        mapping_graph.add((blank_exec, rdflib.URIRef(RML_FUNCTION_MAP), blanknode_fnmap))
         mapping_graph.add((blanknode_fnmap, rdflib.URIRef(RML_CONSTANT), row.functionID))
 
         blank_input = rdflib.BNode()
@@ -259,18 +262,22 @@ def _translate_fnml_to_rml(mapping_graph: rdflib.Graph) -> rdflib.Graph:
         blank_value_map = rdflib.BNode()
         mapping_graph.add((blank_input, rdflib.term.URIRef(RML_VALUE_MAP), blank_value_map))
 
-        if 'functionExecution' in str(row._objectConnector):
-            inner_fns[str(row._objectValue)] = blank_value_map
+        # Nested calls are only visible through the BIND-resolved variables,
+        # which rewrite fnml:functionValue into rml:functionExecution and point
+        # at the object map issuing the inner call.
+        if 'functionExecution' in str(row.objectConnector):
+            inner_fns[row.objectValue] = blank_value_map
         else:
-            mapping_graph.add((blank_value_map, rdflib.term.URIRef(str(row._objectConnector)), row._objectValue))
+            mapping_graph.add((blank_value_map, rdflib.term.URIRef(str(row.objectConnector)), row.objectValue))
 
         blank_pm = rdflib.BNode()
         mapping_graph.add((blank_input, rdflib.URIRef(RML_PARAMETER_MAP), blank_pm))
         mapping_graph.add((blank_pm, rdflib.term.URIRef(RML_CONSTANT), row.parameter))
 
     for inner_om, outer_bn in inner_fns.items():
+        # Also a blank node for an inline object map, hence used as returned.
         inner_blanks = list(mapping_graph.objects(
-            rdflib.URIRef(inner_om),
+            inner_om,
             rdflib.term.URIRef(RML_EXECUTION),
         ))
         if inner_blanks:
