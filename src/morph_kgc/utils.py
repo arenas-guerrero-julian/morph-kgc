@@ -12,7 +12,6 @@ import logging
 import sys
 import rdflib
 import time
-import pandas as pd
 import multiprocessing as mp
 
 from itertools import product
@@ -171,20 +170,6 @@ def replace_objects_in_graph(graph, object_to_remove, object_to_add):
 
 def get_delta_time(start_time):
     return "{:.3f}".format((time.time() - start_time))
-
-
-def get_references_in_join_condition(rml_rule, join_conditions):
-    references = list()
-    parent_references = list()
-
-    # if join_condition is not null and it is not empty
-    if pd.notna(rml_rule[join_conditions]) and rml_rule[join_conditions]:
-        join_conditions = eval(rml_rule[join_conditions])
-        for join_condition in join_conditions.values():
-            references.append(join_condition['child_value'])
-            parent_references.append(join_condition['parent_value'])
-
-    return references, parent_references
 
 
 def normalize_oracle_identifier_casing(dataframe, references):
