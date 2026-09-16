@@ -591,6 +591,60 @@ def _graph_to_rml_mapping(
 
 
 ##############################################################################
+# Rule identity helpers
+##############################################################################
+
+def _get_term_map_identity(term_map: Optional[TermMap]) -> Optional[tuple]:
+    """
+    Hashable identity of a term map.
+
+    Every attribute that can make two term maps yield different RDF terms is
+    part of the identity: two object maps over the same reference but with
+    distinct language tags, datatypes, base directions or join conditions are
+    different term maps and must not be considered equal.
+
+    Join conditions are conjunctive, so their order carries no meaning: they
+    are sorted to keep the identity stable regardless of the order in which
+    the SPARQL parsing queries returned them.
+    """
+    if term_map is None:
+        return None
+
+    return (
+        term_map.map_type,
+        term_map.map_value,
+        term_map.term_type,
+        term_map.lang_datatype,
+        term_map.lang_datatype_map_type,
+        term_map.lang_datatype_map_value,
+        term_map.direction_map_type,
+        term_map.direction_map_value,
+        tuple(sorted(
+            (jc.child_value, jc.parent_value) for jc in term_map.join_conditions
+        )),
+    )
+
+
+def _get_logical_source_identity(logical_source: LogicalSource) -> tuple:
+    """
+    Hashable identity of a logical source.
+
+    ``format_`` is left out: it is still empty at deduplication time and is
+    derived from the remaining attributes later in ``_complete_source_types``.
+    ``config_section_name`` is part of the identity because the same logical
+    source declared under two config sections can resolve to different data
+    (e.g. a different database or file path).
+    """
+    return (
+        logical_source.config_section_name,
+        logical_source.value_type,
+        logical_source.value,
+        logical_source.iterator,
+        logical_source.reference_formulation,
+    )
+
+
+##############################################################################
 # Identifier helpers
 ##############################################################################
 
@@ -676,24 +730,27 @@ class MappingParser:
         self._remove_self_joins_no_condition()
 
     def _drop_duplicates(self):
+        """
+        Drop rules that are duplicates of an earlier rule, keeping the first
+        occurrence of each.
+
+        Two rules are duplicates only when their triples map, logical source
+        and every term map are identical. Anything less than the full term map
+        identity would discard rules that generate different triples, and,
+        since the surviving rule is whichever the SPARQL parsing query returned
+        first, would do so unpredictably.
+        """
         seen: set[tuple] = set()
         unique: list[RMLRule] = []
         for rule in self.rml_mapping.rules:
             key = (
                 rule.triples_map_id,
                 rule.triples_map_type,
-                rule.logical_source.value,
-                rule.logical_source.iterator,
-                rule.logical_source.reference_formulation,
-                rule.subject.map_type,
-                rule.subject.map_value,
-                rule.subject.term_type,
-                rule.predicate.map_type  if rule.predicate else None,
-                rule.predicate.map_value if rule.predicate else None,
-                rule.object_.map_type    if rule.object_   else None,
-                rule.object_.map_value   if rule.object_   else None,
-                rule.object_.term_type   if rule.object_   else None,
-                rule.graph.map_value     if rule.graph     else None,
+                _get_logical_source_identity(rule.logical_source),
+                _get_term_map_identity(rule.subject),
+                _get_term_map_identity(rule.predicate),
+                _get_term_map_identity(rule.object_),
+                _get_term_map_identity(rule.graph),
             )
             if key not in seen:
                 seen.add(key)
