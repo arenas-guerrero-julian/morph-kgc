@@ -14,7 +14,7 @@ History = 'https://github.com/morph-kgc/morph-kgc/releases'
 name = 'morph_kgc'
 description = 'Powerful [R2]RML engine to create RDF knowledge graphs from heterogeneous data sources.'
 readme = 'README.md'
-keywords = ['Morph-KGC', 'RDF', 'R2RML', 'RML', 'RML-star', 'Knowledge Graph', 'Data Integration']
+keywords = ['Morph-KGC', 'RDF', 'R2RML', 'RML', 'Knowledge Graph', 'Data Integration']
 authors = [
   {name = 'Julián Arenas-Guerrero', email = 'julian.arenas.guerrero@upm.es'}
 ]

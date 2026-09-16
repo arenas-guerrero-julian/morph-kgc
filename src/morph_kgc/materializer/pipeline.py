@@ -100,8 +100,8 @@ def materialize_rule(
     python_source:
         Optional in-memory data for PYTHON_SOURCE logical sources.
     nest_level:
-        Recursion depth for quoted-triple (triple-term) rules. At level 0
-        the graph component is appended for N-Quads output.
+        Recursion depth for triple-term rules. At level 0 the graph
+        component is appended for N-Quads output.
 
     Returns
     -------

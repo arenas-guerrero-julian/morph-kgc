@@ -5,7 +5,7 @@ __license__ = "Apache-2.0"
 Stage 2 — Reference Collection
 ===============================
 Determines which source columns are needed to materialize a rule, including
-join-condition columns and recursively nested FNML / quoted-triple maps.
+join-condition columns and recursively nested FNML / triple-term maps.
 
 Public API
 ----------
