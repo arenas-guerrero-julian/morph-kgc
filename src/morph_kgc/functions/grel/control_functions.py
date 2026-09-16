@@ -2,6 +2,7 @@ from functools import reduce
 from operator import xor
 
 from ..registry import bif
+from .safe_eval import safe_eval_expression
 
 
 @bif(
@@ -16,7 +17,9 @@ def controls_if(boolean_expression, value_true, value_false=None):
     elif str(boolean_expression).lower() in ["false", 0]:
         return value_false
     else:
-        if eval(boolean_expression):
+        # boolean_expression is built from the data being materialized, so it
+        # is evaluated without allowing arbitrary code to run
+        if safe_eval_expression(boolean_expression):
             return value_true
         else:
             return value_false
@@ -35,7 +38,9 @@ def controls_if_cast(string, value_true, value_false=None):
     elif string.lower() in ["true", "yes", "on", "1"]:
         return value_true
     else:
-        if eval(string):
+        # string comes from the data being materialized, so it is evaluated
+        # without allowing arbitrary code to run
+        if safe_eval_expression(string):
             return value_true
         else:
             return value_false

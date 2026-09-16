@@ -13,7 +13,9 @@ def array_get(string_list, start, end=None):
     # it does not explode
 
     try:
-        string_list = eval(string_list)  # it is a list
+        # string_list comes from the data being materialized, so it is parsed
+        # as a literal instead of evaluated as code
+        string_list = literal_eval(string_list)  # it is a list
     except:
         pass  # it is a string
 
@@ -63,7 +65,9 @@ def array_slice(string_list, start, end=None):
     # it does not explode
 
     try:
-        string_list = eval(string_list)  # it is a list
+        # string_list comes from the data being materialized, so it is parsed
+        # as a literal instead of evaluated as code
+        string_list = literal_eval(string_list)  # it is a list
     except:
         pass  # it is a string
 
