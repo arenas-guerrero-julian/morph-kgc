@@ -310,12 +310,12 @@ def _triples_to_graph(triples: set[str]) -> Graph:
 
 
 def _triples_to_oxigraph(triples: set[str]):
-    from pyoxigraph import Store
+    from pyoxigraph import RdfFormat, Store
     store = Store()
     if triples:
         store.bulk_load(
             BytesIO((".\n".join(triples) + ".").encode()),
-            "application/n-quads",
+            RdfFormat.N_QUADS,
         )
     return store
 
