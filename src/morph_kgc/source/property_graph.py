@@ -24,10 +24,13 @@ def _fetch_pg(config, rml_rule) -> pd.DataFrame:
     base_url = "/".join(db_url.split("/")[:-1])
     base_url, user_password = base_url.split("@")
     user, password = user_password.split(":")
-    driver = neo4j.GraphDatabase.driver(base_url, auth=(user, password))
-    return driver.execute_query(
-        query, database=db, result_transformer=neo4j.Result.to_df
-    )
+    # the driver owns a connection pool, so it must be closed once the query is
+    # done; leaving it to the garbage collector holds sockets open for the rest
+    # of the materialization, one pool per mapping rule
+    with neo4j.GraphDatabase.driver(base_url, auth=(user, password)) as driver:
+        return driver.execute_query(
+            query, database=db, result_transformer=neo4j.Result.to_df
+        )
 
 class PropertyGraphAdapter:
     """DataSourceAdapter for property-graph databases (Neo4j)."""

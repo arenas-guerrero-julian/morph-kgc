@@ -16,7 +16,8 @@ get_rdb_reference_datatype() — used by materializer for SQL type inference
 """
 
 import logging
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 import pandas as pd
 
@@ -119,8 +120,23 @@ def _replace_query_enclosing_characters(sql_query: str, db_dialect: str) -> str:
     # ANSI-compliant dialects (Oracle, PostgreSQL, SQLite, Snowflake, default)
     return sql_query.replace('`', '"')
 
-def _relational_db_connection(config, source_name: str):
-    """Return (connection, dialect_string) for *source_name*."""
+@contextmanager
+def _relational_db_connection(config, source_name: str) -> Iterator[tuple[Any, str]]:
+    """
+    Yield (connection, dialect_string) for *source_name*, closing the
+    connection and disposing of the engine on exit.
+
+    Must be used as a context manager so that the underlying DBAPI connection
+    is released as soon as the query is done, instead of lingering until the
+    garbage collector happens to reclaim it. Callers that hold connections
+    open implicitly stack up one connection per mapping rule and exhaust the
+    server's connection limit on large mappings.
+
+    A fresh engine is built per call on purpose: the materializer forks worker
+    processes, and SQLAlchemy engines (and their pooled connections) must not
+    be shared across a fork. NullPool already keeps the engine from holding
+    connections open behind our back; disposing it releases the rest.
+    """
     import ast
 
     from sqlalchemy import create_engine
@@ -135,10 +151,14 @@ def _relational_db_connection(config, source_name: str):
     engine = create_engine(
         config.get_db_url(source_name), connect_args=connect_args, poolclass=NullPool
     )
-    connection = engine.connect()
-    dialect = engine.dialect.name.upper()
-
-    return connection, dialect
+    try:
+        connection = engine.connect()
+        try:
+            yield connection, engine.dialect.name.upper()
+        finally:
+            connection.close()
+    finally:
+        engine.dispose()
 
 def _get_table_columns(config, source_name: str, table_name: str) -> list | None:
     """
@@ -148,15 +168,12 @@ def _get_table_columns(config, source_name: str, table_name: str) -> list | None
     """
     from sqlalchemy import inspect
 
-    connection, _ = _relational_db_connection(config, source_name)
-    try:
+    with _relational_db_connection(config, source_name) as (connection, _):
         try:
             return inspect(connection).get_columns(table_name)
         except Exception:
             LOGGER.debug(f'Could not inspect table `{table_name}` of data source `{source_name}`.')
             return None
-    finally:
-        connection.close()
 
 def _get_column_table_datatype(config, source_name: str, table_name: str, column_name: str,
                                columns_cache: dict | None = None) -> str | None:
@@ -259,11 +276,13 @@ class RelationalAdapter:
         if sql_query is None:
             return pd.DataFrame(columns=list(references))
 
-        conn, dialect = _relational_db_connection(config, rml_rule.logical_source.config_section_name)
-        sql_query = _replace_query_enclosing_characters(sql_query, dialect)
+        with _relational_db_connection(
+            config, rml_rule.logical_source.config_section_name
+        ) as (conn, dialect):
+            sql_query = _replace_query_enclosing_characters(sql_query, dialect)
 
-        LOGGER.debug(
-            f"SQL query for mapping rule `{rml_rule.triples_map_id}`: [{sql_query}]"
-        )
+            LOGGER.debug(
+                f"SQL query for mapping rule `{rml_rule.triples_map_id}`: [{sql_query}]"
+            )
 
-        return pd.read_sql_query(sql_query, con=conn, coerce_float=False)
+            return pd.read_sql_query(sql_query, con=conn, coerce_float=False)
