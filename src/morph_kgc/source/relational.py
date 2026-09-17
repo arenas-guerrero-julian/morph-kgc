@@ -94,8 +94,47 @@ SQL_RDF_DATATYPE: dict[str | Any, str | Any] = {
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
+# Delimiters used by each dialect to quote an identifier, as (open, close).
+# The close character is also the one that has to be doubled to escape it
+# inside the identifier.
+_IDENTIFIER_DELIMITERS: dict[str, tuple[str, str]] = {
+    MYSQL: ('`', '`'),
+    MARIADB: ('`', '`'),
+    MSSQL: ('[', ']'),
+    # Databricks (Spark SQL) delimits with backticks: double quotes are string
+    # literals there unless spark.sql.ansi.doubleQuotedIdentifiers is enabled.
+    DATABRICKS: ('`', '`'),
+}
+
+# ANSI SQL: Oracle, PostgreSQL, SQLite, Snowflake and any unknown dialect.
+_ANSI_IDENTIFIER_DELIMITERS = ('"', '"')
+
+
+def _quote_identifier(identifier: str, db_dialect: str) -> str:
+    """
+    Quote *identifier* the way *db_dialect* expects it.
+
+    Dots are treated as qualification separators, so that schema-qualified
+    names are quoted part by part (``myschema.Student`` becomes
+    ``"myschema"."Student"`` and not a single identifier containing a dot,
+    see issue #89). The closing delimiter is doubled to escape it, so that an
+    identifier carrying one cannot break out of the quoting.
+    """
+    open_char, close_char = _IDENTIFIER_DELIMITERS.get(db_dialect, _ANSI_IDENTIFIER_DELIMITERS)
+
+    return '.'.join(
+        f'{open_char}{part.replace(close_char, close_char * 2)}{close_char}'
+        for part in identifier.split('.')
+    )
+
+
 def _replace_query_enclosing_characters(sql_query: str, db_dialect: str) -> str:
-    """Swap backtick identifier quoting for dialect-specific quoting."""
+    """
+    Swap backtick identifier quoting for dialect-specific quoting in a
+    user-supplied ``rml:query``. Queries built by Morph-KGC are quoted for the
+    target dialect directly by _quote_identifier() and must not go through
+    this function.
+    """
     if db_dialect in (MYSQL, MARIADB):
         # backticks are already correct for MySQL/MariaDB
         return sql_query
@@ -213,9 +252,10 @@ def _get_column_table_datatype(config, source_name: str, table_name: str, column
 
     return None
 
-def _build_sql_query(config, rml_rule, references) -> str | None:
+def _build_sql_query(config, rml_rule, references, db_dialect: str) -> str | None:
     """
-    Construct the SQL SELECT that fetches exactly the *references* columns.
+    Construct the SQL SELECT that fetches exactly the *references* columns,
+    with identifiers quoted for *db_dialect*.
     Returns None when the rule has no column references (all constants).
     """
     col_refs = list(references)
@@ -226,11 +266,14 @@ def _build_sql_query(config, rml_rule, references) -> str | None:
     ls_value = rml_rule.logical_source.value
 
     if ls_type == RML_QUERY:
-        return ls_value
-    elif ls_type == RML_TABLE_NAME and len(references):
-        quoted = ", ".join(f'"{r}"' for r in col_refs)
-        from_clause = f'"{ls_value}"'
-        conditions = " AND ".join(f'"{r}" IS NOT NULL' for r in col_refs)
+        # user-supplied SQL: only its backtick quoting is translated
+        return _replace_query_enclosing_characters(ls_value, db_dialect)
+    elif ls_type == RML_TABLE_NAME:
+        quoted = ", ".join(_quote_identifier(r, db_dialect) for r in col_refs)
+        from_clause = _quote_identifier(ls_value, db_dialect)
+        conditions = " AND ".join(
+            f"{_quote_identifier(r, db_dialect)} IS NOT NULL" for r in col_refs
+        )
         filter_null = f" WHERE {conditions}"
 
         return f"SELECT {quoted} FROM {from_clause}{filter_null}"
@@ -272,14 +315,18 @@ class RelationalAdapter:
         python_source: dict | None = None,
         rml_mapping: Any | None = None,
     ) -> pd.DataFrame:
-        sql_query = _build_sql_query(config, rml_rule, references)
-        if sql_query is None:
+        if not references:
+            # all-constant rule: nothing to fetch, do not open a connection
             return pd.DataFrame(columns=list(references))
 
         with _relational_db_connection(
             config, rml_rule.logical_source.config_section_name
         ) as (conn, dialect):
-            sql_query = _replace_query_enclosing_characters(sql_query, dialect)
+            # the query is built here because quoting depends on the dialect,
+            # which is only known once the engine has been created
+            sql_query = _build_sql_query(config, rml_rule, references, dialect)
+            if sql_query is None:
+                return pd.DataFrame(columns=list(references))
 
             LOGGER.debug(
                 f"SQL query for mapping rule `{rml_rule.triples_map_id}`: [{sql_query}]"
