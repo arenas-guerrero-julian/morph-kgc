@@ -30,6 +30,7 @@
     - **In-memory data structures**: [Python Dictionaries](https://docs.python.org/3/tutorial/datastructures.html#dictionaries), [DataFrames](https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html).
     - **Cloud data lake solutions**: [Databricks](https://www.databricks.com/), [Snowflake](https://www.snowflake.com/).
     - **Property graph databases**: [Neo4j](https://neo4j.com/).
+    - **HTTP APIs**: JSON over HTTP, with the requests described in the mapping with the [HTTP Vocabulary in RDF](https://www.w3.org/TR/HTTP-in-RDF10/).
 
 ## Documentation :bookmark_tabs:
 

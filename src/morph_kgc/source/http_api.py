@@ -15,6 +15,7 @@ import importlib.util
 import json
 import os
 import sys
+from string import Formatter
 from typing import Any
 
 import pandas as pd
@@ -25,11 +26,58 @@ from ..utils import normalize_hierarchical_data
 
 def _load_module_from_path(module_name: str, file_path: str):
     """Dynamically load a Python module from *file_path*."""
-    spec   = importlib.util.spec_from_file_location(module_name, file_path)
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ValueError(
+            f"'api_token' does not point at a Python module: '{file_path}'."
+        )
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _resolve_header_value(config, raw_value: str) -> str:
+    """
+    Resolve the value a header is sent with.
+
+    A value written as a ``{ENV_VAR}`` template is replaced with the
+    environment, and so is one that is the bare name of an environment
+    variable, so that secrets need not be written to the mapping. Otherwise the
+    module given in the ``api_token`` configuration option, when there is one,
+    is asked for it: the value is then the name of a token it hands out. A
+    value that is neither, and one its ``get_api_token`` hands out no token
+    for, is sent as it is written, which is what a constant header such as
+    ``Accept`` needs.
+    """
+    if raw_value in os.environ:
+        return os.environ[raw_value]
+
+    try:
+        placeholders = {name for _, name, _, _ in Formatter().parse(raw_value) if name}
+    except ValueError:
+        # Braces that are not a placeholder are part of the value.
+        placeholders = set()
+
+    if placeholders:
+        missing = placeholders - os.environ.keys()
+        if missing:
+            raise ValueError(
+                f"The HTTP API header value '{raw_value}' references the "
+                f"environment variable(s) {', '.join(sorted(missing))}, which "
+                f"are not set."
+            )
+        return raw_value.format(**os.environ)
+
+    if config.api_token:
+        module = _load_module_from_path("dynamic_api_token", config.api_token)
+        token = module.get_api_token(raw_value)
+        # A module hands out no token for a value that names none, so that
+        # constant headers can be written alongside the tokens.
+        if token:
+            return token
+
+    return raw_value
 
 
 def _fetch_http_api(config, rml_rule, references: set[str], rml_mapping) -> pd.DataFrame:
@@ -56,11 +104,7 @@ def _fetch_http_api(config, rml_rule, references: set[str], rml_mapping) -> pd.D
         if not field_name or not field_value_raw:
             continue
 
-        if field_name in os.environ:
-            field_value = field_value_raw.format(**os.environ)
-        else:
-            mod = _load_module_from_path("dynamic_api_token", config.api_token)
-            field_value = mod.get_api_token(arg1=field_value_raw)
+        field_value = _resolve_header_value(config, field_value_raw)
 
         if field_name.lower() in ["authorization", "accept", "keyid", "user-agent"]:
             headers[field_name] = field_value

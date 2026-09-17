@@ -774,12 +774,19 @@ class MappingParser:
                         rule.logical_source.value = fp
 
     def _complete_source_types(self):
+        # A logical source whose value is the request described with htv:
+        # properties is an HTTP API, whatever its reference formulation: the
+        # formulation says how the response is read, not where it comes from.
+        http_api_sources = {entry.source for entry in self.rml_mapping.http_api_entries}
+
         for rule in self.rml_mapping.rules:
             section  = rule.logical_source.config_section_name
             ls       = rule.logical_source
             ref_form = ls.reference_formulation
 
-            if self.config.has_db_url(section):
+            if str(ls.value) in http_api_sources:
+                ls.format_ = HTTPAPI
+            elif self.config.has_db_url(section):
                 if ref_form and 'SQL' in ref_form.upper():
                     ls.format_ = RDB
                 elif ref_form and any(x in ref_form.upper() for x in ('CYPHER', 'GQL')):
