@@ -846,13 +846,22 @@ class MappingParser:
     def _infer_datatypes(self):
         """
         Infer XSD datatypes for RDB-sourced object maps that carry no explicit
-        datatype.  No-op for non-RDB sources.
+        datatype.  No-op for non-RDB sources and when `infer_sql_datatypes` is
+        disabled.
         """
+        if not self.config.infer_sql_datatypes:
+            return
+
+        # inspect the schema of each table only once
+        columns_cache: dict = {}
+
         for rule in self.rml_mapping.rules:
             if rule.logical_source.format_ != RDB:
                 continue
             if rule.object_ is None:
                 continue
+            if rule.object_.term_type != RML_LITERAL:
+                continue  # datatypes only apply to literals
             if rule.object_.lang_datatype is not None:
                 continue  # already has an explicit lang/datatype annotation
             if rule.object_.map_type == RML_REFERENCE:
@@ -860,8 +869,11 @@ class MappingParser:
                     self.config,
                     rule.logical_source,
                     rule.object_.map_value,
+                    columns_cache,
                 )
-                if inferred:
+                # xsd:string is the datatype of simple literals in RDF 1.1,
+                # annotating it explicitly would be redundant
+                if inferred and inferred != XSD_STRING:
                     rule.object_.lang_datatype           = RML_DATATYPE_MAP
                     rule.object_.lang_datatype_map_type  = RML_CONSTANT
                     rule.object_.lang_datatype_map_value = inferred

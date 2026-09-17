@@ -140,21 +140,45 @@ def _relational_db_connection(config, source_name: str):
 
     return connection, dialect
 
-def _get_column_table_datatype(config, source_name: str, table_name: str, column_name: str) -> str | None:
+def _get_table_columns(config, source_name: str, table_name: str) -> list | None:
+    """
+    Query the information schema for the columns of *table_name*.
+    Returns None when the table cannot be inspected (views, CTEs, missing
+    tables, etc.).
+    """
+    from sqlalchemy import inspect
+
+    connection, _ = _relational_db_connection(config, source_name)
+    try:
+        try:
+            return inspect(connection).get_columns(table_name)
+        except Exception:
+            LOGGER.debug(f'Could not inspect table `{table_name}` of data source `{source_name}`.')
+            return None
+    finally:
+        connection.close()
+
+def _get_column_table_datatype(config, source_name: str, table_name: str, column_name: str,
+                               columns_cache: dict | None = None) -> str | None:
     """
     Query the information schema to obtain the SQL datatype of *column_name*,
     mapped to its corresponding XSD datatype via SQL_RDF_DATATYPE.
     Returns None when the column cannot be found (views, CTEs, etc.) or when
     the SQL datatype has no known XSD mapping.
+
+    *columns_cache* optionally memoizes the inspected columns per table, so
+    that a mapping with several references over one table only hits the
+    information schema once.
     """
-    from sqlalchemy import inspect
+    cache_key = (source_name, table_name)
+    if columns_cache is not None and cache_key in columns_cache:
+        columns = columns_cache[cache_key]
+    else:
+        columns = _get_table_columns(config, source_name, table_name)
+        if columns_cache is not None:
+            columns_cache[cache_key] = columns
 
-    connection, _ = _relational_db_connection(config, source_name)
-
-    insp = inspect(connection)
-    try:
-        columns = insp.get_columns(table_name)
-    except Exception:
+    if columns is None:
         return None
 
     data_type = None
@@ -199,20 +223,23 @@ def _build_sql_query(config, rml_rule, references) -> str | None:
 
 # ── Public helpers ────────────────────────────────────────────────────────────
 
-def get_rdb_reference_datatype(config, logical_source, reference: str) -> str | None:
+def get_rdb_reference_datatype(config, logical_source, reference: str,
+                               columns_cache: dict | None = None) -> str | None:
     """
-    Return the SQL datatype string for *reference* in *rml_rule*'s table.
-    Used by the materializer for automatic XSD datatype assignment.
-    Returns None for query-based sources or when the column is not found.
-    """
-    ls_type = logical_source.value_type
-    ls_value = logical_source.value
+    Return the XSD datatype for *reference* in *logical_source*'s table.
+    Used by the mapping parser for automatic XSD datatype assignment.
+    Returns None for query-based sources (arbitrary SQL cannot be inspected),
+    when the column is not found, or when its SQL datatype has no known XSD
+    counterpart.
 
-    if ls_type in (RML_QUERY, RML_TABLE_NAME):
-        return None  # cannot inspect arbitrary SQL queries
+    *columns_cache* is an optional dictionary reused across calls to inspect
+    each table only once.
+    """
+    if logical_source.value_type != RML_TABLE_NAME:
+        return None  # cannot inspect arbitrary SQL queries (rml:query)
 
     return _get_column_table_datatype(
-        config, logical_source.config_section_name, ls_value, reference
+        config, logical_source.config_section_name, logical_source.value, reference, columns_cache
     )
 
 # ── Adapter ───────────────────────────────────────────────────────────────────
