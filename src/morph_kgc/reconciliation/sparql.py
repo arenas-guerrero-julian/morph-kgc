@@ -63,17 +63,6 @@ ENTITY_VARIABLE   = "entity_iri"
 MATCHING_VARIABLE = "matching_value_1"
 MATCHING_VARIABLES = re.compile(r"matching_value_\d+")
 
-# Options a SPARQL_ENDPOINT resource declared when it also held the query, which
-# the mapping now gives.
-OBSOLETE_OPTIONS = {
-    "query",
-    "concept_variable",
-    "attribute_variable",
-    "value_variable",
-    "attributes",
-    "matching",
-}
-
 VALID_METHODS = {"GET", "POST"}
 
 # Unless the resource says otherwise, a query is sent with GET, the method every

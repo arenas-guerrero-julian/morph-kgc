@@ -249,12 +249,6 @@ def _endpoint_resource(initialization, endpoint: str) -> ResourceConfig:
         )
 
     LOGGER.info(f"SPARQL endpoint '{endpoint}' is accessed as resource '{resource.name}'.")
-    for option in sorted(set(resource.options) & sparql.OBSOLETE_OPTIONS):
-        LOGGER.warning(
-            f"Option '{option}' of resource '{resource.name}' is ignored: a "
-            f"'{SPARQL_ENDPOINT_RESOURCE}' resource only declares how the "
-            "endpoint is accessed, the mapping gives the query."
-        )
     return resource
 
 

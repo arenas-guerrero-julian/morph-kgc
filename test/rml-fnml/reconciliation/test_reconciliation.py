@@ -510,6 +510,24 @@ def test_query_projecting_other_variables(tmp_path, query, error):
             morph_kgc.materialize(sparql_config(mapping=mapping))
 
 
+def test_query_projecting_the_graph_variable(tmp_path):
+    """Variables projected besides the convention's, such as ?g, are ignored."""
+    query = STUDIES_QUERY.replace(
+        'SELECT ?entity_iri ?matching_value_1 WHERE', 'SELECT * WHERE'
+    )
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (STUDIES_QUERY, query),
+        )
+        g_morph = morph_kgc.materialize(sparql_config(mapping=mapping))
+
+        assert server.requests == [('/public/sparql', query)]
+
+    assert_isomorphic(expected_sparql_graph(), g_morph)
+
+
 @pytest.mark.parametrize('replacement', [
     # No query at all.
     ('rml:parameter morph-fn:sparqlQuery ;', 'rml:parameter morph-fn:unused ;'),
@@ -553,22 +571,6 @@ def test_endpoint_declared_twice():
             endpoint_resource('https://staging.data.com/query')
             + '\n' + endpoint_resource('https://test.data.com/query', name='other')
         ))
-
-
-def test_options_that_are_not_access_options(caplog):
-    """Options that no longer belong to the configuration file are reported."""
-    with VocabularyServer() as server:
-        g_morph = morph_kgc.materialize(sparql_config(
-            endpoint_resource(
-                f'{server.url}/sparql',
-                'query=SELECT ?concept ?value WHERE { ?concept ?p ?value }\n'
-                'matching=CASE-INSENSITIVE',
-            )
-        ))
-
-    assert_isomorphic(expected_sparql_graph(), g_morph)
-    assert "Option 'matching' of resource 'clinical_trials' is ignored" in caplog.text
-    assert "Option 'query' of resource 'clinical_trials' is ignored" in caplog.text
 
 
 def test_endpoint_rejecting_the_query(tmp_path):
