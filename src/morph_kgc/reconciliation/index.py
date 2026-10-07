@@ -8,7 +8,8 @@ Concept index
 =============
 The in-memory representation a reconciliation function is initialized with: for
 each indexed attribute (``skos:prefLabel``, ``skos:altLabel``, ...) the values
-it takes, and the concepts they identify.
+it takes, and the concepts they identify. The answer to a SPARQL query, which
+says nothing of attributes, is indexed under a single, unnamed one.
 
 The index is built once during the context initialization phase and is then
 read-only, which is what makes it safe to share across mapping rules and worker
@@ -43,10 +44,6 @@ class ConceptIndex:
     # Attributes matched against when the mapping does not name any, in the
     # order they should be tried.
     default_attributes: tuple[str, ...] = ()
-    # True when the index does not tell attributes apart, which is the case for
-    # a SPARQL query that projects values without saying which property they
-    # come from. Lookups then ignore the attributes the mapping declares.
-    attribute_agnostic: bool = False
     # attribute IRI -> normalized value -> concept IRIs
     entries: dict[str, dict[str, list[str]]] = field(default_factory=dict)
 
@@ -78,9 +75,7 @@ class ConceptIndex:
         if value is None:
             return []
 
-        if self.attribute_agnostic:
-            attributes = tuple(self.entries)
-        elif not attributes:
+        if not attributes:
             attributes = self.attributes()
         elif isinstance(attributes, str):
             attributes = (attributes,)

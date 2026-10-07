@@ -1,15 +1,16 @@
-# Reconciliation against a SKOS vocabulary or a SPARQL endpoint
+# Reconciliation against a SKOS vocabulary
 
-Reconciliation maps a value of the input data to the concept it identifies in a
-controlled vocabulary. Morph-KGC ships two **stateful** functions for it:
+Reconciliation maps a value of the input data to the entity it identifies in a
+controlled vocabulary or a knowledge graph. Morph-KGC ships two **stateful**
+functions for it:
 
 | Function | Reconciles against |
 | --- | --- |
 | `urn:morph:function:reconciliation:reconcileVocabularyConcept` | a SKOS vocabulary fetched from a URL |
-| `urn:morph:function:reconciliation:reconcileSPARQLConcept` | the concepts held by a SPARQL endpoint |
+| `urn:morph:function:reconcileEntityOverSPARQL` | the entities of any knowledge graph behind a SPARQL endpoint, selected by a query of the mapping |
 
 Both are initialized **once**, before any triple is materialized: the vocabulary
-is downloaded (or the endpoint queried) a single time and the resulting index is
+is downloaded (or the query sent) a single time and the resulting index is
 shared by every mapping rule and every worker process. No repeated API call is
 made while generating triples.
 
@@ -19,8 +20,8 @@ This example reconciles against a SKOS vocabulary. Run it with:
 python run.py
 ```
 
-[`../reconciliation-sparql`](../reconciliation-sparql) is the same example
-reconciling against a SPARQL endpoint.
+[`../reconciliation-sparql`](../reconciliation-sparql) reconciles against a
+knowledge graph through a SPARQL endpoint.
 
 ## The accessed resource lives in the configuration file
 
@@ -60,38 +61,23 @@ environment variables, so credentials need not be written to the file at all.
 
 ## Resource options
 
-Common to both resource types:
-
 | Option | Meaning |
 | --- | --- |
-| `resource_type` | `SKOS_VOCABULARY` or `SPARQL_ENDPOINT` |
-| `url` | where the vocabulary is downloaded from, or the endpoint queried. A local path is read from disk |
-| `iri` | the IRI identifying the resource, when it differs from `url`. A mapping may name the resource by it |
+| `resource_type` | `SKOS_VOCABULARY` |
+| `url` | where the vocabulary is downloaded from. A local path is read from disk |
+| `iri` | the IRI identifying the vocabulary, when it differs from `url`. A mapping may name the resource by it |
 | `username`, `password` | HTTP Basic Authentication credentials |
+| `format` | RDF serialization of the vocabulary (`turtle`, `xml`, `nt`, `nquads`, `trig`, `json-ld`, ...). Guessed from the response and the URL when omitted. A vocabulary serialized as quads is indexed across all its named graphs |
 | `matching` | `EXACT` (default) or `CASE-INSENSITIVE`, which also collapses whitespace |
 | `attributes` | comma-separated attributes to index when the mapping names none |
-| `timeout` | seconds to wait for the resource (default `30`) |
-
-Only for `SKOS_VOCABULARY`:
-
-| Option | Meaning |
-| --- | --- |
-| `format` | RDF serialization of the vocabulary (`turtle`, `xml`, `nt`, `nquads`, `trig`, `json-ld`, ...). Guessed from the response and the URL when omitted. A vocabulary serialized as quads is indexed across all its named graphs |
-
-Only for `SPARQL_ENDPOINT`:
-
-| Option | Meaning |
-| --- | --- |
-| `query` | the SELECT query the index is built from. Defaults to a query over the SKOS labelling properties in the default graph and every named graph |
-| `method` | `GET` (default) or `POST` |
-| `concept_variable`, `attribute_variable`, `value_variable` | projected variable names (default `concept`, `attribute`, `value`) |
+| `timeout` | seconds to wait for the vocabulary (default `30`) |
 
 ## Function parameters
 
 | Parameter | Meaning |
 | --- | --- |
 | `grel:valueParam` | the value to reconcile |
-| `morph-fn:resource` | name of the `[RESOURCE:<name>]` section to reconcile against. May be omitted when a single resource of the right type is declared. `morph-fn:vocabularyIRI` and `morph-fn:endpointIRI` are accepted spellings, and also accept the IRI identifying the resource |
+| `morph-fn:resource` | name of the `[RESOURCE:<name>]` section to reconcile against. May be omitted when a single vocabulary is declared. `morph-fn:vocabularyIRI` is an accepted spelling, and also accepts the IRI identifying the vocabulary |
 | `morph-fn:attributeIRI` | the vocabulary property (or properties) the value is matched against, e.g. `skos:prefLabel`. Bind it several times to match against several: they are matched as a union, since RDF puts no order on the values of a property. `grel:attributeIRI` is accepted as well |
 
 A value matching no concept yields no triple. A value matching several concepts

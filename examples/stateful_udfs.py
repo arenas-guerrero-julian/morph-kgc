@@ -49,6 +49,9 @@ def load_country_codes(initialization):
                                     the IRI identifying it
       initialization.resources(...) every resource the mapping references
                                     through the given parameter IRIs
+      initialization.executions     the constant values of each execution of
+                                    the function, by parameter IRI, to pair
+                                    values that go together
     """
     # Only the resources the mapping actually names are accessed.
     resources = initialization.resources('urn:morph:function:resource')

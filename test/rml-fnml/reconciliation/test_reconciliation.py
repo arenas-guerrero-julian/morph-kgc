@@ -197,86 +197,449 @@ def test_wrong_resource_type():
 
 # ── SPARQL endpoint ───────────────────────────────────────────────────────────
 
-def sparql_config(extra_options='', processes=1):
+SPARQL_MAPPING = os.path.join(TEST_DIR, 'mapping_sparql.ttl')
+# The endpoint the mappings name, as in the discussion that requested the function.
+MAPPING_ENDPOINT = 'https://data.com/database/query'
+
+STUDIES_QUERY = """
+            PREFIX schema: <https://schema.org/>
+            SELECT ?entity_iri ?matching_value_1 WHERE {
+                GRAPH ?g {
+                    ?entity_iri a schema:MedicalStudy ;
+                                schema:identifier ?matching_value_1 .
+                }
+            }
+        """
+
+DRUGS_QUERY = """
+            PREFIX schema: <https://schema.org/>
+            SELECT ?entity_iri ?matching_value_1 WHERE {
+                GRAPH ?g { ?entity_iri a schema:Drug ; schema:name ?matching_value_1 . }
+            }
+        """
+
+
+def sparql_config(resources='', mapping=SPARQL_MAPPING, processes=1):
     return (
         f'[CONFIGURATION]\n'
         f'output_format=N-QUADS\n'
         f'number_of_processes={processes}\n'
-        f'[RESOURCE:disease_endpoint]\n'
-        f'{extra_options}\n'
+        f'{resources}\n'
         f'[DataSource]\n'
-        f'mappings={os.path.join(TEST_DIR, "mapping_sparql.ttl")}'
+        f'mappings={mapping}'
     )
+
+
+def endpoint_resource(url, extra_options='', name='clinical_trials', iri=MAPPING_ENDPOINT):
+    """A resource declaring the credentials of the endpoint the mapping names."""
+    return (
+        f'[RESOURCE:{name}]\n'
+        f'resource_type=SPARQL_ENDPOINT\n'
+        f'{f"iri={iri}" if iri else ""}\n'
+        f'url={url}\n'
+        f'username={USERNAME}\n'
+        f'password={PASSWORD}\n'
+        f'{extra_options}'
+    )
+
+
+def sparql_mapping(tmp_path, *replacements, mapping=SPARQL_MAPPING):
+    """A copy of *mapping* with each (old, new) replacement applied."""
+    with open(mapping, encoding='utf-8') as f:
+        text = f.read()
+    for old, new in replacements:
+        assert old in text
+        text = text.replace(old, new)
+    path = tmp_path / os.path.basename(mapping)
+    path.write_text(text, encoding='utf-8', newline='\n')
+    return str(path)
+
+
+def expected_sparql_graph(file_name='output_sparql.nq'):
+    g = Dataset()
+    g.parse(os.path.join(TEST_DIR, file_name))
+    return g
 
 
 @pytest.mark.parametrize('method', ['GET', 'POST'])
-def test_reconcile_sparql_endpoint(method):
-    """The endpoint is queried once and its answer reused across all rules."""
+def test_reconcile_entity_over_sparql(method):
+    """
+    The query of the mapping is sent once, as written, with the credentials the
+    configuration file declares for the endpoint, and its answer is reused for
+    every value.
+    """
     with VocabularyServer() as server:
         g_morph = morph_kgc.materialize(sparql_config(
-            f'resource_type=SPARQL_ENDPOINT\n'
-            f'url={server.url}/sparql\n'
-            f'username={USERNAME}\n'
-            f'password={PASSWORD}\n'
-            f'method={method}'
+            endpoint_resource(f'{server.url}/sparql', f'method={method}')
         ))
 
-        paths = [path for path, _ in server.requests]
-        assert paths == ['/sparql']
-        # No 'query' option is declared, so the default SKOS query is sent.
-        assert 'skos/core#prefLabel' in server.requests[0][1]
+        assert server.requests == [('/sparql', STUDIES_QUERY)]
+        assert server.methods == [method]
 
-    assert_isomorphic(expected_graph(), g_morph)
+    assert_isomorphic(expected_sparql_graph(), g_morph)
 
 
-def test_reconcile_sparql_endpoint_with_declared_query():
-    """A resource may declare the query the shared context is built with."""
+def test_reconcile_mapping_of_the_discussion():
+    """
+    The mapping of the feature request, written in the legacy FNML vocabulary
+    and naming the function with the morph-fn prefix, runs as written against a
+    store whose default graph includes the named graphs.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql/union'),
+            mapping=os.path.join(TEST_DIR, 'mapping_sparql_discussion.ttl'),
+        ))
+
+        assert [path for path, _ in server.requests] == ['/sparql/union']
+
+    assert_isomorphic(expected_sparql_graph(), g_morph)
+
+
+def test_query_without_graph_pattern_misses_the_named_graphs(caplog):
+    """
+    A query with no GRAPH pattern reads the default graph only, which on many
+    stores leaves out the named graphs: no entity is found, and the log says why.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql'),
+            mapping=os.path.join(TEST_DIR, 'mapping_sparql_discussion.ttl'),
+        ))
+
+    assert len(g_morph) == 0
+    assert 'GRAPH ?g' in caplog.text
+
+
+def test_endpoint_url_in_the_mapping_only(tmp_path):
+    """An endpoint needing no credentials needs no configuration at all."""
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path, (MAPPING_ENDPOINT, f'{server.url}/public/sparql')
+        )
+        g_morph = morph_kgc.materialize(sparql_config(mapping=mapping))
+
+        assert server.requests == [('/public/sparql', STUDIES_QUERY)]
+
+    assert_isomorphic(expected_sparql_graph(), g_morph)
+
+
+def test_endpoint_needing_undeclared_credentials(tmp_path):
+    """An endpoint denying access says where its credentials are declared."""
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(tmp_path, (MAPPING_ENDPOINT, f'{server.url}/sparql'))
+        with pytest.raises(ValueError, match=r"'username' and 'password'.*\[RESOURCE:<name>\]"):
+            morph_kgc.materialize(sparql_config(mapping=mapping))
+
+
+def test_endpoint_matched_by_url_from_the_environment(tmp_path, monkeypatch):
+    """The URL of a resource matches the mapping once its placeholders are replaced."""
+    with VocabularyServer() as server:
+        monkeypatch.setenv('CLINICAL_TRIALS_ENDPOINT', f'{server.url}/sparql')
+        mapping = sparql_mapping(tmp_path, (MAPPING_ENDPOINT, f'{server.url}/sparql'))
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource('{CLINICAL_TRIALS_ENDPOINT}', iri=''),
+            mapping=mapping,
+        ))
+
+    assert_isomorphic(expected_sparql_graph(), g_morph)
+
+
+def test_endpoint_url_from_an_unset_variable(tmp_path, monkeypatch, caplog):
+    """A resource whose URL cannot be known is said to be passed over."""
+    monkeypatch.delenv('CLINICAL_TRIALS_ENDPOINT', raising=False)
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(tmp_path, (MAPPING_ENDPOINT, f'{server.url}/sparql'))
+        with pytest.raises(ValueError, match="'username' and 'password'"):
+            morph_kgc.materialize(sparql_config(
+                endpoint_resource('{CLINICAL_TRIALS_ENDPOINT}', iri=''),
+                mapping=mapping,
+            ))
+
+    assert "'CLINICAL_TRIALS_ENDPOINT', which is not set" in caplog.text
+
+
+def test_endpoint_declared_without_url():
+    """A resource naming the endpoint by its IRI must say where to query it."""
+    with pytest.raises(ValueError, match="does not declare the 'url'"):
+        morph_kgc.materialize(sparql_config(
+            f'[RESOURCE:clinical_trials]\n'
+            f'resource_type=SPARQL_ENDPOINT\n'
+            f'iri={MAPPING_ENDPOINT}\n'
+        ))
+
+
+def test_several_reconciliations_in_one_mapping():
+    """
+    Each execution pairs its query with its endpoint, so a mapping reconciles
+    against several knowledge graphs. The same query sent to the same endpoint
+    by two executions is sent once.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql') + (
+                f'\n[RESOURCE:public]\n'
+                f'resource_type=SPARQL_ENDPOINT\n'
+                f'iri=https://data.com/public/query\n'
+                f'url={server.url}/public/sparql\n'
+            ),
+            mapping=os.path.join(TEST_DIR, 'mapping_sparql_several.ttl'),
+        ))
+
+        assert sorted(server.requests) == sorted([
+            ('/public/sparql', STUDIES_QUERY),
+            ('/sparql', DRUGS_QUERY),
+            ('/sparql', STUDIES_QUERY),
+        ])
+
+    assert_isomorphic(expected_sparql_graph('output_sparql_several.nq'), g_morph)
+
+
+def test_value_matching_several_entities(tmp_path):
+    """A value matching several entities yields one triple per entity."""
     query = (
-        'SELECT ?concept ?attribute ?value WHERE '
-        '{ ?concept ?attribute ?value }'
+        'SELECT ?entity_iri ("NCT07667218" AS ?matching_value_1) '
+        'WHERE { GRAPH ?g { ?entity_iri a <https://schema.org/MedicalStudy> } }'
+    )
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (STUDIES_QUERY, query),
+        )
+        g_morph = morph_kgc.materialize(sparql_config(mapping=mapping))
+
+    assert {str(o) for o in g_morph.objects()} == {
+        f'https://data.com/id/{i}' for i in range(1, 5)
+    }
+
+
+def test_case_insensitive_matching_in_the_mapping(tmp_path):
+    """
+    Values are matched exactly, so a mapping matching them whatever their case
+    lowercases both the values of the query and the values it reconciles.
+    """
+    with open(os.path.join(TEST_DIR, 'clinical_trials.csv'), encoding='utf-8') as f:
+        rows = f.read().replace('NCT07667218', 'nct07667218').replace('NCT07667205', 'Nct07667205')
+    (tmp_path / 'clinical_trials.csv').write_text(rows, encoding='utf-8')
+    source = str(tmp_path / 'clinical_trials.csv').replace('\\', '/')
+
+    lowercase_query = (
+        'PREFIX schema: <https://schema.org/> '
+        'SELECT ?entity_iri ?matching_value_1 WHERE { GRAPH ?g { '
+        '?entity_iri a schema:MedicalStudy ; schema:identifier ?identifier } '
+        'BIND(LCASE(?identifier) AS ?matching_value_1) }'
+    )
+    lowercase_value = (
+        '[ rml:functionExecution <#LowerCase> ] ] .\n\n'
+        '<#LowerCase>\n'
+        '    rml:function grel:toLowerCase ;\n'
+        '    rml:input [\n'
+        '        rml:parameter grel:valueParameter ;\n'
+        '        rml:inputValueMap [ rml:reference "clinical_trial_id" ]\n'
+        '    ] .\n'
     )
 
     with VocabularyServer() as server:
-        g_morph = morph_kgc.materialize(sparql_config(
-            f'resource_type=SPARQL_ENDPOINT\n'
-            f'url={server.url}/sparql\n'
-            f'username={USERNAME}\n'
-            f'password={PASSWORD}\n'
-            f'query={query}'
+        endpoint = (MAPPING_ENDPOINT, f'{server.url}/public/sparql')
+        source_file = ('test/rml-fnml/reconciliation/clinical_trials.csv', source)
+        exact = morph_kgc.materialize(sparql_config(
+            mapping=sparql_mapping(tmp_path, endpoint, source_file),
+        ))
+        case_insensitive = morph_kgc.materialize(sparql_config(
+            mapping=sparql_mapping(
+                tmp_path, endpoint, source_file,
+                (STUDIES_QUERY, lowercase_query),
+                ('[ rml:reference "clinical_trial_id" ]\n    ] .\n', lowercase_value),
+            ),
         ))
 
-        assert server.requests[0][1] == query
+    assert len(exact) == 1
+    assert_isomorphic(expected_sparql_graph(), case_insensitive)
 
-    assert_isomorphic(expected_graph(), g_morph)
 
-
-def test_reconcile_sparql_endpoint_with_named_graphs():
-    """
-    The default query reads the concepts from the named graphs as well, so a
-    vocabulary loaded into named graphs of a triplestore is reconciled against.
-    """
+def test_reconcile_entity_over_sparql_with_multiple_processes():
+    """Worker processes read the indexes back from the state directory."""
     with VocabularyServer() as server:
         g_morph = morph_kgc.materialize(sparql_config(
-            f'resource_type=SPARQL_ENDPOINT\n'
-            f'url={server.url}/sparql/named-graphs\n'
-            f'username={USERNAME}\n'
-            f'password={PASSWORD}'
+            endpoint_resource(f'{server.url}/sparql'), processes=4,
         ))
 
-        assert 'GRAPH' in server.requests[0][1]
-
-    assert_isomorphic(expected_graph(), g_morph)
+    assert_isomorphic(expected_sparql_graph(), g_morph)
 
 
-def test_reconcile_sparql_endpoint_with_named_graphs_and_graph_variable():
-    """A projected variable named like the graph one does not hide the named graphs."""
+def test_reconcile_entity_over_sparql_from_yarrrml():
+    """The query survives YARRRML as a block scalar, comments included."""
     with VocabularyServer() as server:
         g_morph = morph_kgc.materialize(sparql_config(
-            f'resource_type=SPARQL_ENDPOINT\n'
-            f'url={server.url}/sparql/named-graphs\n'
-            f'username={USERNAME}\n'
-            f'password={PASSWORD}\n'
-            f'concept_variable=graph'
+            endpoint_resource(f'{server.url}/sparql'),
+            mapping=os.path.join(TEST_DIR, 'mapping_sparql.yarrrml'),
         ))
 
-    assert_isomorphic(expected_graph(), g_morph)
+        assert '# The entities are described in named graphs.\n' in server.requests[0][1]
+
+    assert_isomorphic(expected_sparql_graph(), g_morph)
+
+
+@pytest.mark.parametrize('query, error', [
+    (
+        'SELECT ?study ?matching_value_1 WHERE { GRAPH ?g { ?study '
+        '<https://schema.org/identifier> ?matching_value_1 } }',
+        r'does not project \?entity_iri\. .* It projects: \?study \?matching_value_1',
+    ),
+    (
+        'SELECT ?entity_iri ?identifier WHERE { GRAPH ?g { ?entity_iri '
+        '<https://schema.org/identifier> ?identifier } }',
+        r'does not project \?matching_value_1\.',
+    ),
+    (
+        'SELECT ?entity_iri ?matching_value_1 ?matching_value_2 WHERE { GRAPH ?g { '
+        '?entity_iri <https://schema.org/identifier> ?matching_value_1, ?matching_value_2 } }',
+        r'projects \?matching_value_2',
+    ),
+])
+def test_query_projecting_other_variables(tmp_path, query, error):
+    """A query not following the variable convention fails instead of matching nothing."""
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (STUDIES_QUERY, query),
+        )
+        with pytest.raises(ValueError, match=error):
+            morph_kgc.materialize(sparql_config(mapping=mapping))
+
+
+@pytest.mark.parametrize('replacement', [
+    # No query at all.
+    ('rml:parameter morph-fn:sparqlQuery ;', 'rml:parameter morph-fn:unused ;'),
+    # A query read from the data, which is not known before it is read.
+    (f'rml:inputValue """{STUDIES_QUERY}"""',
+     'rml:inputValueMap [ rml:reference "clinical_trial_id" ]'),
+])
+def test_query_not_given_as_a_constant(tmp_path, replacement):
+    """The query is sent before any data is read, so the mapping must give it."""
+    mapping = sparql_mapping(tmp_path, replacement)
+    with pytest.raises(ValueError, match='sparqlQuery.*once, to a constant'):
+        morph_kgc.materialize(sparql_config(mapping=mapping))
+
+
+@pytest.mark.parametrize('endpoint, error', [
+    ('clinical_trials', r'must be an http\(s\) URL'),
+    ('test/rml-fnml/reconciliation/clinical_trials.trig', r'must be an http\(s\) URL'),
+    ('https://user:s3cr3t@data.com/database/query', 'holds credentials'),
+])
+def test_endpoint_not_a_plain_url(tmp_path, endpoint, error):
+    """The endpoint is an http(s) URL, and its credentials stay out of the mapping."""
+    mapping = sparql_mapping(tmp_path, (MAPPING_ENDPOINT, endpoint))
+    with pytest.raises(ValueError, match=error):
+        morph_kgc.materialize(sparql_config(mapping=mapping))
+
+
+def test_query_bound_twice(tmp_path):
+    """An execution sends one query, not one per binding."""
+    mapping = sparql_mapping(tmp_path, (
+        'rml:parameter morph-fn:sparqlQuery ;',
+        'rml:parameter morph-fn:sparqlQuery ;\n        rml:inputValue "SELECT * {}" ;',
+    ))
+    with pytest.raises(ValueError, match='sparqlQuery.*once, to a constant'):
+        morph_kgc.materialize(sparql_config(mapping=mapping))
+
+
+def test_endpoint_declared_twice():
+    """Two resources declaring the endpoint the mapping names are ambiguous."""
+    with pytest.raises(ValueError, match='declared by several resources'):
+        morph_kgc.materialize(sparql_config(
+            endpoint_resource('https://staging.data.com/query')
+            + '\n' + endpoint_resource('https://test.data.com/query', name='other')
+        ))
+
+
+def test_options_that_are_not_access_options(caplog):
+    """Options that no longer belong to the configuration file are reported."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(
+                f'{server.url}/sparql',
+                'query=SELECT ?concept ?value WHERE { ?concept ?p ?value }\n'
+                'matching=CASE-INSENSITIVE',
+            )
+        ))
+
+    assert_isomorphic(expected_sparql_graph(), g_morph)
+    assert "Option 'matching' of resource 'clinical_trials' is ignored" in caplog.text
+    assert "Option 'query' of resource 'clinical_trials' is ignored" in caplog.text
+
+
+def test_endpoint_rejecting_the_query(tmp_path):
+    """What the endpoint says about a query it rejects is reported."""
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (STUDIES_QUERY, 'SELECT ?entity_iri ?matching_value_1 WHERE { GRAPH ?g { '),
+        )
+        with pytest.raises(ValueError, match='answered 400 Bad Request: .+'):
+            morph_kgc.materialize(sparql_config(mapping=mapping))
+
+
+def test_query_that_is_not_a_select_query(tmp_path):
+    """The answer to a query other than a SELECT query is not taken for one."""
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (STUDIES_QUERY, 'ASK { GRAPH ?g { ?s ?p ?o } }'),
+        )
+        with pytest.raises(ValueError, match='must be a SELECT query'):
+            morph_kgc.materialize(sparql_config(mapping=mapping))
+
+
+def test_entities_that_are_not_iris(tmp_path, caplog):
+    """Solutions binding the entity to something other than an IRI are left out."""
+    query = (
+        'PREFIX schema: <https://schema.org/> '
+        'SELECT ?entity_iri ?matching_value_1 WHERE { GRAPH ?g { '
+        '?study a schema:MedicalStudy ; schema:identifier ?matching_value_1 } '
+        'BIND(IF(?study = <https://data.com/id/1>, STR(?study), ?study) AS ?entity_iri) }'
+    )
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (STUDIES_QUERY, query),
+        )
+        g_morph = morph_kgc.materialize(sparql_config(mapping=mapping))
+
+    assert {str(o) for o in g_morph.objects()} == {
+        'https://data.com/id/2', 'https://data.com/id/3',
+    }
+    assert 'other than an IRI in 1 solution(s)' in caplog.text
+
+
+def test_query_too_long_for_a_url(tmp_path):
+    """A query too long to be sent in a URL is sent with POST."""
+    long_query = STUDIES_QUERY + '#' * 5000 + '\n'
+    with VocabularyServer() as server:
+        endpoint = (MAPPING_ENDPOINT, f'{server.url}/public/sparql')
+        morph_kgc.materialize(sparql_config(mapping=sparql_mapping(tmp_path, endpoint)))
+        morph_kgc.materialize(sparql_config(
+            mapping=sparql_mapping(tmp_path, endpoint, (STUDIES_QUERY, long_query)),
+        ))
+
+        assert server.methods == ['GET', 'POST']
+        assert server.requests[1][1] == long_query
+
+
+def test_endpoint_answering_too_late(tmp_path):
+    """A query the endpoint answers too late says how to wait longer."""
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(tmp_path, (MAPPING_ENDPOINT, f'{server.url}/public/sparql/slow'))
+        with pytest.raises(ValueError, match="did not answer the query.*'timeout'"):
+            morph_kgc.materialize(sparql_config(
+                f'[RESOURCE:slow]\n'
+                f'resource_type=SPARQL_ENDPOINT\n'
+                f'url={server.url}/public/sparql/slow\n'
+                f'timeout=1',
+                mapping=mapping,
+            ))

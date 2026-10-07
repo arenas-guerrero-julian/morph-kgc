@@ -52,6 +52,20 @@ _LOADED_CONTEXTS: dict[tuple[str, str], Any] = {}
 # ── Initialization context handed to initializers ─────────────────────────────
 
 @dataclass(frozen=True)
+class ExecutionParameters:
+    """
+    What one execution of a function binds to each parameter IRI, as far as it
+    is known before any data is read: the constant values, in mapping order,
+    and the parameter IRIs bound to the data (a reference, a template or
+    another execution), whose values are only known row by row.
+    """
+
+    execution_id: str
+    constants: dict[str, list[str]] = field(default_factory=dict)
+    bound_to_data: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class InitializationContext:
     """
     What an initializer is told about the mapping it is initialized for.
@@ -68,11 +82,16 @@ class InitializationContext:
         they are the values known before any data is read, which is what an
         initializer can act on (which resource to fetch, which attributes to
         index, ...).
+    executions:
+        What each execution of the function in the mapping binds, so that
+        values that only make sense together, such as a query and the endpoint
+        it is sent to, are paired by the execution binding them.
     """
 
     function_iri: str
     config: Any
     parameters: dict[str, list[str]] = field(default_factory=dict)
+    executions: tuple[ExecutionParameters, ...] = ()
 
     # -- Constants ----------------------------------------------------------
 
@@ -175,6 +194,23 @@ def _constant_parameters(executions: list[FNMLExecution]) -> dict[str, list[str]
     return parameters
 
 
+def _execution_parameters(execution: FNMLExecution) -> ExecutionParameters:
+    """What *execution* binds to each parameter IRI before any data is read."""
+    constants: dict[str, list[str]] = {}
+    bound_to_data: set[str] = set()
+    for input_binding in execution.inputs:
+        for value in input_binding.values:
+            if value.map_type == RML_CONSTANT:
+                constants.setdefault(input_binding.parameter_iri, []).append(value.map_value)
+            else:
+                bound_to_data.add(input_binding.parameter_iri)
+    return ExecutionParameters(
+        execution_id  = execution.execution_id,
+        constants     = constants,
+        bound_to_data = frozenset(bound_to_data),
+    )
+
+
 def _stateful_functions(rml_mapping, config) -> dict[str, list[FNMLExecution]]:
     """
     Group the executions of the mapping by stateful function IRI.
@@ -227,6 +263,9 @@ def initialize_contexts(config, rml_mapping) -> ContextSession:
                 function_iri = function_iri,
                 config       = config,
                 parameters   = _constant_parameters(executions),
+                executions   = tuple(
+                    _execution_parameters(execution) for execution in executions
+                ),
             )
 
             if len(signature(registered.initializer).parameters) == 0:

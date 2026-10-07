@@ -6,13 +6,21 @@ A throwaway HTTP server used by the reconciliation tests: it serves the SKOS
 vocabulary and answers SPARQL queries, both behind HTTP Basic Authentication,
 so that the tests exercise the remote code paths without reaching the network.
 
-``/sparql`` answers every query with fixed bindings, while ``/sparql/named-graphs``
-evaluates it over a dataset that keeps the vocabulary in named graphs only.
+The SPARQL endpoints evaluate queries over the knowledge graph of
+``clinical_trials.trig``, which keeps every entity in a named graph of its own:
+
+- ``/sparql`` has a default graph that does not include the named graphs, as
+  Fuseki, Oxigraph or Stardog by default.
+- ``/sparql/union`` has a default graph that is the union of the named graphs,
+  as GraphDB or Virtuoso.
+- ``/public/sparql`` is ``/sparql`` without authentication.
+- ``/public/sparql/slow`` is ``/public/sparql`` taking longer than a second
+  to answer.
 """
 
-import json
 import os
 import threading
+import time
 from base64 import b64encode
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -24,21 +32,6 @@ PASSWORD = 's3cr3t'
 
 TEST_DIR = os.path.dirname(os.path.realpath(__file__))
 
-# The bindings the fake endpoint answers every SELECT query with.
-SPARQL_BINDINGS = [
-    {
-        'concept':   {'type': 'uri', 'value': 'https://data.boehringer.com/id/00036/10073037'},
-        'attribute': {'type': 'uri', 'value': 'http://www.w3.org/2004/02/skos/core#altLabel'},
-        'value':     {'type': 'literal', 'value': 'Early-onset spastic ataxia-myoclonic epilepsy-neuropathy syndrome'},
-    },
-    {
-        'concept':   {'type': 'uri', 'value': 'https://data.boehringer.com/id/00036/10077339'},
-        'attribute': {'type': 'uri', 'value': 'http://www.w3.org/2004/02/skos/core#prefLabel'},
-        'value':     {'type': 'literal', 'value': 'Autosomal dominant cerebellar ataxia-deafness-narcolepsy syndrome'},
-    },
-]
-
-
 # Served as text/plain, as some servers do with files they do not know.
 VOCABULARY_FILES = {
     '/vocabulary': ('disease_vocabulary.ttl', 'text/turtle'),
@@ -47,11 +40,22 @@ VOCABULARY_FILES = {
 }
 
 
-def _named_graph_dataset():
-    """A dataset whose default graph is empty and is not the union of the others."""
-    dataset = Dataset()
-    dataset.parse(os.path.join(TEST_DIR, 'disease_vocabulary.nq'), format='nquads')
+def _knowledge_graph(default_union):
+    dataset = Dataset(default_union=default_union)
+    dataset.parse(os.path.join(TEST_DIR, 'clinical_trials.trig'), format='trig')
     return dataset
+
+
+# SPARQL endpoint path -> whether its default graph is the union of the others.
+SPARQL_ENDPOINTS = {
+    '/sparql': False,
+    '/sparql/union': True,
+    '/public/sparql': False,
+    '/public/sparql/slow': False,
+}
+
+# Paths answered without authentication.
+PUBLIC_PREFIX = '/public/'
 
 
 def _expected_authorization():
@@ -60,11 +64,12 @@ def _expected_authorization():
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """Serves /vocabulary and /sparql, both requiring Basic Authentication."""
+    """Serves the vocabulary and the SPARQL endpoints."""
 
     # Requests reaching the server, so that tests can assert the vocabulary is
-    # fetched exactly once.
+    # fetched (and each query sent) exactly once, and the HTTP methods they used.
     requests = []
+    methods = []
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -78,27 +83,33 @@ class _Handler(BaseHTTPRequestHandler):
         self._dispatch(urlsplit(self.path).path, query)
 
     def _dispatch(self, path, query):
-        if self.headers.get('Authorization') != _expected_authorization():
+        if (
+            not path.startswith(PUBLIC_PREFIX)
+            and self.headers.get('Authorization') != _expected_authorization()
+        ):
             self._respond(401, b'unauthorized', 'text/plain')
             return
 
-        type(self).requests.append((path, query))
+        # A mapping checked out with Windows line endings sends its query with
+        # them; the tests compare queries whatever the platform.
+        type(self).requests.append((path, query.replace('\r\n', '\n')))
+        type(self).methods.append(self.command)
 
         if path in VOCABULARY_FILES:
             file_name, content_type = VOCABULARY_FILES[path]
             with open(os.path.join(TEST_DIR, file_name), 'rb') as f:
                 self._respond(200, f.read(), content_type)
-        elif path == '/sparql/named-graphs':
-            results = _named_graph_dataset().query(query).serialize(format='json')
-            self._respond(200, results, 'application/sparql-results+json')
-        elif path == '/sparql':
-            results = {
-                'head': {'vars': ['concept', 'attribute', 'value']},
-                'results': {'bindings': SPARQL_BINDINGS},
-            }
+        elif path in SPARQL_ENDPOINTS:
+            if path.endswith('/slow'):
+                time.sleep(1.5)
+            try:
+                results = _knowledge_graph(SPARQL_ENDPOINTS[path]).query(query)
+            except Exception as exc:
+                self._respond(400, str(exc).encode(), 'text/plain')
+                return
             self._respond(
                 200,
-                json.dumps(results).encode(),
+                results.serialize(format='json'),
                 'application/sparql-results+json',
             )
         else:
@@ -124,6 +135,7 @@ class VocabularyServer:
 
     def __enter__(self):
         _Handler.requests = []
+        _Handler.methods = []
         self._server = HTTPServer(('127.0.0.1', 0), _Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
@@ -142,3 +154,7 @@ class VocabularyServer:
     @property
     def requests(self):
         return list(_Handler.requests)
+
+    @property
+    def methods(self):
+        return list(_Handler.methods)
