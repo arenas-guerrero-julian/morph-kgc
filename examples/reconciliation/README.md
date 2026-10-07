@@ -56,8 +56,14 @@ matching=CASE-INSENSITIVE
     ] .
 ```
 
-`{ENV_VAR}` placeholders in `url`, `username` and `password` are replaced with
-environment variables, so credentials need not be written to the file at all.
+An object map using the function needs `rml:termType rml:IRI`
+(`rr:termType rr:IRI`, `type: iri` in YARRRML): one whose value is the result of
+a function generates literals by default (RML-FNML, section 5.1), while a
+subject map generates IRIs.
+
+`{ENV_VAR}` placeholders in `iri`, `url`, `username` and `password` are replaced
+with environment variables, so credentials need not be written to the file at
+all.
 
 ## Resource options
 
@@ -66,10 +72,10 @@ environment variables, so credentials need not be written to the file at all.
 | `resource_type` | `SKOS_VOCABULARY` |
 | `url` | where the vocabulary is downloaded from. A local path is read from disk |
 | `iri` | the IRI identifying the vocabulary, when it differs from `url`. A mapping may name the resource by it |
-| `username`, `password` | HTTP Basic Authentication credentials |
+| `username`, `password` | HTTP Basic Authentication credentials, which are not accepted in `url` |
 | `format` | RDF serialization of the vocabulary (`turtle`, `xml`, `nt`, `nquads`, `trig`, `json-ld`, ...). Guessed from the response and the URL when omitted. A vocabulary serialized as quads is indexed across all its named graphs |
 | `matching` | `EXACT` (default) or `CASE-INSENSITIVE`, which also collapses whitespace |
-| `attributes` | comma-separated attributes to index when the mapping names none |
+| `attributes` | comma-separated attributes the value is matched against when the execution names none, as IRIs or as prefixed names (`skos:prefLabel`) with one of the prefixes `skos`, `rdf`, `rdfs`, `owl`, `xsd`, `dc`, `dcterms`/`dct`, `schema` (`https://schema.org/`) or `foaf`; an attribute in another namespace is written as a full IRI. Without it, every property whose value is a literal |
 | `timeout` | seconds to wait for the vocabulary (default `30`) |
 
 ## Function parameters
@@ -78,10 +84,12 @@ environment variables, so credentials need not be written to the file at all.
 | --- | --- |
 | `grel:valueParam` | the value to reconcile |
 | `morph-fn:resource` | name of the `[RESOURCE:<name>]` section to reconcile against. May be omitted when a single vocabulary is declared. `morph-fn:vocabularyIRI` is an accepted spelling, and also accepts the IRI identifying the vocabulary |
-| `morph-fn:attributeIRI` | the vocabulary property (or properties) the value is matched against, e.g. `skos:prefLabel`. Bind it several times to match against several: they are matched as a union, since RDF puts no order on the values of a property. `grel:attributeIRI` is accepted as well |
+| `morph-fn:attributeIRI` | the vocabulary property (or properties) the value is matched against, e.g. `skos:prefLabel`. Bind it several times to match against several: they are matched as a union, since RDF puts no order on the values of a property. `grel:attributeIRI` is accepted as well, and both may be bound together. When omitted, the `attributes` option of the resource applies |
 
 A value matching no concept yields no triple. A value matching several concepts
-yields one triple per matched concept.
+yields one triple per matched concept. Resources typed as concept schemes or
+collections are never matched. The concepts are IRIs, so an object map
+generating them needs `rml:termType rml:IRI`.
 
 ## YARRRML
 

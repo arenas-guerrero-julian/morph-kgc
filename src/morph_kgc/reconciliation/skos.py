@@ -22,17 +22,42 @@ vocabulary fetched from the URL declared by a ``[RESOURCE:<name>]`` section::
 The vocabulary is retrieved once, during the context initialization phase. It
 may be serialized as triples or as quads (N-Quads, TriG): the concepts of every
 graph of a vocabulary split across named graphs are indexed.
+
+The ``attributes`` are absolute IRIs, or prefixed names with one of the
+well-known prefixes in :data:`WELL_KNOWN_PREFIXES` (``skos:``, ``dcterms:``,
+``schema:``, ...). An attribute in any other namespace is written as a full IRI.
 """
 
 import logging
+from urllib.parse import urlsplit
 
 import rdflib
+from rdflib.namespace import DC, DCTERMS, FOAF, OWL, RDF, RDFS, SDO, SKOS, XSD
 
 from ..constants import LOGGING_NAMESPACE
 from ..http import DEFAULT_TIMEOUT, fetch
 from .index import ConceptIndex, EXACT_MATCHING, VALID_MATCHINGS
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
+
+# Prefixes the 'attributes' option may use. The prefixes a vocabulary declares
+# are not used: rdflib renames them when they clash with its own bindings.
+WELL_KNOWN_PREFIXES = {
+    "skos":    str(SKOS),
+    "rdf":     str(RDF),
+    "rdfs":    str(RDFS),
+    "owl":     str(OWL),
+    "xsd":     str(XSD),
+    "dc":      str(DC),
+    "dcterms": str(DCTERMS),
+    "dct":     str(DCTERMS),
+    "schema":  str(SDO),
+    "foaf":    str(FOAF),
+}
+
+# SKOS makes these classes disjoint from skos:Concept: their resources are
+# labelled as concepts are, but no value identifies one of them as a concept.
+NON_CONCEPT_CLASSES = (SKOS.ConceptScheme, SKOS.Collection, SKOS.OrderedCollection)
 
 # Serializations we can ask for, most specific first.
 ACCEPTED_MEDIA_TYPES = (
@@ -74,12 +99,40 @@ def get_matching(resource) -> str:
     return matching
 
 
-def resolve_attributes(resource, attributes) -> tuple[str, ...]:
+def is_absolute_iri(value: str) -> bool:
     """
-    Attributes to index: those the mapping matches against, falling back to the
-    'attributes' option of the resource.
+    True when *value* is an absolute IRI that no prefixed name can be mistaken
+    for: one with an authority (``http://...``) or an absolute path
+    (``file:///...``), or a URN or tag IRI.
     """
-    return tuple(attributes) or tuple(resource.get_list("attributes"))
+    parts = urlsplit(value)
+    return bool(parts.scheme) and (
+        bool(parts.netloc)
+        or parts.path.startswith("/")
+        or parts.scheme.lower() in ("urn", "tag")
+    )
+
+
+def resolve_attributes(resource) -> tuple[str, ...]:
+    """
+    The 'attributes' option of *resource*, its prefixed names expanded with the
+    well-known prefixes.
+    """
+    attributes = []
+    for attribute in resource.get_list("attributes"):
+        prefix, separator, local_name = attribute.partition(":")
+        if is_absolute_iri(attribute):
+            attributes.append(attribute)
+        elif separator and prefix in WELL_KNOWN_PREFIXES:
+            attributes.append(WELL_KNOWN_PREFIXES[prefix] + local_name)
+        else:
+            raise ValueError(
+                f"Option 'attributes' of resource '{resource.name}' holds "
+                f"'{attribute}', which is neither an absolute IRI nor a prefixed "
+                "name with one of the prefixes "
+                f"{', '.join(sorted(WELL_KNOWN_PREFIXES))}. Write it as a full IRI."
+            )
+    return tuple(attributes)
 
 
 def guess_format(resource, url: str, content_type: str) -> str | None:
@@ -114,6 +167,12 @@ def load_vocabulary_graph(resource) -> rdflib.Dataset:
             f"Resource '{resource.name}' does not declare the 'url' of the "
             "vocabulary to reconcile against."
         )
+    if urlsplit(url).username is not None:
+        raise ValueError(
+            f"The 'url' of resource '{resource.name}' holds credentials. Keep "
+            "them out of the URL: declare them as 'username' and 'password' in "
+            f"the configuration file, in its '[RESOURCE:{resource.name}]' section."
+        )
 
     response = fetch(
         url,
@@ -140,33 +199,65 @@ def load_vocabulary_graph(resource) -> rdflib.Dataset:
     return graph
 
 
-def build_index(resource, attributes=()) -> ConceptIndex:
+def build_index(resource, matched_attributes=((),)) -> ConceptIndex:
     """
     Build the concept index of a SKOS vocabulary resource.
 
-    Only *attributes* are indexed, which keeps the shared context to the part of
-    the vocabulary the mapping actually reconciles against. When neither the
-    mapping nor the resource names any, every property of the vocabulary whose
-    value is a literal is indexed.
+    *matched_attributes* holds, for each execution of the function reconciling
+    against the resource, the attributes it matches against: the ones it names,
+    ``()`` when it names none, and ``None`` when it reads them from the data.
+    An execution naming none matches against the 'attributes' option of the
+    resource or, without it, against every property of the vocabulary whose
+    value is a literal.
+
+    Only those attributes are indexed, which keeps the shared context to the
+    part of the vocabulary the mapping actually reconciles against. Concept
+    schemes and collections are left out.
     """
+    # The option only concerns the executions naming no attribute: a mistake in
+    # it does not stop a mapping none of whose executions relies on it.
+    default_attributes = ()
+    if any(attributes == () for attributes in matched_attributes):
+        default_attributes = resolve_attributes(resource)
+
     graph = load_vocabulary_graph(resource)
-    attributes = resolve_attributes(resource, attributes)
 
-    index = ConceptIndex(
-        matching           = get_matching(resource),
-        default_attributes = attributes,
-    )
+    attributes = {}
+    every_attribute = False
+    for execution_attributes in matched_attributes:
+        if execution_attributes is None:
+            every_attribute = True
+        elif execution_attributes:
+            attributes.update(dict.fromkeys(execution_attributes))
+        elif default_attributes:
+            attributes.update(dict.fromkeys(default_attributes))
+        else:
+            every_attribute = True
 
-    if attributes:
-        for attribute in attributes:
-            predicate = rdflib.term.URIRef(attribute)
-            for concept, value in graph.subject_objects(predicate):
-                index.add(attribute, value, str(concept))
-    else:
+    index = ConceptIndex(matching=get_matching(resource))
+
+    non_concepts = {
+        subject
+        for concept_class in NON_CONCEPT_CLASSES
+        for subject in graph.subjects(RDF.type, concept_class)
+    }
+
+    literal_attributes = {}
+    if every_attribute:
         # Iterating a dataset yields quads, its triples() the union of graphs.
         for concept, predicate, value in graph.triples((None, None, None)):
-            if isinstance(value, rdflib.term.Literal):
+            if isinstance(value, rdflib.term.Literal) and concept not in non_concepts:
                 index.add(str(predicate), value, str(concept))
+                literal_attributes[str(predicate)] = None
+    for attribute in attributes:
+        predicate = rdflib.term.URIRef(attribute)
+        for concept, value in graph.subject_objects(predicate):
+            if concept not in non_concepts:
+                index.add(attribute, value, str(concept))
+
+    # An execution naming no attribute matches against these, not against every
+    # indexed attribute: one only another execution names may take IRIs.
+    index.default_attributes = default_attributes or tuple(literal_attributes)
 
     LOGGER.info(
         f"Resource '{resource.name}': indexed {len(index)} value(s) of "

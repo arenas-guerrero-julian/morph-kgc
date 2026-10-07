@@ -71,7 +71,10 @@ endpoint.
 
 A function returns the IRI of the matched entity, ``None`` when the value
 matches none (the triple is then not generated), and the list of matched IRIs
-when a value is ambiguous.
+when a value is ambiguous. An object map using a function needs
+``rml:termType rml:IRI`` (``rr:termType rr:IRI``, ``type: iri`` in YARRRML):
+one whose value is the result of a function generates literals by default
+(RML-FNML, section 5.1), while a subject map generates IRIs.
 """
 
 import logging
@@ -96,6 +99,7 @@ from ..constants import (
 from ..reconciliation import skos, sparql
 from ..reconciliation.index import ReconciliationContext
 from .bif_decorator import stateful_bif
+from .param_resolver import MergedAliases
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
@@ -110,6 +114,41 @@ def _result(value, matches):
 
 
 # ── SKOS vocabulary ───────────────────────────────────────────────────────────
+
+def _matched_attributes(initialization, resource) -> list:
+    """
+    The attributes each execution of the function that may reconcile against
+    *resource* matches against, as :func:`skos.build_index` takes them: the
+    constant ones it binds, under any parameter IRI, ``()`` when it binds none,
+    and ``None`` when it reads them from the data. Each execution is accounted
+    for on its own, so that what one binds does not limit another.
+    """
+    matched = []
+    for execution in initialization.executions:
+        # An execution not naming its resource as a constant may use any.
+        named = {
+            initialization.resource(value).name
+            for parameter_iri in MORPH_RESOURCE_PARAMETERS
+            for value in execution.constants.get(parameter_iri, [])
+        }
+        if (
+            named
+            and resource.name not in named
+            and not execution.bound_to_data.intersection(MORPH_RESOURCE_PARAMETERS)
+        ):
+            continue
+
+        if execution.bound_to_data.intersection(MORPH_ATTRIBUTE_PARAMETERS):
+            matched.append(None)
+        else:
+            matched.append(tuple(
+                value
+                for parameter_iri in MORPH_ATTRIBUTE_PARAMETERS
+                for value in execution.constants.get(parameter_iri, [])
+            ))
+
+    return matched
+
 
 def _initialize_vocabulary(initialization) -> ReconciliationContext:
     """
@@ -132,8 +171,6 @@ def _initialize_vocabulary(initialization) -> ReconciliationContext:
             f"'resource_type={SKOS_VOCABULARY_RESOURCE}' to the configuration file."
         )
 
-    attributes = initialization.constants(*MORPH_ATTRIBUTE_PARAMETERS)
-
     context = ReconciliationContext()
     for mapping_value, resource in resources.items():
         if resource.resource_type and resource.resource_type != SKOS_VOCABULARY_RESOURCE:
@@ -146,8 +183,18 @@ def _initialize_vocabulary(initialization) -> ReconciliationContext:
         # Several mapping values (the resource name and its URL) may point at
         # the same resource; it is fetched once and reachable through all of them.
         if resource.name not in context.indexes:
-            context.add(resource.name, skos.build_index(resource, attributes))
-        context.alias(resource.name, mapping_value, *resource.identifiers())
+            context.add(
+                resource.name,
+                skos.build_index(resource, _matched_attributes(initialization, resource)),
+            )
+        # The IRI is expanded, unless it names an unset variable, but the URL is
+        # kept as declared: expanded, it may hold a secret read from the
+        # environment (an API key), and the context is written to disk.
+        try:
+            iri = resource.get_iri()
+        except ValueError:
+            iri = ""
+        context.alias(resource.name, mapping_value, iri, resource.url)
 
     return context
 
@@ -157,14 +204,15 @@ def _initialize_vocabulary(initialization) -> ReconciliationContext:
     initializer = _initialize_vocabulary,
     value       = (GREL_VALUE_PARAM, GREL_VALUE_PARAMETER),
     resource    = MORPH_RESOURCE_PARAMETERS,
-    attribute   = MORPH_ATTRIBUTE_PARAMETERS,
+    attribute   = MergedAliases(MORPH_ATTRIBUTE_PARAMETERS),
 )
 def reconcile_vocabulary_concept(context, value, resource=None, attribute=None):
     """Reconcile *value* against a SKOS vocabulary fetched from a URL."""
     index = context.get(resource)
 
-    # A parameter bound several times (e.g. skos:prefLabel and skos:altLabel)
-    # arrives as a list; the value is matched against all of them.
+    # A parameter bound several times (e.g. skos:prefLabel and skos:altLabel),
+    # under any of its IRIs, arrives as a list; the value is matched against
+    # all of them.
     if attribute is None:
         attributes = ()
     elif isinstance(attribute, (list, tuple)):
@@ -207,15 +255,11 @@ def _endpoint_resource(initialization, endpoint: str) -> ResourceConfig:
 
     declared = initialization.config.get_resources_of_type(SPARQL_ENDPOINT_RESOURCE)
     matches = []
+    # Errors of identifiers naming an unset environment variable, which may
+    # well name this endpoint.
     unexpanded = []
     for resource in declared.values():
-        try:
-            url = resource.get_url()
-        except ValueError as exc:
-            # An unset environment variable; it may well name this endpoint.
-            url = ""
-            unexpanded.append(str(exc))
-        if endpoint in (resource.get("iri"), resource.url, url):
+        if endpoint in resource.identifiers(unexpanded):
             matches.append(resource)
 
     if len(matches) > 1:

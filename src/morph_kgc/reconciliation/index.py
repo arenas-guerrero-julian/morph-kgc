@@ -41,8 +41,8 @@ class ConceptIndex:
     """Values of a set of attributes, and the concepts they identify."""
 
     matching: str = EXACT_MATCHING
-    # Attributes matched against when the mapping does not name any, in the
-    # order they should be tried.
+    # Attributes matched against when an execution does not name any, in the
+    # order they should be tried; every indexed attribute when empty.
     default_attributes: tuple[str, ...] = ()
     # attribute IRI -> normalized value -> concept IRIs
     entries: dict[str, dict[str, list[str]]] = field(default_factory=dict)
@@ -59,7 +59,7 @@ class ConceptIndex:
     # -- Looking up ---------------------------------------------------------
 
     def attributes(self) -> tuple[str, ...]:
-        """Attributes to match against when the mapping does not name any."""
+        """Attributes to match against when an execution does not name any."""
         return self.default_attributes or tuple(self.entries)
 
     def lookup(self, value, attributes=None) -> list[str]:

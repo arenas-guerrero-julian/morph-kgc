@@ -7,21 +7,27 @@ __email__ = "arenas.guerrero.julian@outlook.com"
 
 
 import os
+import select
+import signal
+import subprocess
+import sys
 
 import morph_kgc
 import pytest
 
+from contextlib import contextmanager, suppress
 from rdflib import Dataset
 from morph_kgc.testing import assert_isomorphic
 
 
 TEST_DIR = os.path.dirname(os.path.realpath(__file__))
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(TEST_DIR)))
 
 
-def config(state_dir=''):
+def config(state_dir='', udf='udf.py', names='country_names.json'):
     mapping_path = os.path.join(TEST_DIR, 'mapping.ttl')
-    udf_path = os.path.join(TEST_DIR, 'udf.py')
-    names_path = os.path.join(TEST_DIR, 'country_names.json')
+    udf_path = os.path.join(TEST_DIR, udf)
+    names_path = os.path.join(TEST_DIR, names)
 
     return (
         f'[CONFIGURATION]\n'
@@ -40,6 +46,58 @@ def expected_graph():
     g = Dataset()
     g.parse(os.path.join(TEST_DIR, 'output.nq'))
     return g
+
+
+linux_only = pytest.mark.skipif(
+    'linux' not in sys.platform, reason='worker processes are only used on Linux')
+
+
+@contextmanager
+def materialization_process(udf):
+    """
+    A run with *udf* and two worker processes, in a process of its own that
+    leads a process group with its workers: whatever is left of the run when
+    the test is over is killed, so that a run that hangs cannot hang the tests.
+    """
+    script = (
+        'import signal\n'
+        'import morph_kgc\n'
+        'from morph_kgc.config.loaders import load_config\n'
+        # Ctrl-C interrupts the run, even if the tests run with SIGINT ignored.
+        'signal.signal(signal.SIGINT, signal.default_int_handler)\n'
+        f'cfg = load_config({config(udf=udf)!r})\n'
+        'cfg.number_of_processes = 2\n'
+        'morph_kgc.materialize(cfg)\n'
+    )
+    # The morph_kgc under test, wherever it is imported from.
+    src_dir = os.path.dirname(os.path.dirname(morph_kgc.__file__))
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        path for path in (src_dir, os.environ.get('PYTHONPATH')) if path))
+
+    run = subprocess.Popen(
+        [sys.executable, '-c', script], cwd=ROOT_DIR, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        yield run
+    finally:
+        # The outputs of the run are closed once the run and its workers ended.
+        if not run.stdout.closed:
+            with suppress(ProcessLookupError):
+                os.killpg(run.pid, signal.SIGKILL)
+            run.communicate()
+
+
+def end_of(run, timeout):
+    """
+    The standard error of *run* once the run and its workers, which share its
+    outputs, ended; None if they did not end within *timeout* seconds.
+    """
+    try:
+        return run.communicate(timeout=timeout)[1]
+    except subprocess.TimeoutExpired:
+        return None
 
 
 def test_stateful_udf():
@@ -97,14 +155,127 @@ def test_stateful_udf_failing_initializer_leaves_no_state():
     assert cfg.state_dir == ''
 
 
-def test_stateful_udf_persists_the_context_to_disk(tmp_path):
-    """A configured state directory holds the context after materialization."""
-    state_dir = str(tmp_path / 'state')
-    g_morph = morph_kgc.materialize(config(state_dir=state_dir))
+def test_stateful_udf_configured_state_dir(tmp_path, monkeypatch):
+    """
+    The contexts are written inside a configured state directory, in a
+    subdirectory of the run removed when the run ends: the directory and
+    whatever else it holds are left alone, and so is the configuration.
+    """
+    from glob import glob
+    from morph_kgc.config.loaders import load_config
+    from morph_kgc.functions import executor
+    from morph_kgc.functions.state import get_context
+
+    state_dir = tmp_path / 'state'
+    state_dir.mkdir()
+    (state_dir / 'unrelated.txt').write_text('kept')
+
+    context_files = []
+
+    def spying_get_context(function_iri, run_config):
+        context_files.extend(glob(os.path.join(state_dir, '*', '*.pickle')))
+        return get_context(function_iri, run_config)
+
+    monkeypatch.setattr(executor, 'get_context', spying_get_context)
+
+    cfg = load_config(config(state_dir=str(state_dir)))
+    # A single process, so that the spy sees the contexts being read.
+    cfg.number_of_processes = 1
+    g_morph = morph_kgc.materialize(cfg)
 
     assert_isomorphic(expected_graph(), g_morph)
-    assert os.path.isdir(state_dir)
-    assert [f for f in os.listdir(state_dir) if f.endswith('.pickle')]
+    assert context_files
+    assert os.listdir(state_dir) == ['unrelated.txt']
+    assert (state_dir / 'unrelated.txt').read_text() == 'kept'
+    assert cfg.state_dir == str(state_dir)
+
+
+def test_stateful_udf_runs_sharing_state_dir(tmp_path, monkeypatch):
+    """
+    Two runs sharing a configured state directory keep to their own contexts,
+    even when one runs while the other has built its contexts but not yet
+    read them.
+    """
+    from morph_kgc.config.loaders import load_config
+    from morph_kgc.functions import executor
+    from morph_kgc.functions.state import get_context
+
+    state_dir = str(tmp_path / 'state')
+    other_names = tmp_path / 'other_country_names.json'
+    other_names.write_text('{"ES": "Espana"}')
+
+    other_triples = set()
+
+    def get_context_after_other_run(function_iri, run_config):
+        # The other run happens on the first read only, and reads its own
+        # contexts as usual.
+        monkeypatch.setattr(executor, 'get_context', get_context)
+        other_config = load_config(config(state_dir=state_dir, names=str(other_names)))
+        other_config.number_of_processes = 1
+        other_triples.update(morph_kgc.materialize_set(other_config))
+        return get_context(function_iri, run_config)
+
+    monkeypatch.setattr(executor, 'get_context', get_context_after_other_run)
+
+    cfg = load_config(config(state_dir=state_dir))
+    # A single process, so that the other run starts before the contexts of
+    # this one are read.
+    cfg.number_of_processes = 1
+    g_morph = morph_kgc.materialize(cfg)
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert {triple.strip() for triple in other_triples} == {
+        '<http://example.com/Madrid> <http://example.com/country> "Espana"'}
+    assert os.listdir(state_dir) == []
+
+
+def test_stateful_udf_context_is_written_atomically(tmp_path):
+    """A context file is never seen half-written: it is complete or absent."""
+    from morph_kgc.functions import state
+
+    files_while_writing = []
+
+    class Context:
+        def __reduce__(self):
+            files_while_writing.extend(os.listdir(tmp_path))
+            return dict, ()
+
+    state._persist_context(str(tmp_path), 'http://example.com/countryName', Context())
+
+    context_files = os.listdir(tmp_path)
+    assert len(context_files) == 1
+    assert context_files[0] not in files_while_writing
+
+
+@linux_only
+def test_stateful_udf_killed_worker_fails_the_run():
+    """
+    A worker process that dies, as when the operating system kills it for
+    running out of memory, fails the run instead of hanging it.
+    """
+    with materialization_process('udf_killed_worker.py') as run:
+        stderr = end_of(run, timeout=30)
+
+    assert stderr is not None, 'The run hangs when a worker process dies.'
+    assert run.returncode == 1
+    assert 'A worker process died' in stderr
+
+
+@linux_only
+def test_stateful_udf_workers_end_with_the_run():
+    """
+    The worker processes end promptly when the run is interrupted (with Ctrl-C)
+    while they are materializing.
+    """
+    with materialization_process('udf_slow_worker.py') as run:
+        # Once a worker is materializing.
+        assert select.select([run.stdout], [], [], 30)[0]
+        assert run.stdout.readline() == 'materializing\n'
+
+        os.kill(run.pid, signal.SIGINT)
+        stderr = end_of(run, timeout=10)
+
+    assert stderr is not None, 'The worker processes outlive the run.'
 
 
 def test_stateful_udf_initializer_runs_once():

@@ -131,22 +131,43 @@ class ResourceConfig:
         return [item.strip() for item in self.get(key).split(",") if item.strip()]
 
     def has_credentials(self) -> bool:
-        return bool(self.username) or bool(self.password)
+        """
+        Whether a username or a password is declared, once expanded: one that
+        is empty, or names an unset environment variable, is not sent.
+        """
+        for key, value in (("username", self.username), ("password", self.password)):
+            try:
+                if self._expand_env(key, value):
+                    return True
+            except ValueError:
+                continue
+        return False
 
-    def identifiers(self) -> tuple[str, ...]:
+    def identifiers(self, unexpanded: Optional[list] = None) -> tuple[str, ...]:
         """
         Values, besides the section name, a mapping may use to name this
-        resource: the IRI that identifies it and the URL it is accessed at.
-        They differ when a vocabulary is published under a canonical IRI but
-        downloaded from somewhere else.
+        resource: the IRI that identifies it and the URL it is accessed at,
+        once expanded. They differ when a vocabulary is published under a
+        canonical IRI but downloaded from somewhere else. One naming an unset
+        environment variable is left out, so that it is only reported if the
+        resource is actually accessed; the error is appended to *unexpanded*.
         """
-        return tuple(
-            identifier
-            for identifier in (self.get("iri"), self.url)
-            if identifier
-        )
+        identifiers = []
+        for expand in (self.get_iri, self.get_url):
+            try:
+                identifier = expand()
+            except ValueError as exc:
+                if unexpanded is not None:
+                    unexpanded.append(str(exc))
+                continue
+            if identifier:
+                identifiers.append(identifier)
+        return tuple(identifiers)
 
     # -- Environment-variable expansion -------------------------------------
+
+    def get_iri(self) -> str:
+        return self._expand_env("iri", self.get("iri"))
 
     def get_url(self) -> str:
         return self._expand_env("url", self.url)
@@ -167,6 +188,12 @@ class ResourceConfig:
             raise ValueError(
                 f"Option '{key}' of resource '{self.name}' references the "
                 f"environment variable {exc.args[0]!r}, which is not set."
+            ) from exc
+        except IndexError as exc:
+            # A positional placeholder, '{}' or '{0}', names no variable.
+            raise ValueError(
+                f"Option '{key}' of resource '{self.name}' holds a placeholder "
+                "naming no environment variable. Write it as '{ENV_VAR}'."
             ) from exc
 
 
@@ -404,7 +431,9 @@ class MorphConfig:
     def find_resource(self, reference: str) -> Optional[ResourceConfig]:
         """
         Resolve a resource by section name or, failing that, by the IRI that
-        identifies it (its ``iri`` option, falling back to its ``url``).
+        identifies it (its ``iri`` option, falling back to its ``url``), once
+        their ``{ENV_VAR}`` placeholders are expanded. When none matches, those
+        that could not be expanded are logged.
 
         Resolving by IRI lets a mapping name the accessed vocabulary or
         endpoint directly, while where it is fetched from and the credentials
@@ -414,9 +443,14 @@ class MorphConfig:
         if resource is not None:
             return resource
 
+        unexpanded = []
         for resource in self.resources.values():
-            if reference in resource.identifiers():
+            if reference in resource.identifiers(unexpanded):
                 return resource
+
+        # An identifier that could not be expanded may well be the one looked for.
+        for error in unexpanded:
+            LOGGER.warning("%s The resource may be the one '%s' names.", error, reference)
 
         return None
 

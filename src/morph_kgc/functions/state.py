@@ -15,17 +15,23 @@ in a service or a background process, so that the worker processes spawned by
 the multiprocess executor read it back instead of rebuilding it. Each worker
 loads a context at most once and keeps it in memory afterwards.
 
+The files go to a directory of their own for every run, created inside the
+configured ``state_dir`` (a disk with room for large contexts, for instance) or
+in the system temporary directory when none is configured, and removed when the
+run ends. ``state_dir`` is therefore not a cache reused across runs, and runs
+sharing it never read each other's contexts.
+
 Lifecycle
 ---------
 initialize_contexts(config, rml_mapping) -> ContextSession
     Pre-execution step: runs every initializer needed by the mapping and writes
-    the resulting contexts to ``config.state_dir``.
+    the resulting contexts to the state directory of the run.
 
 get_context(function_iri, config) -> Any
     Execution step: reads (once per process) the context of a function.
 
 release_contexts(session)
-    Post-execution step: removes the state directory when the engine created it.
+    Post-execution step: removes the state directory of the run.
 """
 
 import logging
@@ -140,14 +146,14 @@ class InitializationContext:
 
 @dataclass
 class ContextSession:
-    """The state directory of one run, and whether the engine created it."""
+    """The state directory of one run."""
 
     path: str = ""
-    created: bool = False
     function_iris: list[str] = field(default_factory=list)
-    # Set when the engine created the directory, so that releasing the session
-    # leaves the configuration exactly as the run found it.
+    # The configuration of the run and the state_dir it was given, so that
+    # releasing the session leaves the configuration exactly as the run found it.
     config: Any = None
+    configured_state_dir: str = ""
 
     def __bool__(self) -> bool:
         return bool(self.function_iris)
@@ -284,23 +290,40 @@ def initialize_contexts(config, rml_mapping) -> ContextSession:
 
 
 def _open_state_dir(config) -> ContextSession:
-    """Return the state directory to use, creating it when needed."""
+    """
+    Create the state directory of this run: a private directory inside the
+    configured ``state_dir``, or inside the system temporary directory when
+    none is configured.
+    """
     if config.state_dir:
         os.makedirs(config.state_dir, exist_ok=True)
-        return ContextSession(path=config.state_dir, created=False)
 
-    path = tempfile.mkdtemp(prefix="morph-kgc-state-")
+    # A directory of its own, so that runs sharing a configured state_dir never
+    # read (or overwrite) each other's contexts.
+    path = tempfile.mkdtemp(prefix="morph-kgc-state-", dir=config.state_dir or None)
+    session = ContextSession(
+        path                 = path,
+        config               = config,
+        configured_state_dir = config.state_dir,
+    )
     # Workers receive the path through the config, which travels with them.
     config.state_dir = path
-    return ContextSession(path=path, created=True, config=config)
+    return session
 
 
 def _persist_context(state_dir: str, function_iri: str, context: Any) -> None:
-    """Write the shared context of *function_iri* to *state_dir*."""
+    """
+    Write the shared context of *function_iri* to *state_dir*, under a
+    temporary name first, so that the context file is complete or absent.
+    """
     path = _context_file(state_dir, function_iri)
+    # A temporary file left behind by a failure goes with the directory of the
+    # run, which a failing initialization removes.
+    descriptor, temporary_path = tempfile.mkstemp(dir=state_dir, suffix=".tmp")
     try:
-        with open(path, "wb") as state_file:
+        with os.fdopen(descriptor, "wb") as state_file:
             pickle.dump(context, state_file, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temporary_path, path)
     except (pickle.PicklingError, AttributeError, TypeError) as exc:
         raise ValueError(
             f"The shared context of '{function_iri}' cannot be persisted to "
@@ -345,16 +368,16 @@ def get_context(function_iri: str, config) -> Any:
 
 def release_contexts(session: Optional[ContextSession]) -> None:
     """
-    Remove the state directory, if the engine is the one that created it, and
-    give the configuration back the ``state_dir`` the run started with — a run
-    that creates its own directory must leave nothing behind, on disk or in the
-    configuration it was handed.
+    Remove the state directory of the run and give the configuration back the
+    ``state_dir`` the run started with — a run must leave nothing behind, on
+    disk or in the configuration it was handed. A configured ``state_dir`` is
+    kept, with anything else it holds.
     """
-    if session is None or not session.created or not session.path:
+    if session is None or not session.path:
         return
 
     shutil.rmtree(session.path, ignore_errors=True)
     LOGGER.debug(f"State directory '{session.path}' removed.")
 
     if session.config is not None and session.config.state_dir == session.path:
-        session.config.state_dir = ""
+        session.config.state_dir = session.configured_state_dir

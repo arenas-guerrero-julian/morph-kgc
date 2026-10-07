@@ -123,8 +123,9 @@ username={ENDPOINT_USER}
 password={ENDPOINT_PASSWORD}
 ```
 
-`{ENV_VAR}` placeholders in `url`, `username` and `password` are replaced with
-environment variables, so credentials need not be written to the file at all.
+`{ENV_VAR}` placeholders in `url`, `iri`, `username` and `password` are replaced
+with environment variables, so credentials need not be written to the file at
+all.
 
 | Option | Meaning |
 | --- | --- |

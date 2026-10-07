@@ -7,12 +7,14 @@ __email__ = "arenas.guerrero.julian@outlook.com"
 
 
 import os
+import re
 import sys
 
 import morph_kgc
 import pytest
 
-from rdflib import Dataset
+from rdflib import Dataset, URIRef
+from morph_kgc.config.model import ResourceConfig
 from morph_kgc.testing import assert_isomorphic
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -21,6 +23,13 @@ from server import PASSWORD, USERNAME, VocabularyServer   # noqa: E402
 TEST_DIR = os.path.dirname(os.path.realpath(__file__))
 MAPPING = os.path.join(TEST_DIR, 'mapping.ttl')
 VOCABULARY = os.path.join(TEST_DIR, 'disease_vocabulary.ttl')
+VOCABULARY_IRI_MAPPING = os.path.join(TEST_DIR, 'mapping_vocabulary_iri.ttl')
+
+SKOS = 'http://www.w3.org/2004/02/skos/core#'
+# The predicate the mappings relate a patient to the reconciled disease with.
+HAS_DISEASE = 'http://semanticscience.org/resource/SIO_000255'
+ATAXIA = 'https://data.boehringer.com/id/00036/10073037'
+NARCOLEPSY = 'https://data.boehringer.com/id/00036/10077339'
 
 
 def config(resource_options, mapping=MAPPING, processes=1):
@@ -39,6 +48,26 @@ def expected_graph():
     g = Dataset()
     g.parse(os.path.join(TEST_DIR, 'output.nq'))
     return g
+
+
+def mapping_copy(tmp_path, *replacements, mapping=MAPPING):
+    """A copy of *mapping* with each (old, new) replacement applied."""
+    with open(mapping, encoding='utf-8') as f:
+        text = f.read()
+    for old, new in replacements:
+        assert old in text
+        text = text.replace(old, new)
+    path = tmp_path / os.path.basename(mapping)
+    path.write_text(text, encoding='utf-8', newline='\n')
+    return str(path)
+
+
+def reconciled(g_morph, predicate=HAS_DISEASE):
+    """The patients *predicate* relates to a concept, and those concepts."""
+    return {
+        (str(patient).rsplit('/', 1)[1], str(concept))
+        for patient, concept in g_morph.subject_objects(URIRef(predicate))
+    }
 
 
 # ── SKOS vocabulary ───────────────────────────────────────────────────────────
@@ -129,7 +158,7 @@ def test_reconcile_vocabulary_referenced_by_its_iri():
         f'resource_type=SKOS_VOCABULARY\n'
         f'iri=https://example.org/vocabulary/disease\n'
         f'url={VOCABULARY}',
-        mapping=os.path.join(TEST_DIR, 'mapping_vocabulary_iri.ttl'),
+        mapping=VOCABULARY_IRI_MAPPING,
     ))
 
     assert_isomorphic(expected_graph(), g_morph)
@@ -173,6 +202,363 @@ def test_exact_matching_by_default():
     ))
 
     assert len(g_morph) == 0
+
+
+# The attribute input of mapping.ttl, removed by the tests of executions that
+# name no attribute.
+WITHOUT_ATTRIBUTE = (
+    ' ;\n'
+    '    rml:input [\n'
+    '        rml:parameter morph-fn:attributeIRI ;\n'
+    '        rml:inputValue skos:prefLabel , skos:altLabel\n'
+    '    ]',
+    '',
+)
+
+
+@pytest.mark.parametrize('attributes, expected', [
+    ('skos:prefLabel,skos:altLabel', {('pid_00001', ATAXIA), ('pid_00002', NARCOLEPSY)}),
+    ('skos:prefLabel', {('pid_00002', NARCOLEPSY)}),
+    (f'{SKOS}prefLabel', {('pid_00002', NARCOLEPSY)}),
+])
+def test_attributes_option(tmp_path, attributes, expected):
+    """
+    An execution naming no attribute matches against the 'attributes' option of
+    the resource, written as IRIs or as prefixed names.
+    """
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}\n'
+        f'attributes={attributes}',
+        mapping=mapping_copy(tmp_path, WITHOUT_ATTRIBUTE),
+    ))
+
+    assert reconciled(g_morph) == expected
+
+
+@pytest.mark.parametrize('prefix, namespace', [
+    ('dcterms', 'http://purl.org/dc/terms/'),
+    ('schema', 'https://schema.org/'),
+])
+def test_attributes_option_with_a_well_known_prefix(tmp_path, prefix, namespace):
+    """
+    The well-known prefixes of the 'attributes' option stand for their usual
+    namespace, whatever the vocabulary declares.
+    """
+    with open(VOCABULARY, encoding='utf-8') as f:
+        text = f.read().replace('skos:altLabel', f'<{namespace}synonym>')
+    vocabulary = tmp_path / 'disease_vocabulary.ttl'
+    vocabulary.write_text(f'@prefix {prefix}: <https://example.org/other#> .\n' + text, encoding='utf-8')
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={vocabulary}\n'
+        f'attributes=skos:prefLabel,{prefix}:synonym',
+        mapping=mapping_copy(tmp_path, WITHOUT_ATTRIBUTE),
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+def test_attributes_option_with_a_prefix_of_the_vocabulary(tmp_path):
+    """
+    A prefix only the vocabulary declares is not used by the 'attributes'
+    option, which says to write the attribute as a full IRI.
+    """
+    with open(VOCABULARY, encoding='utf-8') as f:
+        text = f.read().replace('skos:altLabel', 'dis:synonym')
+    vocabulary = tmp_path / 'disease_vocabulary.ttl'
+    vocabulary.write_text('@prefix dis: <https://example.org/vocabulary/disease#> .\n' + text, encoding='utf-8')
+
+    error = "'dis:synonym', which is neither an absolute IRI .* Write it as a full IRI"
+    with pytest.raises(ValueError, match=error):
+        morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={vocabulary}\n'
+            f'attributes=skos:prefLabel,dis:synonym',
+            mapping=mapping_copy(tmp_path, WITHOUT_ATTRIBUTE),
+        ))
+
+
+@pytest.mark.parametrize('iri', [
+    f'{SKOS}altLabel',
+    'file:///vocabulary/disease#synonym',
+    'urn:example:synonym',
+])
+def test_attributes_option_with_iris(tmp_path, iri):
+    """
+    The IRIs of the 'attributes' option are taken as they are, whether they
+    have an authority or not.
+    """
+    with open(VOCABULARY, encoding='utf-8') as f:
+        text = f.read().replace('skos:altLabel', f'<{iri}>')
+    vocabulary = tmp_path / 'disease_vocabulary.ttl'
+    vocabulary.write_text(text, encoding='utf-8')
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={vocabulary}\n'
+        f'attributes=skos:prefLabel,{iri}',
+        mapping=mapping_copy(tmp_path, WITHOUT_ATTRIBUTE),
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+@pytest.mark.parametrize('attribute', [
+    # A prefix that is not well known.
+    'skso:prefLabel',
+    'prefLabel',
+    # A prefix, not a prefixed name.
+    'skos',
+    f'<{SKOS}prefLabel>',
+])
+def test_attributes_option_not_an_iri(tmp_path, attribute):
+    """An attribute that is not an IRI fails instead of indexing nothing."""
+    error = f"Option 'attributes' of resource 'disease_vocabulary' .*'{re.escape(attribute)}'"
+    with pytest.raises(ValueError, match=error):
+        morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={VOCABULARY}\n'
+            f'attributes=skos:altLabel,{attribute}',
+            mapping=mapping_copy(tmp_path, WITHOUT_ATTRIBUTE),
+        ))
+
+
+def test_attributes_option_unused():
+    """
+    A mistake in the 'attributes' option does not stop a mapping whose
+    executions all name their attributes, since none of them uses it.
+    """
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}\n'
+        f'attributes=skso:prefLabel'
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+@pytest.mark.parametrize('attributes, expected', [
+    # Without the option, every attribute of the vocabulary.
+    ('', {('pid_00001', ATAXIA), ('pid_00002', NARCOLEPSY)}),
+    (f'attributes={SKOS}prefLabel', {('pid_00002', NARCOLEPSY)}),
+])
+def test_executions_naming_different_attributes(attributes, expected):
+    """
+    Each execution matches against the attributes it names, or against those of
+    the resource when it names none, whatever the other executions name.
+    """
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}\n'
+        f'{attributes}',
+        mapping=os.path.join(TEST_DIR, 'mapping_two_executions.ttl'),
+    ))
+
+    assert reconciled(g_morph, 'https://example.org/kg/diseaseByAltLabel') == {('pid_00001', ATAXIA)}
+    assert reconciled(g_morph, 'https://example.org/kg/disease') == expected
+
+
+def test_execution_naming_no_attribute_next_to_one_naming_iris(tmp_path):
+    """
+    An execution naming no attribute matches against the literals of the
+    vocabulary only, although another one names an attribute taking IRIs.
+    """
+    with open(VOCABULARY, encoding='utf-8') as f:
+        text = f.read().replace(
+            'skos:notation "ORPHA:352587"',
+            'skos:notation "ORPHA:352587" ;\n'
+            '    skos:exactMatch <http://www.orpha.net/ORDO/Orphanet_352587>',
+        )
+    vocabulary = tmp_path / 'disease_vocabulary.ttl'
+    vocabulary.write_text(text, encoding='utf-8')
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        'pid,disease_label\n'
+        'pid_00001,http://www.orpha.net/ORDO/Orphanet_352587\n'
+        'pid_00002,ADCA-DN\n',
+        encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValue skos:altLabel', 'rml:inputValue skos:exactMatch'),
+        mapping=os.path.join(TEST_DIR, 'mapping_two_executions.ttl'),
+    )
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={vocabulary}',
+        mapping=mapping,
+    ))
+
+    assert reconciled(g_morph, 'https://example.org/kg/diseaseByAltLabel') == {('pid_00001', ATAXIA)}
+    assert reconciled(g_morph, 'https://example.org/kg/disease') == {('pid_00002', NARCOLEPSY)}
+
+
+def test_attributes_bound_under_both_parameter_iris(tmp_path):
+    """
+    The attributes an execution binds as grel:attributeIRI and as
+    morph-fn:attributeIRI are all matched against.
+    """
+    mapping = mapping_copy(tmp_path, (
+        'rml:parameter morph-fn:attributeIRI ;\n'
+        '        rml:inputValue skos:prefLabel , skos:altLabel',
+        'rml:parameter grel:attributeIRI ;\n'
+        '        rml:inputValue skos:prefLabel\n'
+        '    ] ;\n'
+        '    rml:input [\n'
+        '        rml:parameter morph-fn:attributeIRI ;\n'
+        '        rml:inputValue skos:altLabel',
+    ))
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=mapping,
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+@pytest.mark.parametrize('replacements', [
+    (),
+    # Matched against every attribute of the vocabulary.
+    (WITHOUT_ATTRIBUTE,),
+])
+def test_concept_schemes_and_collections_are_not_concepts(tmp_path, replacements):
+    """
+    A value labelling a concept scheme or a collection is not reconciled with
+    it, while one labelling a concept is, even when concepts are not typed.
+    """
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={os.path.join(TEST_DIR, "disease_vocabulary_schemes.ttl")}',
+        mapping=mapping_copy(tmp_path, ('patients.csv', 'patients_schemes.csv'), *replacements),
+    ))
+
+    assert reconciled(g_morph) == {('pid_00001', ATAXIA)}
+
+
+@pytest.mark.parametrize('other_iri', [
+    '{OTHER_VOCABULARY_IRI}',
+    # A positional placeholder, naming no variable.
+    'https://example.org/vocabulary/{0}',
+])
+def test_vocabulary_iri_from_the_environment(monkeypatch, other_iri):
+    """
+    The IRI of a resource matches the mapping once its placeholders are
+    replaced, and a resource whose placeholders cannot be is passed over.
+    """
+    monkeypatch.setenv('DISEASE_VOCABULARY_IRI', 'https://example.org/vocabulary/disease')
+    monkeypatch.delenv('OTHER_VOCABULARY_IRI', raising=False)
+    monkeypatch.delenv('OTHER_VOCABULARY_URL', raising=False)
+    g_morph = morph_kgc.materialize(
+        f'[CONFIGURATION]\n'
+        f'output_format=N-QUADS\n'
+        f'[RESOURCE:other_vocabulary]\n'
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'iri={other_iri}\n'
+        f'url={{OTHER_VOCABULARY_URL}}\n'
+        f'[RESOURCE:disease_vocabulary]\n'
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'iri={{DISEASE_VOCABULARY_IRI}}\n'
+        f'url={VOCABULARY}\n'
+        f'[DataSource]\n'
+        f'mappings={VOCABULARY_IRI_MAPPING}'
+    )
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+def test_vocabulary_iri_from_an_unset_variable(monkeypatch, caplog):
+    """A resource whose IRI cannot be known is said to be passed over."""
+    monkeypatch.delenv('DISEASE_VOCABULARY_IRI', raising=False)
+    with pytest.raises(ValueError, match='not declared in the configuration'):
+        morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'iri={{DISEASE_VOCABULARY_IRI}}\n'
+            f'url={VOCABULARY}',
+            mapping=VOCABULARY_IRI_MAPPING,
+        ))
+
+    assert "'DISEASE_VOCABULARY_IRI', which is not set" in caplog.text
+
+
+def test_vocabulary_url_from_the_environment_is_not_kept(tmp_path, monkeypatch):
+    """
+    The URL read from the environment, which may hold a secret, is not written
+    to the state directory.
+    """
+    from morph_kgc.functions import executor
+    from morph_kgc.functions.state import get_context
+
+    state_dir = tmp_path / 'state'
+    contexts = []
+
+    def spying_get_context(function_iri, run_config):
+        # The contexts of the run are removed when it ends: read them meanwhile.
+        contexts.extend(path.read_bytes() for path in state_dir.glob('*/*.pickle'))
+        return get_context(function_iri, run_config)
+
+    monkeypatch.setattr(executor, 'get_context', spying_get_context)
+
+    with VocabularyServer() as server:
+        monkeypatch.setenv('DISEASE_VOCABULARY_URL', f'{server.url}/vocabulary?apikey=t0p-s3cr3t')
+        g_morph = morph_kgc.materialize(
+            f'[CONFIGURATION]\n'
+            f'output_format=N-QUADS\n'
+            # A single process, so that the spy sees the contexts being read.
+            f'number_of_processes=1\n'
+            f'state_dir={state_dir}\n'
+            f'[RESOURCE:disease_vocabulary]\n'
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={{DISEASE_VOCABULARY_URL}}\n'
+            f'username={USERNAME}\n'
+            f'password={PASSWORD}\n'
+            f'[DataSource]\n'
+            f'mappings={MAPPING}'
+        )
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert contexts
+    for context in contexts:
+        assert b't0p-s3cr3t' not in context
+
+
+def test_vocabulary_referenced_by_its_url_from_the_environment(tmp_path, monkeypatch):
+    """A mapping may name the vocabulary by its URL, read from the environment."""
+    with VocabularyServer() as server:
+        monkeypatch.setenv('DISEASE_VOCABULARY_URL', f'{server.url}/vocabulary')
+        mapping = mapping_copy(
+            tmp_path,
+            ('https://example.org/vocabulary/disease', f'{server.url}/vocabulary'),
+            mapping=VOCABULARY_IRI_MAPPING,
+        )
+        g_morph = morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={{DISEASE_VOCABULARY_URL}}\n'
+            f'username={USERNAME}\n'
+            f'password={PASSWORD}',
+            mapping=mapping,
+        ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+def test_vocabulary_url_holding_credentials():
+    """Credentials are declared as such, not in the URL, which is not echoed."""
+    with VocabularyServer() as server:
+        url = server.url.replace('://', f'://{USERNAME}:{PASSWORD}@')
+        with pytest.raises(ValueError, match="'url' of resource 'disease_vocabulary' holds credentials") as error:
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={url}/vocabulary'
+            ))
+
+        assert server.requests == []
+
+    assert PASSWORD not in str(error.value)
 
 
 def test_undeclared_resource():
@@ -245,14 +631,7 @@ def endpoint_resource(url, extra_options='', name='clinical_trials', iri=MAPPING
 
 def sparql_mapping(tmp_path, *replacements, mapping=SPARQL_MAPPING):
     """A copy of *mapping* with each (old, new) replacement applied."""
-    with open(mapping, encoding='utf-8') as f:
-        text = f.read()
-    for old, new in replacements:
-        assert old in text
-        text = text.replace(old, new)
-    path = tmp_path / os.path.basename(mapping)
-    path.write_text(text, encoding='utf-8', newline='\n')
-    return str(path)
+    return mapping_copy(tmp_path, *replacements, mapping=mapping)
 
 
 def expected_sparql_graph(file_name='output_sparql.nq'):
@@ -357,6 +736,50 @@ def test_endpoint_url_from_an_unset_variable(tmp_path, monkeypatch, caplog):
             ))
 
     assert "'CLINICAL_TRIALS_ENDPOINT', which is not set" in caplog.text
+
+
+def test_endpoint_matched_by_iri_from_the_environment(tmp_path, monkeypatch):
+    """The IRI of a resource matches the mapping once its placeholders are replaced."""
+    with VocabularyServer() as server:
+        monkeypatch.setenv('CLINICAL_TRIALS_IRI', f'{server.url}/sparql')
+        mapping = sparql_mapping(tmp_path, (MAPPING_ENDPOINT, f'{server.url}/sparql'))
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql/union', iri='{CLINICAL_TRIALS_IRI}'),
+            mapping=mapping,
+        ))
+
+        assert [path for path, _ in server.requests] == ['/sparql/union']
+
+    assert_isomorphic(expected_sparql_graph(), g_morph)
+
+
+def test_endpoint_credentials_from_empty_variables(monkeypatch):
+    """Credentials empty once read from the environment say where to declare them."""
+    monkeypatch.setenv('CLINICAL_TRIALS_USER', '')
+    monkeypatch.setenv('CLINICAL_TRIALS_PASSWORD', '')
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=r"'username' and 'password'.*\[RESOURCE:<name>\]"):
+            morph_kgc.materialize(sparql_config(
+                f'[RESOURCE:clinical_trials]\n'
+                f'resource_type=SPARQL_ENDPOINT\n'
+                f'iri={MAPPING_ENDPOINT}\n'
+                f'url={server.url}/sparql\n'
+                f'username={{CLINICAL_TRIALS_USER}}\n'
+                f'password={{CLINICAL_TRIALS_PASSWORD}}\n'
+            ))
+
+
+def test_credentials_from_unset_variables(monkeypatch):
+    """Credentials naming unset variables are no credentials, and do not fail."""
+    monkeypatch.delenv('CLINICAL_TRIALS_USER', raising=False)
+    monkeypatch.setenv('CLINICAL_TRIALS_PASSWORD', '')
+    resource = ResourceConfig(
+        name     = 'clinical_trials',
+        username = '{CLINICAL_TRIALS_USER}',
+        password = '{CLINICAL_TRIALS_PASSWORD}',
+    )
+
+    assert not resource.has_credentials()
 
 
 def test_endpoint_declared_without_url():
