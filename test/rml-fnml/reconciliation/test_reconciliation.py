@@ -138,6 +138,237 @@ def test_reconcile_vocabulary_in_named_graphs_over_http(path):
     assert_isomorphic(expected_graph(), g_morph)
 
 
+@pytest.mark.parametrize('path', ['/vocabulary.gz', '/vocabulary.multi-gz'])
+def test_reconcile_vocabulary_served_gzipped(path):
+    """
+    A vocabulary served gzipped is decompressed as it is downloaded, all its
+    members when it has several.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={server.url}{path}\n'
+            f'username={USERNAME}\n'
+            f'password={PASSWORD}'
+        ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+def test_vocabulary_wrongly_said_to_be_gzipped():
+    """A vocabulary that is not gzipped as its server says is reported as such."""
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match='Could not decompress the vocabulary'):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary.broken-gz\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}'
+            ))
+
+
+@pytest.mark.parametrize('rdf_format, extension', [
+    ('xml', 'rdf'),
+    ('json-ld', 'jsonld'),
+    ('nt', 'nt'),
+])
+def test_reconcile_vocabulary_in_other_serializations(tmp_path, caplog, rdf_format, extension):
+    """A vocabulary in any serialization the streaming parser reads is streamed."""
+    g = Dataset()
+    g.parse(VOCABULARY)
+    vocabulary = tmp_path / f'disease_vocabulary.{extension}'
+    g.serialize(vocabulary, format=rdf_format)
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={vocabulary}'
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert 'parsed in memory' not in caplog.text
+
+
+def test_vocabulary_the_streaming_parser_cannot_read(tmp_path, caplog):
+    """A vocabulary the streaming parser cannot read is parsed in memory instead."""
+    g = Dataset()
+    g.parse(VOCABULARY)
+    vocabulary = tmp_path / 'disease_vocabulary.trix'
+    g.serialize(vocabulary, format='trix')
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={vocabulary}\n'
+        f'format=trix'
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert 'so it is parsed in memory' in caplog.text
+
+
+def test_vocabulary_cut_short():
+    """A vocabulary whose server closes the connection halfway is not indexed in part."""
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match='closed .* before the end of the body'):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary.cut\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}'
+            ))
+
+
+def test_vocabulary_url_that_is_no_iri(caplog):
+    """A vocabulary URL that is no IRI ('|') is still a base for its relative IRIs."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={server.url}/export|vocabulary\n'
+            f'username={USERNAME}\n'
+            f'password={PASSWORD}'
+        ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert 'parsed in memory' not in caplog.text
+
+
+@pytest.mark.parametrize('format_option, prefix', [
+    ('text/turtle', b''),
+    ('turtle', b'\xef\xbb\xbf'),
+])
+def test_vocabulary_streamed_whatever_its_format_option_or_byte_order_mark(
+    tmp_path, caplog, format_option, prefix,
+):
+    """
+    A vocabulary whose 'format' is a media type, or which starts with a byte
+    order mark, is streamed too.
+    """
+    vocabulary = tmp_path / 'disease_vocabulary.ttl'
+    with open(VOCABULARY, 'rb') as f:
+        vocabulary.write_bytes(prefix + f.read())
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={vocabulary}\n'
+        f'format={format_option}'
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert 'parsed in memory' not in caplog.text
+
+
+def test_json_ld_vocabulary_with_a_context(tmp_path, caplog):
+    """
+    A JSON-LD vocabulary whose top level is an object, with its @context and
+    @graph, is reconciled against, but read whole first, which a warning says.
+    """
+    g = Dataset()
+    g.parse(VOCABULARY)
+    vocabulary = tmp_path / 'disease_vocabulary.jsonld'
+    g.serialize(vocabulary, format='json-ld', context={'skos': SKOS})
+    assert vocabulary.read_text(encoding='utf-8').lstrip().startswith('{')
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={vocabulary}'
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert 'read whole into memory' in caplog.text
+
+
+def test_vocabulary_with_a_lone_surrogate_escape(tmp_path, caplog):
+    """
+    A label holding a lone surrogate escape ("\\uD800"), which the streaming
+    parser rejects and rdflib reads, is left out; the others are reconciled.
+    """
+    vocabulary = tmp_path / 'disease_vocabulary.ttl'
+    with open(VOCABULARY, encoding='utf-8') as f:
+        vocabulary.write_text(
+            f.read() + f'\n<https://example.org/broken> <{SKOS}prefLabel> "broken \\uD800" .\n',
+            encoding='utf-8',
+        )
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={vocabulary}'
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert 'so it is parsed in memory' in caplog.text
+
+
+def test_vocabulary_that_is_not_rdf(tmp_path):
+    """A vocabulary neither parser reads says how to declare its serialization."""
+    vocabulary = tmp_path / 'disease_vocabulary.ttl'
+    vocabulary.write_text('this is not RDF', encoding='utf-8')
+
+    with pytest.raises(ValueError, match="could not be parsed as RDF .*'format' option"):
+        morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={vocabulary}'
+        ))
+
+
+def test_index_is_kept_on_disk(tmp_path, monkeypatch):
+    """
+    The index of the vocabulary is a file of the state directory of the run,
+    removed when the run ends, which the shared context only refers to.
+    """
+    from morph_kgc.functions import executor
+    from morph_kgc.functions.state import get_context
+
+    state_dir = tmp_path / 'state'
+    files = []
+
+    def spying_get_context(function_iri, run_config):
+        files.extend((path.name, path.stat().st_size) for path in state_dir.glob('*/*'))
+        return get_context(function_iri, run_config)
+
+    monkeypatch.setattr(executor, 'get_context', spying_get_context)
+
+    g_morph = morph_kgc.materialize(
+        config(f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}', processes=1)
+        .replace('[CONFIGURATION]\n', f'[CONFIGURATION]\nstate_dir={state_dir}\n')
+    )
+
+    assert_isomorphic(expected_graph(), g_morph)
+    contexts = [size for name, size in files if name.endswith('.pickle')]
+    indexes = [size for name, size in files if name.endswith('.parquet')]
+    assert contexts and indexes
+    # The context holds the path of the index, not its entries.
+    assert max(contexts) < 2000
+    assert os.listdir(state_dir) == []
+
+
+def test_index_looks_values_up_alike_one_by_one_or_together(tmp_path):
+    """
+    An index looks a few values up one by one, in the parts of its file that
+    may hold them, and many values in a single pass over it, with the same
+    results.
+    """
+    from dataclasses import replace
+    from morph_kgc.functions.tables import close_connections
+    from morph_kgc.reconciliation.index import CASE_INSENSITIVE_MATCHING, ConceptIndexBuilder
+
+    with ConceptIndexBuilder(str(tmp_path), '512MB', CASE_INSENSITIVE_MATCHING) as builder:
+        builder.add('label', 'Ataxia', 'c1')
+        builder.add('alt', 'ATAXIA', 'c2')
+        builder.add('label', 'Narcolepsy', 'c3')
+        builder.add('label', 'Scheme', 'c4')
+        builder.exclude('c4')
+        index = builder.build()
+
+    values = ['ataxia', None, 'Narcolepsy', 'unknown', 'Scheme', 'Ataxia ']
+    try:
+        together = index.lookup_many(values, ['label', 'alt'])
+        one_by_one = replace(index, row_groups=100).lookup_many(values, ['label', 'alt'])
+    finally:
+        close_connections(str(tmp_path))
+
+    assert together == one_by_one == [['c1', 'c2'], [], ['c3'], [], [], ['c1', 'c2']]
+    assert (len(index), index.concept_count, index.row_groups) == (3, 3, 1)
+
+
 def test_reconcile_vocabulary_with_multiple_processes():
     """Worker processes read the shared context back from the state directory."""
     g_morph = morph_kgc.materialize(config(
@@ -497,8 +728,9 @@ def test_vocabulary_url_from_the_environment_is_not_kept(tmp_path, monkeypatch):
     contexts = []
 
     def spying_get_context(function_iri, run_config):
-        # The contexts of the run are removed when it ends: read them meanwhile.
-        contexts.extend(path.read_bytes() for path in state_dir.glob('*/*.pickle'))
+        # The contexts of the run, and the index files they refer to, are
+        # removed when it ends: read them meanwhile.
+        contexts.extend(path.read_bytes() for path in state_dir.glob('*/*') if path.is_file())
         return get_context(function_iri, run_config)
 
     monkeypatch.setattr(executor, 'get_context', spying_get_context)
@@ -1040,6 +1272,30 @@ def test_entities_that_are_not_iris(tmp_path, caplog):
         'https://data.com/id/2', 'https://data.com/id/3',
     }
     assert 'other than an IRI in 1 solution(s)' in caplog.text
+
+
+@pytest.mark.parametrize('variant, warning', [
+    ('gzip', None),
+    ('xml', None),
+    ('no-head', 'cannot be read as a stream'),
+    ('results-first', 'gives its results before its head'),
+    ('bad-term', 'cannot be read as a stream'),
+])
+def test_answers_in_other_shapes(tmp_path, caplog, variant, warning):
+    """
+    An answer gzipped, in XML, in JSON without the head some endpoints leave
+    out or with the results before it, or with a term the streaming parser
+    rejects, is read too: the last three whole, which a warning says.
+    """
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(tmp_path, (MAPPING_ENDPOINT, f'{server.url}/public/sparql/{variant}'))
+        g_morph = morph_kgc.materialize(sparql_config(mapping=mapping))
+
+    assert_isomorphic(expected_sparql_graph(), g_morph)
+    if warning:
+        assert warning in caplog.text
+    else:
+        assert 'memory' not in caplog.text
 
 
 def test_query_too_long_for_a_url(tmp_path):

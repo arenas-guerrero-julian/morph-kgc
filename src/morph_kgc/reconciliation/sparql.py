@@ -24,10 +24,15 @@ For instance::
     }
 
 The query is sent once, during the context initialization phase, and exactly as
-written: whether its patterns read the named graphs of the endpoint is up to the
-query, since stores differ on whether their default graph includes them. Values
-are matched exactly; a query may normalize the values it returns (``LCASE``),
-and the mapping the values it reconciles, to match otherwise.
+written. Its answer is downloaded to the state directory of the run and read as
+a stream into the index on disk, so that an answer of any size is indexed with
+the same memory. An answer in JSON is only read as a stream when it gives its
+head first, as most stores write it, and when every term in it is well formed;
+otherwise it is read whole into memory, with a warning. Whether its patterns
+read the named graphs of the endpoint is up to the query, since stores differ on
+whether their default graph includes them. Values are matched exactly; a query
+may normalize the values it returns (``LCASE``), and the mapping the values it
+reconciles, to match otherwise.
 
 How the endpoint is accessed is declared in the configuration file, only when
 its URL is not enough: a ``[RESOURCE:<name>]`` section whose ``url`` (or
@@ -49,14 +54,27 @@ from http.client import HTTPException
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
 
+import pyoxigraph
+
 from .._version import __version__
 from ..constants import LOGGING_NAMESPACE
-from ..http import fetch
-from .index import ConceptIndex
+from ..http import Download, download
+from .index import ConceptIndex, ConceptIndexBuilder
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
 SPARQL_RESULTS_JSON = "application/sparql-results+json"
+
+# The serializations of SPARQL results read as a stream, by content type. JSON
+# is the one asked for; the others are read too, should an endpoint send them.
+RESULTS_FORMATS = {
+    SPARQL_RESULTS_JSON:               pyoxigraph.QueryResultsFormat.JSON,
+    "application/json":                pyoxigraph.QueryResultsFormat.JSON,
+    "application/sparql-results+xml":  pyoxigraph.QueryResultsFormat.XML,
+    "application/xml":                 pyoxigraph.QueryResultsFormat.XML,
+    "text/xml":                        pyoxigraph.QueryResultsFormat.XML,
+    "text/tab-separated-values":       pyoxigraph.QueryResultsFormat.TSV,
+}
 
 # The variables the query projects.
 ENTITY_VARIABLE   = "entity_iri"
@@ -94,10 +112,10 @@ def get_method(resource, url: str, query: str) -> str:
     return method
 
 
-def run_query(resource, query: str) -> tuple[list[str] | None, list[dict]]:
+def run_query(resource, query: str, state_dir: str) -> Download:
     """
-    Send *query* to the endpoint of *resource* and return the variables it
-    projects, if the endpoint says, and its bindings.
+    Send *query* to the endpoint of *resource* and download its answer to
+    *state_dir*.
     """
     endpoint = resource.get_url()
     if urlsplit(endpoint).scheme.lower() not in ("http", "https"):
@@ -117,8 +135,9 @@ def run_query(resource, query: str) -> tuple[list[str] | None, list[dict]]:
         request = {"params": {"query": query}}
 
     try:
-        response = fetch(
+        return download(
             endpoint,
+            state_dir,
             username    = resource.get_username(),
             password    = resource.get_password(),
             accept      = SPARQL_RESULTS_JSON,
@@ -129,8 +148,8 @@ def run_query(resource, query: str) -> tuple[list[str] | None, list[dict]]:
             **request,
         )
     except (OSError, HTTPException) as exc:
-        # Not wrapped by fetch: the endpoint took too long to answer the query,
-        # or dropped the connection while answering it.
+        # Not wrapped by download: the endpoint took too long to answer the
+        # query, or dropped the connection while answering it.
         detail = str(exc) or type(exc).__name__
         if not isinstance(exc, TimeoutError):
             raise ValueError(
@@ -168,22 +187,114 @@ def run_query(resource, query: str) -> tuple[list[str] | None, list[dict]]:
             f"{cause.reason}: {detail[:ERROR_EXCERPT_LENGTH]}"
         ) from exc
 
-    try:
-        results = json.loads(response.body)
-        bindings = results["results"]["bindings"]
-    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise ValueError(
-            f"The SPARQL endpoint '{endpoint}' did not answer with SPARQL results "
-            f"in JSON ({response.content_type or 'no content type'}): {exc}. The "
-            "query must be a SELECT query."
-        ) from exc
 
-    # The head is mandatory in SPARQL results, but an endpoint omitting it is
-    # not worth failing for: the bindings then speak for the projection.
+def read_solutions(endpoint: str, answer: Download):
+    """
+    The variables the answer of *endpoint* in the file *answer* projects, if
+    it says, and an iterator of its solutions, read as a stream: for each, the
+    term bound to ?entity_iri and to ?matching_value_1, as (kind, value) pairs
+    whose kind is ``uri`` for an IRI.
+    """
+    json_format = pyoxigraph.QueryResultsFormat.JSON
+    results_format = RESULTS_FORMATS.get(answer.content_type, json_format)
+    try:
+        results = pyoxigraph.parse_query_results(path=answer.path, format=results_format)
+    except SyntaxError as exc:
+        if results_format != json_format:
+            raise _not_results(endpoint, answer, exc) from exc
+        # The head is mandatory in SPARQL results, but an endpoint omitting it
+        # is not worth failing for: the bindings then speak for the projection.
+        return _read_json_solutions(endpoint, answer, exc)
+
+    if not isinstance(results, pyoxigraph.QuerySolutions):
+        raise _not_results(endpoint, answer, "it is the answer to an ASK query")
+
+    if results_format == json_format and not _starts_with_head(answer.path):
+        # The parser holds the solutions until it reads which variables they bind.
+        LOGGER.warning(
+            f"The answer of the SPARQL endpoint '{endpoint}' gives its results "
+            "before its head, so it is read whole into memory before it is indexed."
+        )
+
+    variables = [variable.value for variable in results.variables]
+    if ENTITY_VARIABLE not in variables or MATCHING_VARIABLE not in variables:
+        # check_variables says which is missing.
+        return variables, iter(())
+    # By position, much faster than by name over millions of solutions.
+    entity, value = variables.index(ENTITY_VARIABLE), variables.index(MATCHING_VARIABLE)
+
+    def solutions():
+        try:
+            for solution in results:
+                yield _solution_term(solution[entity]), _solution_term(solution[value])
+        except SyntaxError as exc:
+            if results_format == json_format:
+                # A term the streaming parser rejects and json.load may not: a
+                # Virtuoso 'nodeID://' blank node, a language tag that is not
+                # BCP 47, an IRI with a space.
+                raise _StreamingError(exc) from exc
+            raise _not_results(endpoint, answer, exc) from exc
+
+    return variables, solutions()
+
+
+class _StreamingError(Exception):
+    """The streaming parser rejects a solution of an answer in JSON."""
+
+
+def _starts_with_head(path: str) -> bool:
+    """Whether the answer in JSON at *path* gives its head first."""
+    with open(path, "rb") as answer_file:
+        start = answer_file.read(4096)
+    return re.match(rb'(\xef\xbb\xbf)?\s*\{\s*"head"', start) is not None
+
+
+def _solution_term(term) -> tuple[str, str] | None:
+    """The kind and value of a term bound in a solution, None when unbound."""
+    if term is None:
+        return None
+    if isinstance(term, pyoxigraph.NamedNode):
+        return "uri", term.value
+    # A triple term has no value of its own to match.
+    return type(term).__name__.lower(), getattr(term, "value", None)
+
+
+def _read_json_solutions(endpoint: str, answer: Download, reason):
+    """The solutions of an answer in JSON the streaming parser rejects, in memory."""
+    try:
+        with open(answer.path, "rb") as answer_file:
+            results = json.load(answer_file)
+        bindings = results["results"]["bindings"]
+        iter(bindings)
+    except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise _not_results(endpoint, answer, exc) from exc
+
+    LOGGER.warning(
+        f"The answer of the SPARQL endpoint '{endpoint}' cannot be read as a "
+        f"stream ({reason}), so it is read in memory."
+    )
+
     head = results.get("head")
     variables = head.get("vars") if isinstance(head, dict) else None
 
-    return variables, bindings
+    def term(binding):
+        if not isinstance(binding, dict):
+            return None
+        return binding.get("type"), binding.get("value")
+
+    def solutions():
+        for binding in bindings:
+            yield term(binding.get(ENTITY_VARIABLE)), term(binding.get(MATCHING_VARIABLE))
+
+    return variables, solutions()
+
+
+def _not_results(endpoint: str, answer: Download, detail) -> ValueError:
+    return ValueError(
+        f"The SPARQL endpoint '{endpoint}' did not answer with SPARQL results "
+        f"in JSON ({answer.content_type or 'no content type'}): {detail}. The "
+        "query must be a SELECT query."
+    )
 
 
 def _error_body(error: HTTPError) -> bytes:
@@ -231,31 +342,41 @@ def check_variables(endpoint: str, variables) -> None:
         )
 
 
-def build_index(resource, query: str) -> ConceptIndex:
-    """Build the index of *query* sent to the endpoint of *resource*."""
-    endpoint = resource.get_url()
-    variables, bindings = run_query(resource, query)
-    if variables is not None:
-        check_variables(endpoint, variables)
-
-    index = ConceptIndex()
-    entities = set()
+def _index_solutions(solutions, state_dir: str, memory_limit: str):
+    """The index of *solutions*, and how many bound ?entity_iri to no IRI."""
     not_iris = 0
+    with ConceptIndexBuilder(state_dir, memory_limit) as builder:
+        for entity, value in solutions:
+            # Unbound in this solution, e.g. by an OPTIONAL pattern.
+            if entity is None or value is None or value[1] is None:
+                continue
+            # A blank node or a literal identifies no entity outside the answer.
+            if entity[0] != "uri":
+                not_iris += 1
+                continue
+            # The answer says nothing of attributes: the values are indexed
+            # under a single, unnamed one.
+            builder.add("", value[1], entity[1])
+        return builder.build(), not_iris
 
-    for binding in bindings:
-        entity = binding.get(ENTITY_VARIABLE)
-        value  = binding.get(MATCHING_VARIABLE)
-        # Unbound in this solution, e.g. by an OPTIONAL pattern.
-        if entity is None or value is None:
-            continue
-        # A blank node or a literal identifies no entity outside the answer.
-        if entity.get("type") != "uri":
-            not_iris += 1
-            continue
-        # The answer says nothing of attributes: the values are indexed under
-        # a single, unnamed one.
-        index.add("", value["value"], entity["value"])
-        entities.add(entity["value"])
+
+def build_index(resource, query: str, *, state_dir: str, memory_limit: str) -> ConceptIndex:
+    """Build the index of *query* sent to the endpoint of *resource*, in *state_dir*."""
+    endpoint = resource.get_url()
+    answer = run_query(resource, query, state_dir)
+    try:
+        variables, solutions = read_solutions(endpoint, answer)
+        if variables is not None:
+            check_variables(endpoint, variables)
+
+        try:
+            index, not_iris = _index_solutions(solutions, state_dir, memory_limit)
+        except _StreamingError as exc:
+            # Indexed anew from the start, by a new builder.
+            _, solutions = _read_json_solutions(endpoint, answer, exc)
+            index, not_iris = _index_solutions(solutions, state_dir, memory_limit)
+    finally:
+        answer.remove()
 
     if not_iris:
         LOGGER.warning(
@@ -264,10 +385,10 @@ def build_index(resource, query: str) -> ConceptIndex:
             "left out."
         )
 
-    if entities:
+    if index.concept_count:
         LOGGER.info(
-            f"SPARQL endpoint '{endpoint}': indexed {len(entities)} entity(ies) "
-            f"by {len(index)} value(s)."
+            f"SPARQL endpoint '{endpoint}': indexed {index.concept_count} "
+            f"entity(ies) by {len(index)} value(s)."
         )
     else:
         hint = ""

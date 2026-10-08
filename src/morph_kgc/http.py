@@ -24,13 +24,18 @@ Credentials written in a URL (``https://user:password@host``) are rejected.
 
 Public API
 ----------
-fetch(url, ...)  -> Response(body: bytes, content_type: str)
+fetch(url, ...)               -> Response(body: bytes, content_type: str)
+download(url, directory, ...) -> Download(path: str, content_type: str, temporary: bool)
 """
 
 import gzip
 import logging
 import os
+import shutil
+import tempfile
+import zlib
 from base64 import b64encode
+from contextlib import contextmanager
 from dataclasses import dataclass
 from http.client import InvalidURL
 from urllib.error import HTTPError, URLError
@@ -58,12 +63,32 @@ METHOD_PRESERVING_REDIRECTS = (301, 302, 307, 308)
 # for: Authorization, the KeyId of an HTTP API, Proxy-Authorization, ...
 CROSS_ORIGIN_HEADERS = {"Accept", "Accept-encoding", "Content-type", "User-agent"}
 
+# Bytes read from the network at a time by download().
+CHUNK_SIZE = 1 << 20
+
 
 @dataclass(frozen=True)
 class Response:
     """The body of a fetched resource and the content type it was served with."""
     body: bytes
     content_type: str = ""
+
+
+@dataclass(frozen=True)
+class Download:
+    """
+    A resource written to a local file, and the content type it was served
+    with. A local path is not copied: *temporary* says whether the file was
+    written by :func:`download`, for the caller to remove once read.
+    """
+    path: str
+    content_type: str = ""
+    temporary: bool = False
+
+    def remove(self) -> None:
+        """Remove the file, if :func:`download` wrote it."""
+        if self.temporary and os.path.exists(self.path):
+            os.remove(self.path)
 
 
 def is_remote(url: str) -> bool:
@@ -107,6 +132,80 @@ def fetch(
     if not is_remote(url):
         return _read_file(url, description)
 
+    with _open(
+        url, username, password, accept, params, headers, data, content_type,
+        method, timeout, description,
+    ) as (response, url):
+        content_encoding = response.headers.get("Content-Encoding", "")
+        return Response(
+            body=_decompress(response.read(), content_encoding, url, description),
+            content_type=response.headers.get_content_type() or "",
+        )
+
+
+def download(
+    url: str,
+    directory: str,
+    *,
+    username: str = "",
+    password: str = "",
+    accept: str = "",
+    params: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    content_type: str = "",
+    method: str = "",
+    timeout: int = DEFAULT_TIMEOUT,
+    description: str = "resource",
+) -> Download:
+    """
+    Retrieve *url* as :func:`fetch` does, but write its body to a new file of
+    *directory* as it arrives, instead of holding it in memory: a resource of
+    any size is read with the same memory. A local path is returned as it is.
+    """
+    if not is_remote(url):
+        if not os.path.isfile(url):
+            raise ValueError(f"The {description} '{url}' is not a readable file.")
+        return Download(path=url)
+
+    with _open(
+        url, username, password, accept, params, headers, data, content_type,
+        method, timeout, description,
+    ) as (response, url):
+        content_encoding = response.headers.get("Content-Encoding", "")
+        descriptor, path = tempfile.mkstemp(prefix="download-", dir=directory)
+        try:
+            with os.fdopen(descriptor, "wb") as body:
+                if content_encoding.lower() == "gzip":
+                    _copy_decompressed(response, body, url, description)
+                else:
+                    shutil.copyfileobj(response, body, CHUNK_SIZE)
+            # Read in parts, a body cut short by the server is not an error:
+            # what it said it would send and did not is left over.
+            if getattr(response, "length", None):
+                raise ValueError(
+                    f"Could not retrieve the {description} '{url}': the connection "
+                    f"closed {response.length} byte(s) before the end of the body."
+                )
+        except BaseException:
+            os.remove(path)
+            raise
+        return Download(
+            path=path,
+            content_type=response.headers.get_content_type() or "",
+            temporary=True,
+        )
+
+
+@contextmanager
+def _open(
+    url, username, password, accept, params, headers, data, content_type,
+    method, timeout, description,
+):
+    """
+    Send the request *fetch* and *download* describe, and yield the response
+    and the URL it was sent to, turning the errors of urllib into ValueError.
+    """
     if urlsplit(url).username is not None:
         # urllib would take them for part of the host name, and send them in
         # clear text to the DNS resolver, a proxy and the logs.
@@ -133,11 +232,7 @@ def fetch(
     opener = build_opener(_RedirectHandler)
     try:
         with opener.open(request, timeout=timeout) as response:
-            content_encoding = response.headers.get("Content-Encoding", "")
-            return Response(
-                body=_decompress(response.read(), content_encoding, url, description),
-                content_type=response.headers.get_content_type() or "",
-            )
+            yield response, url
     except HTTPError as exc:
         detail = f"{exc.code} {exc.reason}"
         if exc.code in (401, 403) and not (username or password):
@@ -266,6 +361,19 @@ def _decompress(body: bytes, content_encoding: str, url: str, description: str) 
     try:
         return gzip.decompress(body)
     except (OSError, EOFError) as exc:
+        raise ValueError(
+            f"Could not decompress the {description} '{url}': {exc}."
+        ) from exc
+
+
+def _copy_decompressed(response, body, url: str, description: str) -> None:
+    """Copy the gzipped *response* to the file *body*, decompressing it."""
+    # Every member of the body is read (as gzip.decompress does), and at most
+    # CHUNK_SIZE bytes of it are decompressed at a time.
+    try:
+        with gzip.GzipFile(fileobj=response, mode="rb") as decompressed:
+            shutil.copyfileobj(decompressed, body, CHUNK_SIZE)
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
         raise ValueError(
             f"Could not decompress the {description} '{url}': {exc}."
         ) from exc

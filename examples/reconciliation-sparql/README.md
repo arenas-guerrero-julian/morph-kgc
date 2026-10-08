@@ -11,7 +11,14 @@ fetched from a URL instead.
 
 It is a **stateful** function: the query is sent **once**, before any triple is
 materialized, and the resulting index of entities is shared by every mapping
-rule and every worker process. No query is sent while generating triples.
+rule and every worker process. No query is sent while generating triples. As
+for a SKOS vocabulary, the answer is streamed into an index kept on disk, so
+the memory an answer of millions of entities takes is set by the
+`state_memory_limit` of the configuration file, not by the answer (see
+[`../reconciliation`](../reconciliation)). An answer in JSON is streamed when it
+gives its head first, as most stores write it; one giving its results first, or
+holding a term the streaming parser rejects, is read whole into memory, with a
+warning.
 
 Run this example with:
 
@@ -200,5 +207,6 @@ mappings:
 
 ## Writing your own stateful function
 
-Any user-defined function can be given a shared context in the same way; see
+Any user-defined function can be given a shared context in the same way, kept
+in memory or, when large, in an on-disk table; see
 [`../stateful_udfs.py`](../stateful_udfs.py).

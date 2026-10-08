@@ -339,3 +339,216 @@ def test_stateful_udf_without_initialization():
 
     with pytest.raises(FileNotFoundError):
         get_context('http://example.com/countryName', cfg)
+
+
+# ── On-disk tables and vectorized functions ───────────────────────────────────
+
+@pytest.mark.parametrize('processes', [1, 2])
+def test_stateful_udf_with_an_on_disk_table(tmp_path, monkeypatch, processes):
+    """
+    A context may keep its data in a Parquet table of the run, which the
+    function queries: the context only holds the path of the table, and the
+    table goes with the state directory of the run.
+    """
+    from morph_kgc.config.loaders import load_config
+    from morph_kgc.functions import executor
+    from morph_kgc.functions.state import get_context
+
+    state_dir = tmp_path / 'state'
+    files = []
+
+    def spying_get_context(function_iri, run_config):
+        files.extend((path.name, path.stat().st_size) for path in state_dir.glob('*/*'))
+        return get_context(function_iri, run_config)
+
+    monkeypatch.setattr(executor, 'get_context', spying_get_context)
+
+    cfg = load_config(config(state_dir=str(state_dir), udf='udf_table.py'))
+    cfg.number_of_processes = processes
+    g_morph = morph_kgc.materialize(cfg)
+
+    assert_isomorphic(expected_graph(), g_morph)
+    if processes == 1:
+        # The spy only sees the contexts read in this process.
+        assert [name for name, _ in files if name.endswith('.parquet')]
+        assert max(size for name, size in files if name.endswith('.pickle')) < 2000
+    assert os.listdir(state_dir) == []
+
+
+def test_stateful_udf_run_leaves_nothing_in_memory():
+    """
+    A run materialized in this process forgets its contexts and closes the
+    connection it read their tables with.
+    """
+    from morph_kgc.config.loaders import load_config
+    from morph_kgc.functions import state, tables
+
+    cfg = load_config(config(udf='udf_table.py'))
+    cfg.number_of_processes = 1
+    morph_kgc.materialize(cfg)
+
+    assert state._LOADED_CONTEXTS == {}
+    assert tables._CONNECTIONS == {}
+
+
+def test_state_memory_limit_not_valid():
+    """
+    A memory limit DuckDB does not understand is reported as an option when the
+    configuration is read, before any resource is downloaded.
+    """
+    from morph_kgc.config.loaders import load_config
+
+    with pytest.raises(ValueError, match="Option 'state_memory_limit' is 'lots'"):
+        load_config(config(udf='udf_table.py').replace(
+            '[CONFIGURATION]\n', '[CONFIGURATION]\nstate_memory_limit=lots\n'))
+
+
+def test_vectorized_udf_is_called_once_per_rule():
+    """A vectorized function is called once, with the values of every row."""
+    from morph_kgc.config.loaders import load_config
+    from morph_kgc.functions.registry import FunctionRegistry
+
+    cfg = load_config(config(udf='udf_vectorized.py'))
+    cfg.number_of_processes = 1
+    calls = FunctionRegistry.get('http://example.com/countryName', cfg).function.__globals__['CALLS']
+    calls.clear()
+
+    g_morph = morph_kgc.materialize(cfg)
+
+    assert_isomorphic(expected_graph(), g_morph)
+    assert len(calls) == 1
+    codes, resources = calls[0]
+    assert sorted(codes) == ['ES', 'FR', 'NL', 'XX']
+    assert resources == ['country_names'] * 4
+
+
+def test_vectorized_udf_not_returning_a_result_per_row(tmp_path):
+    """A vectorized function must return a result per row."""
+    from morph_kgc.config.loaders import load_config
+
+    with open(os.path.join(TEST_DIR, 'mapping.ttl'), encoding='utf-8') as f:
+        mapping = f.read().replace('ex:countryName', 'ex:wrongCountryName')
+    mapping_path = tmp_path / 'mapping.ttl'
+    mapping_path.write_text(mapping, encoding='utf-8')
+
+    cfg = load_config(config(udf='udf_vectorized.py').replace(
+        os.path.join(TEST_DIR, 'mapping.ttl'), str(mapping_path)))
+    cfg.number_of_processes = 1
+
+    with pytest.raises(TypeError, match='must return a list of 4 result'):
+        morph_kgc.materialize(cfg)
+
+
+def test_vectorized_udf_is_not_called_without_rows(tmp_path):
+    """As a function called per row, a vectorized one is not called for no row."""
+    from morph_kgc.config.loaders import load_config
+    from morph_kgc.functions.registry import FunctionRegistry
+
+    # The function gives the subjects of a join that matches nothing.
+    mapping_path = tmp_path / 'mapping.ttl'
+    mapping_path.write_text(
+        '@prefix ex: <http://example.com/> .\n'
+        '@prefix rml: <http://w3id.org/rml/> .\n'
+        '@prefix grel: <http://users.ugent.be/~bjdmeest/function/grel.ttl#> .\n'
+        '@prefix morph-fn: <urn:morph:function:> .\n'
+        '@base <http://example.com/base/> .\n'
+        '<Country> rml:logicalSource [ rml:source "test/rml-fnml/stateful_udf/countries.csv" ;'
+        ' rml:referenceFormulation rml:CSV ] ;\n'
+        '  rml:subjectMap [ rml:functionExecution <#Execution> ; rml:termType rml:BlankNode ] ;\n'
+        '  rml:predicateObjectMap [ rml:predicate ex:city ; rml:objectMap [\n'
+        '    rml:parentTriplesMap <City> ;\n'
+        '    rml:joinCondition [ rml:child "code" ; rml:parent "city" ] ] ] .\n'
+        '<City> rml:logicalSource [ rml:source "test/rml-fnml/stateful_udf/countries.csv" ;'
+        ' rml:referenceFormulation rml:CSV ] ;\n'
+        '  rml:subjectMap [ rml:template "http://example.com/{city}" ] .\n'
+        '<#Execution> rml:function ex:countryName ; rml:input\n'
+        '  [ rml:parameter morph-fn:resource ; rml:inputValue "country_names" ] ,\n'
+        '  [ rml:parameter grel:valueParam ; rml:inputValueMap [ rml:reference "code" ] ] .\n',
+        encoding='utf-8',
+    )
+
+    cfg = load_config(config(udf='udf_vectorized.py').replace(
+        os.path.join(TEST_DIR, 'mapping.ttl'), str(mapping_path)))
+    cfg.number_of_processes = 1
+    calls = FunctionRegistry.get('http://example.com/countryName', cfg).function.__globals__['CALLS']
+    calls.clear()
+
+    g_morph = morph_kgc.materialize(cfg)
+
+    assert len(g_morph) == 0
+    assert calls == []
+
+
+def test_vectorized_must_be_a_boolean():
+    """'vectorized' is no name for a parameter of a function."""
+    from morph_kgc.functions.bif_decorator import make_decorator
+
+    udf = make_decorator({})
+    with pytest.raises(TypeError, match="no parameter may be named 'vectorized'"):
+        @udf(fun_id='http://example.com/f', vectorized='http://example.com/param/vectorized')
+        def f(vectorized):
+            return vectorized
+
+
+def test_on_disk_table_keeps_integers_exact(tmp_path):
+    """A 64-bit integer is written as it is, even next to a missing value."""
+    from morph_kgc.functions.tables import close_connections, write_table
+
+    rows = [(2**60 + 1, 'a'), (None, 'b'), (2**53 + 1, 'c')]
+    table = write_table(str(tmp_path), '512MB', rows, {'id': 'BIGINT', 'name': 'VARCHAR'})
+    try:
+        assert table.select('SELECT id, name FROM {table} ORDER BY name') == rows
+    finally:
+        close_connections(str(tmp_path))
+
+
+def test_runs_in_threads_keep_their_own_connection(tmp_path):
+    """
+    Runs materialized at the same time in threads of one process read their
+    tables through connections of their own: one ending does not close the
+    other's.
+    """
+    from morph_kgc.functions import tables
+
+    first, second = tmp_path / 'first', tmp_path / 'second'
+    first.mkdir()
+    second.mkdir()
+    first_table = tables.write_table(str(first), '512MB', [('a',)], {'value': 'VARCHAR'})
+    second_table = tables.write_table(str(second), '512MB', [('b',)], {'value': 'VARCHAR'})
+    try:
+        assert first_table.select('SELECT value FROM {table}') == [('a',)]
+        assert second_table.select('SELECT value FROM {table}') == [('b',)]
+
+        tables.close_connections(str(first))
+
+        assert second_table.select('SELECT value FROM {table}') == [('b',)]
+        assert {key[1] for key in tables._CONNECTIONS} & {str(first), str(second)} == {str(second)}
+    finally:
+        tables.close_connections(str(first))
+        tables.close_connections(str(second))
+
+
+def _select_in_child(table, results):
+    results.put(table.select('SELECT value FROM {table}'))
+
+
+@linux_only
+def test_worker_forked_while_a_connection_opens(tmp_path):
+    """
+    A worker forked while another thread of the parent opens a connection, and
+    holds the lock guarding them, can open its own.
+    """
+    import multiprocessing
+    from morph_kgc.functions import tables
+
+    table = tables.write_table(str(tmp_path), '512MB', [('a',)], {'value': 'VARCHAR'})
+    context = multiprocessing.get_context('fork')
+    results = context.Queue()
+    with tables._CONNECTION_LOCK:
+        worker = context.Process(target=_select_in_child, args=(table, results))
+        worker.start()
+        worker.join(60)
+    if worker.is_alive():
+        worker.kill()
+    assert worker.exitcode == 0
+    assert results.get(timeout=5) == [('a',)]

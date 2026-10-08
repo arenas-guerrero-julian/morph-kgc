@@ -62,7 +62,7 @@ The SKOS vocabulary is declared in the configuration file with a `[RESOURCE:<nam
 
 The SPARQL example also ships a small `endpoint.py` answering the queries, so that it runs without a triplestore of its own.
 
-[`stateful_udfs.py`](https://github.com/morph-kgc/morph-kgc/blob/main/examples/stateful_udfs.py) shows how to give a user-defined function a shared context of its own with the `@stateful_udf` decorator.
+[`stateful_udfs.py`](https://github.com/morph-kgc/morph-kgc/blob/main/examples/stateful_udfs.py) shows how to give a user-defined function a shared context of its own with the `@stateful_udf` decorator, kept in memory or, when large, in an on-disk table queried by a vectorized function.
 
 
 ### Configuration Files

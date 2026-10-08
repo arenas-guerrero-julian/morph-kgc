@@ -13,7 +13,14 @@ immutable context reused by every invocation of the function.
 The context is persisted to disk (one pickle file per function) rather than kept
 in a service or a background process, so that the worker processes spawned by
 the multiprocess executor read it back instead of rebuilding it. Each worker
-loads a context at most once and keeps it in memory afterwards.
+loads a context at most once, the first time it executes the function, and
+keeps it in memory afterwards.
+
+A context too large to hold in memory keeps its data in Parquet files the
+initializer writes to the state directory of the run, and only holds handles
+to them (see :mod:`morph_kgc.functions.tables`): the reconciliation functions
+keep their indexes that way, so that their memory does not grow with the size
+of the vocabulary or of the answer of the SPARQL endpoint.
 
 The files go to a directory of their own for every run, created inside the
 configured ``state_dir`` (a disk with room for large contexts, for instance) or
@@ -31,7 +38,8 @@ get_context(function_iri, config) -> Any
     Execution step: reads (once per process) the context of a function.
 
 release_contexts(session)
-    Post-execution step: removes the state directory of the run.
+    Post-execution step: forgets the contexts of the run, closes the DuckDB
+    connection of the process and removes the state directory of the run.
 """
 
 import logging
@@ -44,9 +52,11 @@ from hashlib import sha256
 from inspect import signature
 from typing import Any, Optional
 
+from ..config.defaults import DEFAULT_STATE_MEMORY_LIMIT
 from ..constants import LOGGING_NAMESPACE, RML_CONSTANT
 from .model import FNMLExecution
 from .registry import FunctionRegistry
+from .tables import ParquetTable, close_connections, write_table
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
@@ -98,6 +108,36 @@ class InitializationContext:
     config: Any
     parameters: dict[str, list[str]] = field(default_factory=dict)
     executions: tuple[ExecutionParameters, ...] = ()
+    # The state directory of the run, where an initializer may write the files
+    # its context refers to; they are removed with it when the run ends.
+    state_dir: str = ""
+
+    # -- Files ----------------------------------------------------------------
+
+    @property
+    def memory_limit(self) -> str:
+        """The memory DuckDB may use in a process, as 'state_memory_limit' says."""
+        return getattr(self.config, "state_memory_limit", "") or DEFAULT_STATE_MEMORY_LIMIT
+
+    def write_table(
+        self,
+        rows,
+        columns: dict[str, str],
+        *,
+        order_by: tuple[str, ...] = (),
+        distinct: bool = False,
+    ) -> ParquetTable:
+        """
+        Write *rows* (an iterable of tuples, consumed as it goes) to a Parquet
+        file of the run, as a table of *columns* (name -> SQL type) sorted by
+        *order_by*, with the same memory whatever their number. The returned
+        :class:`~morph_kgc.functions.tables.ParquetTable` is what the context
+        keeps: the function queries the file through it.
+        """
+        return write_table(
+            self.state_dir, self.memory_limit, rows, columns,
+            order_by=order_by, distinct=distinct,
+        )
 
     # -- Constants ----------------------------------------------------------
 
@@ -272,6 +312,7 @@ def initialize_contexts(config, rml_mapping) -> ContextSession:
                 executions   = tuple(
                     _execution_parameters(execution) for execution in executions
                 ),
+                state_dir    = session.path,
             )
 
             if len(signature(registered.initializer).parameters) == 0:
@@ -370,11 +411,18 @@ def release_contexts(session: Optional[ContextSession]) -> None:
     """
     Remove the state directory of the run and give the configuration back the
     ``state_dir`` the run started with — a run must leave nothing behind, on
-    disk or in the configuration it was handed. A configured ``state_dir`` is
-    kept, with anything else it holds.
+    disk, in memory or in the configuration it was handed. A configured
+    ``state_dir`` is kept, with anything else it holds.
     """
     if session is None or not session.path:
         return
+
+    # The contexts of the run, read by this process when it materialized the
+    # mapping itself, and the connection their tables were read with.
+    # Other runs may be materialized at the same time in threads of this one.
+    for cache_key in [key for key in list(_LOADED_CONTEXTS) if key[0] == session.path]:
+        _LOADED_CONTEXTS.pop(cache_key, None)
+    close_connections(session.path)
 
     shutil.rmtree(session.path, ignore_errors=True)
     LOGGER.debug(f"State directory '{session.path}' removed.")

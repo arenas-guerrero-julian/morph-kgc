@@ -23,20 +23,35 @@ The vocabulary is retrieved once, during the context initialization phase. It
 may be serialized as triples or as quads (N-Quads, TriG): the concepts of every
 graph of a vocabulary split across named graphs are indexed.
 
+The vocabulary is downloaded to the state directory of the run and parsed as a
+stream, its labels going to the index on disk as they are read, so that indexing
+a vocabulary takes the same memory whatever its size. A serialization the
+streaming parser cannot read (TriX, a JSON-LD document with a remote context, a
+document breaking the syntax in ways rdflib tolerates) is parsed in memory with
+rdflib instead, as a fallback, with a warning. Where the streaming parser keeps
+a typed literal as written (``"01"^^xsd:integer`` is matched by ``01``), rdflib
+normalizes it (matched by ``1``). A JSON-LD document whose top level is an
+object (``@context`` and ``@graph``) is read whole before its first statement,
+also with a warning: only a top-level array of nodes is read as a stream.
+
 The ``attributes`` are absolute IRIs, or prefixed names with one of the
 well-known prefixes in :data:`WELL_KNOWN_PREFIXES` (``skos:``, ``dcterms:``,
 ``schema:``, ...). An attribute in any other namespace is written as a full IRI.
 """
 
 import logging
-from urllib.parse import urlsplit
+import re
+from pathlib import Path
+from urllib.parse import quote, urlsplit, urlunsplit
 
+import duckdb
+import pyoxigraph
 import rdflib
 from rdflib.namespace import DC, DCTERMS, FOAF, OWL, RDF, RDFS, SDO, SKOS, XSD
 
 from ..constants import LOGGING_NAMESPACE
-from ..http import DEFAULT_TIMEOUT, fetch
-from .index import ConceptIndex, EXACT_MATCHING, VALID_MATCHINGS
+from ..http import DEFAULT_TIMEOUT, download
+from .index import ConceptIndex, ConceptIndexBuilder, EXACT_MATCHING, VALID_MATCHINGS
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
@@ -57,7 +72,32 @@ WELL_KNOWN_PREFIXES = {
 
 # SKOS makes these classes disjoint from skos:Concept: their resources are
 # labelled as concepts are, but no value identifies one of them as a concept.
-NON_CONCEPT_CLASSES = (SKOS.ConceptScheme, SKOS.Collection, SKOS.OrderedCollection)
+NON_CONCEPT_CLASSES = frozenset(
+    str(concept_class)
+    for concept_class in (SKOS.ConceptScheme, SKOS.Collection, SKOS.OrderedCollection)
+)
+RDF_TYPE = str(RDF.type)
+
+# The serializations the streaming parser reads, by the names the 'format'
+# option and guess_format() give them (rdflib's, and other usual spellings).
+STREAMING_FORMATS = {
+    "turtle":    pyoxigraph.RdfFormat.TURTLE,
+    "ttl":       pyoxigraph.RdfFormat.TURTLE,
+    "n3":        pyoxigraph.RdfFormat.N3,
+    "nt":        pyoxigraph.RdfFormat.N_TRIPLES,
+    "nt11":      pyoxigraph.RdfFormat.N_TRIPLES,
+    "ntriples":  pyoxigraph.RdfFormat.N_TRIPLES,
+    "n-triples": pyoxigraph.RdfFormat.N_TRIPLES,
+    "nquads":    pyoxigraph.RdfFormat.N_QUADS,
+    "nq":        pyoxigraph.RdfFormat.N_QUADS,
+    "n-quads":   pyoxigraph.RdfFormat.N_QUADS,
+    "trig":      pyoxigraph.RdfFormat.TRIG,
+    "xml":       pyoxigraph.RdfFormat.RDF_XML,
+    "rdf/xml":   pyoxigraph.RdfFormat.RDF_XML,
+    "rdfxml":    pyoxigraph.RdfFormat.RDF_XML,
+    "json-ld":   pyoxigraph.RdfFormat.JSON_LD,
+    "jsonld":    pyoxigraph.RdfFormat.JSON_LD,
+}
 
 # Serializations we can ask for, most specific first.
 ACCEPTED_MEDIA_TYPES = (
@@ -153,14 +193,8 @@ def guess_format(resource, url: str, content_type: str) -> str | None:
     )
 
 
-def load_vocabulary_graph(resource) -> rdflib.Dataset:
-    """
-    Fetch and parse the SKOS vocabulary declared by *resource*.
-
-    The vocabulary is parsed into a dataset whose default graph is the union of
-    all its graphs, so that the triples of a vocabulary serialized as quads are
-    not lost: a plain graph silently drops those in a named graph.
-    """
+def download_vocabulary(resource, state_dir: str):
+    """Download the SKOS vocabulary declared by *resource* to *state_dir*."""
     url = resource.get_url()
     if not url:
         raise ValueError(
@@ -174,8 +208,9 @@ def load_vocabulary_graph(resource) -> rdflib.Dataset:
             f"the configuration file, in its '[RESOURCE:{resource.name}]' section."
         )
 
-    response = fetch(
+    return download(
         url,
+        state_dir,
         username    = resource.get_username(),
         password    = resource.get_password(),
         accept      = ACCEPTED_MEDIA_TYPES,
@@ -183,25 +218,128 @@ def load_vocabulary_graph(resource) -> rdflib.Dataset:
         description = "vocabulary",
     )
 
-    rdf_format = guess_format(resource, url, response.content_type)
 
-    graph = rdflib.Dataset(default_union=True)
-    try:
-        graph.parse(data=response.body, format=rdf_format)
-    except Exception as exc:
-        raise ValueError(
-            f"The vocabulary of resource '{resource.name}' fetched from '{url}' "
-            f"could not be parsed as RDF ({rdf_format or 'unknown format'}): "
-            f"{exc}. Set the 'format' option of the resource to its "
-            "serialization."
-        ) from exc
-
-    return graph
+class _StreamingParseError(Exception):
+    """The streaming parser cannot read a vocabulary, which rdflib may."""
 
 
-def build_index(resource, matched_attributes=((),)) -> ConceptIndex:
+UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _valid_base_iri(iri: str) -> str | None:
     """
-    Build the concept index of a SKOS vocabulary resource.
+    *iri* as the base IRI of the streaming parser, percent-encoded where it is
+    no IRI ('|', '^', '%zz' in a path urllib fetches anyway); None when it
+    cannot be one.
+    """
+    escaped = re.sub(r"%(?![0-9A-Fa-f]{2})", "%25", iri)
+    for candidate in (iri, quote(escaped, safe=":/?#[]@!$&'()*+,;=%~")):
+        try:
+            return pyoxigraph.NamedNode(candidate).value
+        except ValueError:
+            pass
+    return None
+
+
+def _starts_with(path: str, prefix: bytes) -> bool:
+    """Whether the file at *path*, after a byte order mark and spaces, starts with *prefix*."""
+    with open(path, "rb") as document:
+        head = document.read(4096)
+    return head.removeprefix(UTF8_BOM).lstrip().startswith(prefix)
+
+
+def _term(term) -> tuple[str, str | None]:
+    """The kind of an RDF term (iri, bnode or literal) and its value."""
+    if isinstance(term, (pyoxigraph.NamedNode, rdflib.URIRef)):
+        return "iri", str(term.value if isinstance(term, pyoxigraph.NamedNode) else term)
+    if isinstance(term, (pyoxigraph.Literal, rdflib.Literal)):
+        return "literal", str(term.value if isinstance(term, pyoxigraph.Literal) else term)
+    if isinstance(term, (pyoxigraph.BlankNode, rdflib.BNode)):
+        return "bnode", None
+    # A triple term, which identifies no concept and is no label.
+    return "other", None
+
+
+def _streamed_statements(path: str, rdf_format, base_iri: str | None, predicates=None):
+    """
+    The statements of the vocabulary at *path*, read as a stream: those of
+    *predicates* only, unless it is None.
+    """
+    if rdf_format is None:
+        raise _StreamingParseError("the streaming parser does not read its serialization")
+    # The contents of an N3 formula ({ ... }) are quoted, not asserted: they
+    # come in a graph of their own.
+    asserted_only = rdf_format == pyoxigraph.RdfFormat.N3
+    with open(path, "rb") as document:
+        # The parser takes a byte order mark for the start of the document.
+        if document.read(len(UTF8_BOM)) != UTF8_BOM:
+            document.seek(0)
+        try:
+            quads = pyoxigraph.parse(document, format=rdf_format, base_iri=base_iri, lenient=True)
+            for quad in quads:
+                predicate = quad.predicate.value
+                if predicates is not None and predicate not in predicates:
+                    continue
+                if asserted_only and not isinstance(quad.graph_name, pyoxigraph.DefaultGraph):
+                    continue
+                yield _term(quad.subject), predicate, _term(quad.object)
+        except SyntaxError as exc:
+            raise _StreamingParseError(str(exc)) from exc
+
+
+def _parsed_statements(path: str, rdf_format: str | None, base_iri: str):
+    """The statements of the vocabulary at *path*, parsed in memory by rdflib."""
+    # Its default graph is the union of all the graphs of the vocabulary, so
+    # that the triples of a vocabulary serialized as quads are not lost.
+    graph = rdflib.Dataset(default_union=True)
+    graph.parse(source=path, format=rdf_format, publicID=base_iri)
+    for subject, predicate, value in graph.triples((None, None, None)):
+        subject, predicate, value = _term(subject), str(predicate), _term(value)
+        # rdflib reads a lone surrogate escape ("\uD800"), which no text holds
+        # and the index cannot store; the streaming parser rejects it.
+        if _is_text(subject[1]) and _is_text(predicate) and _is_text(value[1]):
+            yield subject, predicate, value
+
+
+def _is_text(value: str | None) -> bool:
+    """False for a string holding a lone surrogate."""
+    try:
+        value is None or value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _index_statements(statements, builder, attributes, every_attribute) -> dict:
+    """
+    Add to *builder* the values the concepts of *statements* take for
+    *attributes*, and for every property whose value is a literal when
+    *every_attribute*. Returns those properties.
+    """
+    literal_attributes = {}
+    for (subject_kind, subject), predicate, (value_kind, value) in statements:
+        # A blank node identifies no concept outside the vocabulary.
+        if subject_kind != "iri":
+            continue
+        if predicate == RDF_TYPE and value_kind == "iri" and value in NON_CONCEPT_CLASSES:
+            builder.exclude(subject)
+        if value_kind == "literal" and every_attribute:
+            builder.add(predicate, value, subject)
+            literal_attributes[predicate] = None
+        elif value_kind in ("literal", "iri") and predicate in attributes:
+            builder.add(predicate, value, subject)
+    return literal_attributes
+
+
+def build_index(
+    resource,
+    matched_attributes=((),),
+    *,
+    state_dir: str,
+    memory_limit: str,
+) -> ConceptIndex:
+    """
+    Build the concept index of a SKOS vocabulary resource, in *state_dir*.
 
     *matched_attributes* holds, for each execution of the function reconciling
     against the resource, the attributes it matches against: the ones it names,
@@ -220,8 +358,6 @@ def build_index(resource, matched_attributes=((),)) -> ConceptIndex:
     if any(attributes == () for attributes in matched_attributes):
         default_attributes = resolve_attributes(resource)
 
-    graph = load_vocabulary_graph(resource)
-
     attributes = {}
     every_attribute = False
     for execution_attributes in matched_attributes:
@@ -234,34 +370,70 @@ def build_index(resource, matched_attributes=((),)) -> ConceptIndex:
         else:
             every_attribute = True
 
-    index = ConceptIndex(matching=get_matching(resource))
+    matching = get_matching(resource)
+    vocabulary = download_vocabulary(resource, state_dir)
+    try:
+        url = resource.get_url()
+        rdf_format = guess_format(resource, url, vocabulary.content_type)
+        # Relative IRIs resolve against the URL of the vocabulary, but not its
+        # query, which may hold a secret (an API key) read from the environment.
+        if vocabulary.temporary:
+            base_iri = urlunsplit(urlsplit(url)._replace(query="", fragment=""))
+        else:
+            base_iri = Path(url).resolve().as_uri()
+        # Without a hint, as rdflib does, the vocabulary is taken for Turtle.
+        # The 'format' option may name it by its media type, as rdflib allows.
+        format_name = (rdf_format or "turtle").strip().lower()
+        streaming_format = STREAMING_FORMATS.get(CONTENT_TYPE_FORMATS.get(format_name, format_name))
+        if streaming_format == pyoxigraph.RdfFormat.JSON_LD and _starts_with(vocabulary.path, b"{"):
+            LOGGER.warning(
+                f"The vocabulary of resource '{resource.name}' is a JSON-LD "
+                "document whose top level is an object (@context and @graph), "
+                "which is read whole into memory before it is indexed. Serve it "
+                "as N-Triples, Turtle or RDF/XML to keep memory bounded."
+            )
+        # Every statement is read when every property with a literal value is
+        # indexed; otherwise, only those that can be indexed or exclude a concept.
+        predicates = None if every_attribute else frozenset(attributes) | {RDF_TYPE}
 
-    non_concepts = {
-        subject
-        for concept_class in NON_CONCEPT_CLASSES
-        for subject in graph.subjects(RDF.type, concept_class)
-    }
-
-    literal_attributes = {}
-    if every_attribute:
-        # Iterating a dataset yields quads, its triples() the union of graphs.
-        for concept, predicate, value in graph.triples((None, None, None)):
-            if isinstance(value, rdflib.term.Literal) and concept not in non_concepts:
-                index.add(str(predicate), value, str(concept))
-                literal_attributes[str(predicate)] = None
-    for attribute in attributes:
-        predicate = rdflib.term.URIRef(attribute)
-        for concept, value in graph.subject_objects(predicate):
-            if concept not in non_concepts:
-                index.add(attribute, value, str(concept))
-
-    # An execution naming no attribute matches against these, not against every
-    # indexed attribute: one only another execution names may take IRIs.
-    index.default_attributes = default_attributes or tuple(literal_attributes)
+        try:
+            with ConceptIndexBuilder(state_dir, memory_limit, matching) as builder:
+                statements = _streamed_statements(
+                    vocabulary.path, streaming_format, _valid_base_iri(base_iri), predicates,
+                )
+                literal_attributes = _index_statements(
+                    statements, builder, attributes, every_attribute,
+                )
+                index = builder.build(default_attributes or tuple(literal_attributes))
+        except _StreamingParseError as streaming_error:
+            LOGGER.warning(
+                f"The vocabulary of resource '{resource.name}' cannot be read as "
+                f"a stream ({streaming_error}), so it is parsed in memory."
+            )
+            with ConceptIndexBuilder(state_dir, memory_limit, matching) as builder:
+                try:
+                    statements = _parsed_statements(vocabulary.path, rdf_format, base_iri)
+                    literal_attributes = _index_statements(
+                        statements, builder, attributes, every_attribute,
+                    )
+                except duckdb.Error:
+                    # Writing the index failed (a full disk), not reading the vocabulary.
+                    raise
+                except Exception as exc:
+                    raise ValueError(
+                        f"The vocabulary of resource '{resource.name}' fetched from "
+                        f"'{url}' could not be parsed as RDF "
+                        f"({rdf_format or 'unknown format'}): {streaming_error}; "
+                        f"{(str(exc).strip() or type(exc).__name__).splitlines()[0]}. "
+                        "Set the 'format' option of the resource to its serialization."
+                    ) from exc
+                index = builder.build(default_attributes or tuple(literal_attributes))
+    finally:
+        vocabulary.remove()
 
     LOGGER.info(
         f"Resource '{resource.name}': indexed {len(index)} value(s) of "
-        f"{len(index.entries)} attribute(s) of the vocabulary."
+        f"{len(index.indexed_attributes)} attribute(s) of the vocabulary."
     )
 
     return index

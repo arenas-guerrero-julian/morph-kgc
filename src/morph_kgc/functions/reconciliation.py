@@ -12,7 +12,9 @@ step of an ETL pipeline that builds a knowledge graph.
 
 Both functions are initialized once, before any triple is materialized: the
 vocabulary is fetched (or the endpoint queried) a single time and the resulting
-index is shared by every mapping rule and worker process.
+index is shared by every mapping rule and worker process. The index is kept on
+disk, and the functions are vectorized: they look up all the values of a
+mapping rule in one query, rather than one value at a time.
 
 ``reconcileVocabularyConcept`` reconciles against a SKOS vocabulary, which lives
 in the configuration file, not in the mapping::
@@ -185,7 +187,12 @@ def _initialize_vocabulary(initialization) -> ReconciliationContext:
         if resource.name not in context.indexes:
             context.add(
                 resource.name,
-                skos.build_index(resource, _matched_attributes(initialization, resource)),
+                skos.build_index(
+                    resource,
+                    _matched_attributes(initialization, resource),
+                    state_dir    = initialization.state_dir,
+                    memory_limit = initialization.memory_limit,
+                ),
             )
         # The IRI is expanded, unless it names an unset variable, but the URL is
         # kept as declared: expanded, it may hold a secret read from the
@@ -199,28 +206,62 @@ def _initialize_vocabulary(initialization) -> ReconciliationContext:
     return context
 
 
+def _per_row(argument, rows: int) -> list:
+    """The value of a vectorized *argument* for each row, when the mapping binds it."""
+    return argument if isinstance(argument, list) else [argument] * rows
+
+
+def _attributes(attribute) -> tuple:
+    """
+    The attributes a row matches against: a parameter bound several times
+    (e.g. skos:prefLabel and skos:altLabel), under any of its IRIs, arrives as
+    a list, and the value is matched against all of them.
+    """
+    if attribute is None:
+        return ()
+    if isinstance(attribute, (list, tuple)):
+        return tuple(attribute)
+    return (attribute,)
+
+
+def _reconcile_rows(values, groups, lookup) -> list:
+    """
+    Reconcile *values*, the rows of each group of *groups* (key -> row
+    numbers) with a single call to ``lookup(key, values)``.
+    """
+    results = [None] * len(values)
+    for key, rows in groups.items():
+        matches = lookup(key, [values[row] for row in rows])
+        for row, row_matches in zip(rows, matches):
+            results[row] = _result(values[row], row_matches)
+    return results
+
+
 @stateful_bif(
     fun_id      = MORPH_RECONCILE_VOCABULARY_CONCEPT,
     initializer = _initialize_vocabulary,
+    vectorized  = True,
     value       = (GREL_VALUE_PARAM, GREL_VALUE_PARAMETER),
     resource    = MORPH_RESOURCE_PARAMETERS,
     attribute   = MergedAliases(MORPH_ATTRIBUTE_PARAMETERS),
 )
 def reconcile_vocabulary_concept(context, value, resource=None, attribute=None):
-    """Reconcile *value* against a SKOS vocabulary fetched from a URL."""
-    index = context.get(resource)
+    """Reconcile each of *value* against a SKOS vocabulary fetched from a URL."""
+    resources  = _per_row(resource, len(value))
+    attributes = _per_row(attribute, len(value))
 
-    # A parameter bound several times (e.g. skos:prefLabel and skos:altLabel),
-    # under any of its IRIs, arrives as a list; the value is matched against
-    # all of them.
-    if attribute is None:
-        attributes = ()
-    elif isinstance(attribute, (list, tuple)):
-        attributes = tuple(attribute)
-    else:
-        attributes = (attribute,)
+    # The rows reconciled against the same resource and attributes, which are
+    # usually all of them, are looked up together.
+    groups: dict[tuple, list[int]] = {}
+    for row, (row_resource, row_attribute) in enumerate(zip(resources, attributes)):
+        key = (row_resource, _attributes(row_attribute))
+        groups.setdefault(key, []).append(row)
 
-    return _result(value, index.lookup(value, attributes))
+    def lookup(key, values):
+        row_resource, row_attributes = key
+        return context.get(row_resource).lookup_many(values, row_attributes)
+
+    return _reconcile_rows(value, groups, lookup)
 
 
 # ── SPARQL endpoint ───────────────────────────────────────────────────────────
@@ -312,7 +353,12 @@ def _initialize_sparql(initialization) -> dict:
 
         if (endpoint, query) not in indexes:
             resource = _endpoint_resource(initialization, endpoint)
-            indexes[(endpoint, query)] = sparql.build_index(resource, query)
+            indexes[(endpoint, query)] = sparql.build_index(
+                resource,
+                query,
+                state_dir    = initialization.state_dir,
+                memory_limit = initialization.memory_limit,
+            )
 
     return indexes
 
@@ -320,12 +366,20 @@ def _initialize_sparql(initialization) -> dict:
 @stateful_bif(
     fun_id      = MORPH_RECONCILE_ENTITY_OVER_SPARQL,
     initializer = _initialize_sparql,
+    vectorized  = True,
     value       = (GREL_VALUE_PARAM, GREL_VALUE_PARAMETER),
     endpoint    = MORPH_FN_SPARQL_ENDPOINT_URL,
     query       = MORPH_FN_SPARQL_QUERY,
 )
 def reconcile_entity_over_sparql(context, value, endpoint=None, query=None):
-    """Reconcile *value* against the entities a SPARQL query returns."""
+    """Reconcile each of *value* against the entities a SPARQL query returns."""
     # Every execution bound a single constant endpoint and query, which the
     # initializer has indexed.
-    return _result(value, context[(endpoint, query)].lookup(value))
+    endpoints = _per_row(endpoint, len(value))
+    queries   = _per_row(query, len(value))
+
+    groups: dict[tuple, list[int]] = {}
+    for row, key in enumerate(zip(endpoints, queries)):
+        groups.setdefault(key, []).append(row)
+
+    return _reconcile_rows(value, groups, lambda key, values: context[key].lookup_many(values))

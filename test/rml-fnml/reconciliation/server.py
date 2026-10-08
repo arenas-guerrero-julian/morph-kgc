@@ -16,8 +16,23 @@ The SPARQL endpoints evaluate queries over the knowledge graph of
 - ``/public/sparql`` is ``/sparql`` without authentication.
 - ``/public/sparql/slow`` is ``/public/sparql`` taking longer than a second
   to answer.
+- ``/public/sparql/gzip``, ``/public/sparql/xml`` and ``/public/sparql/no-head``
+  are ``/public/sparql`` answering gzipped JSON, XML, and JSON without the head
+  some endpoints leave out.
+- ``/public/sparql/results-first`` gives the results of its answer before the
+  head, as rdflib writes them, and ``/public/sparql/bad-term`` adds a solution
+  with a language tag that is not BCP 47 (``en_US``), as some stores write.
+
+The other endpoints answer in JSON with the head first, as most stores do.
+
+``/vocabulary.gz`` serves the vocabulary gzipped, ``/vocabulary.broken-gz``
+says it does but does not, ``/vocabulary.multi-gz`` serves it gzipped in two
+members, as concatenated gzip files are, and ``/vocabulary.cut`` closes the
+connection halfway through it. ``/export|vocabulary`` has a URL that is no IRI.
 """
 
+import gzip
+import json
 import os
 import threading
 import time
@@ -37,6 +52,11 @@ VOCABULARY_FILES = {
     '/vocabulary': ('disease_vocabulary.ttl', 'text/turtle'),
     '/vocabulary.nq': ('disease_vocabulary.nq', 'text/plain'),
     '/vocabulary.trig': ('disease_vocabulary.trig', 'application/trig'),
+    '/vocabulary.gz': ('disease_vocabulary.ttl', 'text/turtle'),
+    '/vocabulary.broken-gz': ('disease_vocabulary.ttl', 'text/turtle'),
+    '/vocabulary.multi-gz': ('disease_vocabulary.ttl', 'text/turtle'),
+    '/vocabulary.cut': ('disease_vocabulary.ttl', 'text/turtle'),
+    '/export|vocabulary': ('disease_vocabulary.ttl', 'text/turtle'),
 }
 
 
@@ -52,6 +72,11 @@ SPARQL_ENDPOINTS = {
     '/sparql/union': True,
     '/public/sparql': False,
     '/public/sparql/slow': False,
+    '/public/sparql/gzip': False,
+    '/public/sparql/xml': False,
+    '/public/sparql/no-head': False,
+    '/public/sparql/results-first': False,
+    '/public/sparql/bad-term': False,
 }
 
 # Paths answered without authentication.
@@ -98,7 +123,19 @@ class _Handler(BaseHTTPRequestHandler):
         if path in VOCABULARY_FILES:
             file_name, content_type = VOCABULARY_FILES[path]
             with open(os.path.join(TEST_DIR, file_name), 'rb') as f:
-                self._respond(200, f.read(), content_type)
+                body = f.read()
+            if path.endswith('.gz'):
+                self._respond(200, gzip.compress(body), content_type, gzip=True)
+            elif path.endswith('.broken-gz'):
+                self._respond(200, body, content_type, gzip=True)
+            elif path.endswith('.multi-gz'):
+                half = len(body) // 2
+                members = gzip.compress(body[:half]) + gzip.compress(body[half:])
+                self._respond(200, members, content_type, gzip=True)
+            elif path.endswith('.cut'):
+                self._respond(200, body, content_type, cut=True)
+            else:
+                self._respond(200, body, content_type)
         elif path in SPARQL_ENDPOINTS:
             if path.endswith('/slow'):
                 time.sleep(1.5)
@@ -107,19 +144,45 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._respond(400, str(exc).encode(), 'text/plain')
                 return
+            if path.endswith('/xml'):
+                self._respond(
+                    200, results.serialize(format='xml'), 'application/sparql-results+xml',
+                )
+                return
+            # rdflib writes the results before the head.
+            body = results.serialize(format='json')
+            answer = json.loads(body)
+            if path.endswith('/no-head'):
+                del answer['head']
+            elif not path.endswith('/results-first'):
+                answer = {'head': answer['head'], **answer}
+            if path.endswith('/bad-term'):
+                answer['results']['bindings'].append({
+                    'entity_iri': {'type': 'uri', 'value': 'https://data.com/id/unmatched'},
+                    'matching_value_1': {'type': 'literal', 'value': 'Unmatched', 'xml:lang': 'en_US'},
+                })
+            body = json.dumps(answer).encode()
             self._respond(
                 200,
-                results.serialize(format='json'),
+                gzip.compress(body) if path.endswith('/gzip') else body,
                 'application/sparql-results+json',
+                gzip=path.endswith('/gzip'),
             )
         else:
             self._respond(404, b'not found', 'text/plain')
 
-    def _respond(self, status, body, content_type):
+    def _respond(self, status, body, content_type, gzip=False, cut=False):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
+        if gzip:
+            self.send_header('Content-Encoding', 'gzip')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
+        if cut:
+            # Half the body, then the connection is closed.
+            self.wfile.write(body[:len(body) // 2])
+            self.close_connection = True
+            return
         self.wfile.write(body)
 
     def log_message(self, *args):

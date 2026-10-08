@@ -24,6 +24,7 @@ from .defaults import (
     DEFAULT_UDFS,
     DEFAULT_API_TOKEN,
     DEFAULT_STATE_DIR,
+    DEFAULT_STATE_MEMORY_LIMIT,
     DEFAULT_LOGGING_LEVEL,
     DEFAULT_LOGGING_FILE,
 )
@@ -246,6 +247,7 @@ class MorphConfig:
     udfs: str = DEFAULT_UDFS
     api_token: str = DEFAULT_API_TOKEN
     state_dir: str = DEFAULT_STATE_DIR
+    state_memory_limit: str = DEFAULT_STATE_MEMORY_LIMIT
 
     # -- Logging -------------------------------------------------------------
     logging_level: str = DEFAULT_LOGGING_LEVEL
@@ -266,6 +268,7 @@ class MorphConfig:
         self._validate_logging_level()
         self._validate_mapping_partitioning()
         self._validate_number_of_processes()
+        self._validate_state_memory_limit()
         self._validate_paths()
         self._coerce_list_fields()
         self._setup_logging()
@@ -273,6 +276,9 @@ class MorphConfig:
 
     def _normalize_strings(self) -> None:
         self.output_format = self.output_format.strip().upper()
+        self.state_memory_limit = (
+            str(self.state_memory_limit or "").strip() or DEFAULT_STATE_MEMORY_LIMIT
+        )
         self.logging_level = self.logging_level.strip().upper()
         self.mapping_partitioning = self.mapping_partitioning.strip().upper()
 
@@ -302,6 +308,12 @@ class MorphConfig:
             raise ValueError(
                 f"'number_of_processes' must be >= 1, got {self.number_of_processes}."
             )
+
+    def _validate_state_memory_limit(self) -> None:
+        # Imported here: the functions package reads the configuration.
+        from ..functions.tables import check_memory_limit
+
+        check_memory_limit(self.state_memory_limit)
 
     def _validate_paths(self) -> None:
         _create_dirs_in_path(self.logging_file)
