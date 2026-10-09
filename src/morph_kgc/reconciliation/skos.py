@@ -53,7 +53,7 @@ import pyoxigraph
 import rdflib
 from rdflib.namespace import DC, DCTERMS, FOAF, OWL, RDF, RDFS, SDO, SKOS, XSD
 
-from ..constants import LOGGING_NAMESPACE, MORPH_FN_MATCHING
+from ..constants import LOGGING_NAMESPACE
 from ..http import DEFAULT_TIMEOUT, download
 from .index import ConceptIndex, ConceptIndexBuilder, EXACT_MATCHING
 
@@ -373,15 +373,6 @@ def build_index(
     part of the vocabulary the mapping actually reconciles against. Concept
     schemes and collections are left out.
     """
-    if resource.get("matching"):
-        raise ValueError(
-            f"Resource '{resource.name}' declares the option 'matching', which a "
-            "resource does not take: how values are matched is chosen by each "
-            f"execution of the mapping, with the parameter '{MORPH_FN_MATCHING}' "
-            "(EXACT or CASE-INSENSITIVE). Remove the option from the "
-            f"'[RESOURCE:{resource.name}]' section."
-        )
-
     # The option only concerns the executions naming no attribute: a mistake in
     # it does not stop a mapping none of whose executions relies on it.
     default_attributes = ()

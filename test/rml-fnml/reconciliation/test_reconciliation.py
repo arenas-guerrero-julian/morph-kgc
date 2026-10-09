@@ -802,30 +802,6 @@ def test_invalid_matching(tmp_path, matching):
         ))
 
 
-@pytest.mark.parametrize('matching', ['CASE-INSENSITIVE', 'EXACT'])
-def test_matching_option_of_the_resource(matching):
-    """
-    How values are matched is said by the mapping: a 'matching' option in the
-    resource fails, rather than being ignored, before the vocabulary is
-    downloaded.
-    """
-    with VocabularyServer() as server:
-        with pytest.raises(ValueError, match=re.escape(
-            "Resource 'disease_vocabulary' declares the option 'matching', which a "
-            "resource does not take"
-        )):
-            morph_kgc.materialize(config(
-                f'resource_type=SKOS_VOCABULARY\n'
-                f'url={server.url}/vocabulary\n'
-                f'username={USERNAME}\n'
-                f'password={PASSWORD}\n'
-                f'matching={matching}',
-                mapping=UPPERCASE_MAPPING,
-            ))
-
-        assert server.requests == []
-
-
 # The attribute input of mapping.ttl, removed by the tests of executions that
 # name no attribute.
 WITHOUT_ATTRIBUTE = (
