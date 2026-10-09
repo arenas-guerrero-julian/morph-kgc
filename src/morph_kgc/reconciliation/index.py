@@ -27,7 +27,7 @@ import pandas as pd
 
 from ..functions.tables import ParquetTable, TableBuilder, sql_string
 
-# Matching strategies, declared with the 'matching' option of a resource.
+# Matching strategies, which an execution chooses with the matching parameter.
 EXACT_MATCHING = "EXACT"
 CASE_INSENSITIVE_MATCHING = "CASE-INSENSITIVE"
 VALID_MATCHINGS = {EXACT_MATCHING, CASE_INSENSITIVE_MATCHING}
@@ -37,6 +37,12 @@ INDEX_COLUMNS = {"key": "VARCHAR", "attribute": "VARCHAR", "concept": "VARCHAR"}
 
 # The entries of the concepts that were not excluded.
 INCLUDED = "WHERE concept NOT IN (SELECT concept FROM excluded)"
+
+
+def parse_matching(value) -> str | None:
+    """The matching strategy *value* names, whatever its case, or None."""
+    matching = str(value).strip().upper()
+    return matching if matching in VALID_MATCHINGS else None
 
 
 def normalize(value, matching: str) -> str:
@@ -135,17 +141,26 @@ class ConceptIndex:
 
 class ConceptIndexBuilder:
     """
-    Builds a :class:`ConceptIndex`, streaming its entries to disk as they are
-    added, so that building the index of a vocabulary takes the same memory
-    whatever its size.
+    Builds a :class:`ConceptIndex` for each of *matchings* (``EXACT`` when none
+    is given), streaming their entries to disk as they are added, so that
+    building the indexes of a vocabulary takes the same memory whatever its
+    size. The entries of every matching go to a single scratch database, which
+    keeps them within one memory limit.
     """
 
-    def __init__(self, state_dir: str, memory_limit: str, matching: str = EXACT_MATCHING) -> None:
-        self.matching = matching
+    def __init__(self, state_dir: str, memory_limit: str, *matchings: str) -> None:
+        self.matchings = matchings or (EXACT_MATCHING,)
         self._builder = TableBuilder(state_dir, memory_limit)
-        self._builder.create("entries", INDEX_COLUMNS)
+        # matching -> scratch table of its entries
+        self._entries = {
+            matching: f"entries_{number}" for number, matching in enumerate(self.matchings)
+        }
+        for table in self._entries.values():
+            self._builder.create(table, INDEX_COLUMNS)
         self._builder.create("excluded", {"concept": "VARCHAR"})
-        self._attributes: dict[str, None] = {}
+        self._attributes: dict[str, dict[str, None]] = {
+            matching: {} for matching in self.matchings
+        }
 
     def __enter__(self) -> "ConceptIndexBuilder":
         return self
@@ -153,20 +168,34 @@ class ConceptIndexBuilder:
     def __exit__(self, *exc_info) -> None:
         self._builder.close()
 
-    def add(self, attribute: str, value, concept: str) -> None:
-        """Index *concept* under the value its *attribute* takes."""
-        self._builder.append("entries", (normalize(value, self.matching), attribute, concept))
-        self._attributes[attribute] = None
+    def add(self, attribute: str, value, concept: str, matching: str | None = None) -> None:
+        """
+        Index *concept* under the value its *attribute* takes, for *matching*:
+        the first of the builder when not given.
+        """
+        matching = matching or self.matchings[0]
+        self._builder.append(
+            self._entries[matching], (normalize(value, matching), attribute, concept),
+        )
+        self._attributes[matching][attribute] = None
 
     def exclude(self, concept: str) -> None:
-        """Leave *concept* out of the index, whatever it was added under."""
+        """Leave *concept* out of every index, whatever it was added under."""
         self._builder.append("excluded", (concept,))
 
-    def build(self, default_attributes: tuple[str, ...] = ()) -> ConceptIndex:
-        """Write the index to its file and return it."""
+    def build(
+        self,
+        default_attributes: tuple[str, ...] = (),
+        matching: str | None = None,
+    ) -> ConceptIndex:
+        """
+        Write the index of *matching*, the first of the builder when not given,
+        to its file and return it.
+        """
+        matching = matching or self.matchings[0]
         table = self._builder.write(
-            f"SELECT DISTINCT key, attribute, concept FROM entries {INCLUDED} "
-            "ORDER BY key, attribute, concept",
+            f"SELECT DISTINCT key, attribute, concept FROM {self._entries[matching]} "
+            f"{INCLUDED} ORDER BY key, attribute, concept",
             prefix="index-",
         )
         # The number of entries and of row groups is read from the footer of
@@ -179,9 +208,9 @@ class ConceptIndexBuilder:
         )[0]
         return ConceptIndex(
             table              = table,
-            matching           = self.matching,
+            matching           = matching,
             default_attributes = tuple(default_attributes),
-            indexed_attributes = tuple(self._attributes),
+            indexed_attributes = tuple(self._attributes[matching]),
             size               = size,
             concept_count      = concept_count,
             row_groups         = max(row_groups, 1),
@@ -191,31 +220,46 @@ class ConceptIndexBuilder:
 @dataclass
 class ReconciliationContext:
     """
-    The shared context of a reconciliation function: one index per accessed
-    resource, reachable through every name the mapping may use for it.
+    The shared context of a reconciliation function: the indexes of every
+    accessed resource, one per way the mapping matches values against it,
+    reachable through every name the mapping may use for the resource.
     """
 
-    # resource name -> index
-    indexes: dict[str, ConceptIndex] = field(default_factory=dict)
+    # resource name -> matching -> index
+    indexes: dict[str, dict[str, ConceptIndex]] = field(default_factory=dict)
     # any other value a mapping may use for a resource (its URL) -> resource name
     aliases: dict[str, str] = field(default_factory=dict)
 
-    def add(self, name: str, index: ConceptIndex) -> None:
-        """Register the index built for the resource *name*."""
-        self.indexes[name] = index
+    def add(self, name: str, indexes: dict[str, ConceptIndex]) -> None:
+        """Register the indexes built for the resource *name*, by matching."""
+        self.indexes[name] = indexes
 
-    def alias(self, name: str, *aliases: str) -> None:
-        """Make the resource *name* reachable through other values as well."""
+    def alias(self, name: str, *aliases: str, replace: bool = True) -> None:
+        """
+        Make the resource *name* reachable through other values as well. A
+        value already reaching another resource keeps reaching it unless
+        *replace*.
+        """
         for alias in aliases:
-            if alias and alias != name:
+            if alias and alias != name and (replace or alias not in self.aliases):
                 self.aliases[alias] = name
 
-    def get(self, resource=None) -> ConceptIndex:
+    def get(self, resource=None, matching: str = EXACT_MATCHING) -> ConceptIndex:
         """
-        Return the index of *resource*, which may be named by its config
-        section name or by its URL. When the mapping does not name a resource
-        and exactly one is available, that one is used.
+        Return the index of *resource* for *matching*. The resource may be named
+        by its config section name or by its URL. When the mapping does not name
+        a resource and exactly one is available, that one is used.
         """
+        indexes = self._indexes(resource)
+        if matching not in indexes:
+            raise ValueError(
+                f"The mapping reconciles against the resource '{resource}' with "
+                f"{matching} matching, which it was not indexed for."
+            )
+        return indexes[matching]
+
+    def _indexes(self, resource) -> dict[str, ConceptIndex]:
+        """The indexes of *resource*, by matching."""
         if resource is None or resource == "":
             if len(self.indexes) == 1:
                 return next(iter(self.indexes.values()))
@@ -226,8 +270,10 @@ class ReconciliationContext:
                 "'urn:morph:function:resource' parameter to a resource name."
             )
 
+        # A section name is never taken for the URL or the IRI of another
+        # resource, as the configuration file resolves it.
         resource = str(resource)
-        name = self.aliases.get(resource, resource)
+        name = resource if resource in self.indexes else self.aliases.get(resource, resource)
 
         if name not in self.indexes:
             raise ValueError(

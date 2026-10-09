@@ -38,6 +38,9 @@ MORPH_FN_VOCABULARY_IRI = f"{MORPH_FUNCTION_NAMESPACE}vocabularyIRI"
 # Vocabulary property (or properties) the value is matched against.
 MORPH_FN_ATTRIBUTE_IRI  = f"{MORPH_FUNCTION_NAMESPACE}attributeIRI"
 GREL_ATTRIBUTE_IRI      = f"{GREL_NAMESPACE}attributeIRI"
+# How the value is matched against the vocabulary: EXACT (the default) or
+# CASE-INSENSITIVE. A constant: the vocabulary is indexed before any data is read.
+MORPH_FN_MATCHING       = f"{MORPH_FUNCTION_NAMESPACE}matching"
 # URL of the SPARQL endpoint a query is sent to.
 MORPH_FN_SPARQL_ENDPOINT_URL = f"{MORPH_FUNCTION_NAMESPACE}sparqlEndpointUrl"
 # SELECT query the entities and the values they are matched by are read with.

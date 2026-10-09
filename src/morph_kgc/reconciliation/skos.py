@@ -15,13 +15,16 @@ vocabulary fetched from the URL declared by a ``[RESOURCE:<name>]`` section::
     username={VOCABULARY_USER}
     password={VOCABULARY_PASSWORD}
     format=turtle
-    matching=CASE-INSENSITIVE
     attributes=skos:prefLabel,skos:altLabel
     timeout=60
 
 The vocabulary is retrieved once, during the context initialization phase. It
 may be serialized as triples or as quads (N-Quads, TriG): the concepts of every
 graph of a vocabulary split across named graphs are indexed.
+
+How values are matched against the vocabulary is chosen by each execution of
+the mapping, not here. A vocabulary that some executions match exactly and
+others case-insensitively gets an index for each, built from a single download.
 
 The vocabulary is downloaded to the state directory of the run and parsed as a
 stream, its labels going to the index on disk as they are read, so that indexing
@@ -41,6 +44,7 @@ well-known prefixes in :data:`WELL_KNOWN_PREFIXES` (``skos:``, ``dcterms:``,
 
 import logging
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -49,9 +53,9 @@ import pyoxigraph
 import rdflib
 from rdflib.namespace import DC, DCTERMS, FOAF, OWL, RDF, RDFS, SDO, SKOS, XSD
 
-from ..constants import LOGGING_NAMESPACE
+from ..constants import LOGGING_NAMESPACE, MORPH_FN_MATCHING
 from ..http import DEFAULT_TIMEOUT, download
-from .index import ConceptIndex, ConceptIndexBuilder, EXACT_MATCHING, VALID_MATCHINGS
+from .index import ConceptIndex, ConceptIndexBuilder, EXACT_MATCHING
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
@@ -126,17 +130,6 @@ CONTENT_TYPE_FORMATS = {
 GENERIC_CONTENT_TYPE_FORMATS = {
     "text/plain": "nt",
 }
-
-
-def get_matching(resource) -> str:
-    """Read and validate the 'matching' option of *resource*."""
-    matching = resource.get("matching", EXACT_MATCHING).strip().upper()
-    if matching not in VALID_MATCHINGS:
-        raise ValueError(
-            f"Option 'matching' of resource '{resource.name}' is '{matching}', "
-            f"which is not valid. Must be one of: {sorted(VALID_MATCHINGS)}."
-        )
-    return matching
 
 
 def is_absolute_iri(value: str) -> bool:
@@ -310,67 +303,105 @@ def _is_text(value: str | None) -> bool:
     return True
 
 
-def _index_statements(statements, builder, attributes, every_attribute) -> dict:
+@dataclass
+class _Selection:
     """
-    Add to *builder* the values the concepts of *statements* take for
-    *attributes*, and for every property whose value is a literal when
-    *every_attribute*. Returns those properties.
+    The attributes the index of one way of matching values holds: those the
+    executions matching that way match against, and every property whose value
+    is a literal when one of them matches against any.
     """
-    literal_attributes = {}
+
+    attributes: dict = field(default_factory=dict)
+    every_attribute: bool = False
+
+
+def _index_statements(statements, builder, selections) -> dict:
+    """
+    Add to *builder*, for each matching of *selections*, the values the concepts
+    of *statements* take for the attributes of its selection, and for every
+    property whose value is a literal when it selects every attribute. Returns
+    those properties, by matching.
+    """
+    literal_attributes = {matching: {} for matching in selections}
     for (subject_kind, subject), predicate, (value_kind, value) in statements:
         # A blank node identifies no concept outside the vocabulary.
         if subject_kind != "iri":
             continue
         if predicate == RDF_TYPE and value_kind == "iri" and value in NON_CONCEPT_CLASSES:
             builder.exclude(subject)
-        if value_kind == "literal" and every_attribute:
-            builder.add(predicate, value, subject)
-            literal_attributes[predicate] = None
-        elif value_kind in ("literal", "iri") and predicate in attributes:
-            builder.add(predicate, value, subject)
+        for matching, selection in selections.items():
+            if value_kind == "literal" and selection.every_attribute:
+                builder.add(predicate, value, subject, matching)
+                literal_attributes[matching][predicate] = None
+            elif value_kind in ("literal", "iri") and predicate in selection.attributes:
+                builder.add(predicate, value, subject, matching)
     return literal_attributes
+
+
+def _build(builder, literal_attributes, default_attributes) -> dict[str, ConceptIndex]:
+    """Write the index of each matching of *builder* to its file, by matching."""
+    return {
+        matching: builder.build(
+            default_attributes or tuple(literal_attributes[matching]), matching,
+        )
+        for matching in builder.matchings
+    }
 
 
 def build_index(
     resource,
-    matched_attributes=((),),
+    matched_attributes=((EXACT_MATCHING, ()),),
     *,
     state_dir: str,
     memory_limit: str,
-) -> ConceptIndex:
+) -> dict[str, ConceptIndex]:
     """
-    Build the concept index of a SKOS vocabulary resource, in *state_dir*.
+    Build the concept indexes of a SKOS vocabulary resource, in *state_dir*: one
+    for each way the executions of the function match values against it, by
+    matching. The vocabulary is downloaded and read once for all of them.
 
     *matched_attributes* holds, for each execution of the function reconciling
-    against the resource, the attributes it matches against: the ones it names,
-    ``()`` when it names none, and ``None`` when it reads them from the data.
-    An execution naming none matches against the 'attributes' option of the
-    resource or, without it, against every property of the vocabulary whose
+    against the resource, how it matches values (``EXACT`` or
+    ``CASE-INSENSITIVE``) and the attributes it matches against: the ones it
+    names, ``()`` when it names none, and ``None`` when it reads them from the
+    data. An execution naming none matches against the 'attributes' option of
+    the resource or, without it, against every property of the vocabulary whose
     value is a literal.
 
-    Only those attributes are indexed, which keeps the shared context to the
+    Only those attributes are indexed, and only for the ways of matching of the
+    executions matching against them, which keeps the shared context to the
     part of the vocabulary the mapping actually reconciles against. Concept
     schemes and collections are left out.
     """
+    if resource.get("matching"):
+        raise ValueError(
+            f"Resource '{resource.name}' declares the option 'matching', which a "
+            "resource does not take: how values are matched is chosen by each "
+            f"execution of the mapping, with the parameter '{MORPH_FN_MATCHING}' "
+            "(EXACT or CASE-INSENSITIVE). Remove the option from the "
+            f"'[RESOURCE:{resource.name}]' section."
+        )
+
     # The option only concerns the executions naming no attribute: a mistake in
     # it does not stop a mapping none of whose executions relies on it.
     default_attributes = ()
-    if any(attributes == () for attributes in matched_attributes):
+    if any(attributes == () for _, attributes in matched_attributes):
         default_attributes = resolve_attributes(resource)
 
-    attributes = {}
-    every_attribute = False
-    for execution_attributes in matched_attributes:
+    selections: dict[str, _Selection] = {}
+    for matching, execution_attributes in matched_attributes:
+        selection = selections.setdefault(matching, _Selection())
         if execution_attributes is None:
-            every_attribute = True
+            selection.every_attribute = True
         elif execution_attributes:
-            attributes.update(dict.fromkeys(execution_attributes))
+            selection.attributes.update(dict.fromkeys(execution_attributes))
         elif default_attributes:
-            attributes.update(dict.fromkeys(default_attributes))
+            selection.attributes.update(dict.fromkeys(default_attributes))
         else:
-            every_attribute = True
+            selection.every_attribute = True
+    if not selections:
+        selections[EXACT_MATCHING] = _Selection()
 
-    matching = get_matching(resource)
     vocabulary = download_vocabulary(resource, state_dir)
     try:
         url = resource.get_url()
@@ -394,28 +425,30 @@ def build_index(
             )
         # Every statement is read when every property with a literal value is
         # indexed; otherwise, only those that can be indexed or exclude a concept.
-        predicates = None if every_attribute else frozenset(attributes) | {RDF_TYPE}
+        predicates = None
+        if not any(selection.every_attribute for selection in selections.values()):
+            predicates = frozenset(
+                attribute
+                for selection in selections.values()
+                for attribute in selection.attributes
+            ) | {RDF_TYPE}
 
         try:
-            with ConceptIndexBuilder(state_dir, memory_limit, matching) as builder:
+            with ConceptIndexBuilder(state_dir, memory_limit, *selections) as builder:
                 statements = _streamed_statements(
                     vocabulary.path, streaming_format, _valid_base_iri(base_iri), predicates,
                 )
-                literal_attributes = _index_statements(
-                    statements, builder, attributes, every_attribute,
-                )
-                index = builder.build(default_attributes or tuple(literal_attributes))
+                literal_attributes = _index_statements(statements, builder, selections)
+                indexes = _build(builder, literal_attributes, default_attributes)
         except _StreamingParseError as streaming_error:
             LOGGER.warning(
                 f"The vocabulary of resource '{resource.name}' cannot be read as "
                 f"a stream ({streaming_error}), so it is parsed in memory."
             )
-            with ConceptIndexBuilder(state_dir, memory_limit, matching) as builder:
+            with ConceptIndexBuilder(state_dir, memory_limit, *selections) as builder:
                 try:
                     statements = _parsed_statements(vocabulary.path, rdf_format, base_iri)
-                    literal_attributes = _index_statements(
-                        statements, builder, attributes, every_attribute,
-                    )
+                    literal_attributes = _index_statements(statements, builder, selections)
                 except duckdb.Error:
                     # Writing the index failed (a full disk), not reading the vocabulary.
                     raise
@@ -427,13 +460,15 @@ def build_index(
                         f"{(str(exc).strip() or type(exc).__name__).splitlines()[0]}. "
                         "Set the 'format' option of the resource to its serialization."
                     ) from exc
-                index = builder.build(default_attributes or tuple(literal_attributes))
+                indexes = _build(builder, literal_attributes, default_attributes)
     finally:
         vocabulary.remove()
 
-    LOGGER.info(
-        f"Resource '{resource.name}': indexed {len(index)} value(s) of "
-        f"{len(index.indexed_attributes)} attribute(s) of the vocabulary."
-    )
+    for matching, index in indexes.items():
+        LOGGER.info(
+            f"Resource '{resource.name}': indexed {len(index)} value(s) of "
+            f"{len(index.indexed_attributes)} attribute(s) of the vocabulary, "
+            f"for {matching.lower()} matching."
+        )
 
-    return index
+    return indexes

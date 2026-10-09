@@ -38,7 +38,16 @@ in the configuration file, not in the mapping::
         rml:input [
             rml:parameter morph-fn:attributeIRI ;
             rml:inputValue skos:prefLabel, skos:altLabel
+        ] ;
+        rml:input [
+            rml:parameter morph-fn:matching ;
+            rml:inputValue "CASE-INSENSITIVE"
         ] .
+
+``morph-fn:matching`` is ``EXACT`` (the default) or ``CASE-INSENSITIVE``, which
+also normalizes Unicode (NFKC) and collapses whitespace. It is a constant: the
+vocabulary is indexed before any data is read. Executions matching the same
+vocabulary differently share a single download of it.
 
 ``reconcileEntityOverSPARQL`` reconciles against the entities of any knowledge
 graph a SPARQL endpoint answers for. The mapping gives the endpoint and the
@@ -92,6 +101,7 @@ from ..constants import (
     GREL_VALUE_PARAM,
     GREL_VALUE_PARAMETER,
     MORPH_ATTRIBUTE_PARAMETERS,
+    MORPH_FN_MATCHING,
     MORPH_FN_SPARQL_ENDPOINT_URL,
     MORPH_FN_SPARQL_QUERY,
     MORPH_RECONCILE_ENTITY_OVER_SPARQL,
@@ -99,7 +109,12 @@ from ..constants import (
     MORPH_RESOURCE_PARAMETERS,
 )
 from ..reconciliation import skos, sparql
-from ..reconciliation.index import ReconciliationContext
+from ..reconciliation.index import (
+    EXACT_MATCHING,
+    VALID_MATCHINGS,
+    ReconciliationContext,
+    parse_matching,
+)
 from .bif_decorator import stateful_bif
 from .param_resolver import MergedAliases
 
@@ -117,13 +132,38 @@ def _result(value, matches):
 
 # ── SKOS vocabulary ───────────────────────────────────────────────────────────
 
+def _matching(initialization, execution) -> str:
+    """How *execution* matches values: the constant it binds, EXACT when none."""
+    values = execution.constants.get(MORPH_FN_MATCHING, [])
+    if len(values) > 1 or MORPH_FN_MATCHING in execution.bound_to_data:
+        raise ValueError(
+            f"Execution '{execution.execution_id}' of function "
+            f"'{initialization.function_iri}' must bind '{MORPH_FN_MATCHING}' at "
+            "most once, to a constant: the vocabulary is indexed before any data "
+            "is read, so how values are matched against it cannot depend on the data."
+        )
+    if not values:
+        return EXACT_MATCHING
+
+    matching = parse_matching(values[0])
+    if matching is None:
+        raise ValueError(
+            f"Execution '{execution.execution_id}' of function "
+            f"'{initialization.function_iri}' binds '{MORPH_FN_MATCHING}' to "
+            f"'{values[0]}', which is not valid. Must be one of: "
+            f"{', '.join(sorted(VALID_MATCHINGS))}."
+        )
+    return matching
+
+
 def _matched_attributes(initialization, resource) -> list:
     """
-    The attributes each execution of the function that may reconcile against
-    *resource* matches against, as :func:`skos.build_index` takes them: the
-    constant ones it binds, under any parameter IRI, ``()`` when it binds none,
-    and ``None`` when it reads them from the data. Each execution is accounted
-    for on its own, so that what one binds does not limit another.
+    How each execution of the function that may reconcile against *resource*
+    matches values, and the attributes it matches against, as
+    :func:`skos.build_index` takes them: the constant ones it binds, under any
+    parameter IRI, ``()`` when it binds none, and ``None`` when it reads them
+    from the data. Each execution is accounted for on its own, so that what one
+    binds does not limit another.
     """
     matched = []
     for execution in initialization.executions:
@@ -140,14 +180,15 @@ def _matched_attributes(initialization, resource) -> list:
         ):
             continue
 
+        matching = _matching(initialization, execution)
         if execution.bound_to_data.intersection(MORPH_ATTRIBUTE_PARAMETERS):
-            matched.append(None)
+            matched.append((matching, None))
         else:
-            matched.append(tuple(
+            matched.append((matching, tuple(
                 value
                 for parameter_iri in MORPH_ATTRIBUTE_PARAMETERS
                 for value in execution.constants.get(parameter_iri, [])
-            ))
+            )))
 
     return matched
 
@@ -161,6 +202,11 @@ def _initialize_vocabulary(initialization) -> ReconciliationContext:
     file is indexed, which lets a mapping with a single vocabulary omit the
     parameter altogether.
     """
+    # A mistake in how an execution matches values is reported before any
+    # vocabulary is downloaded.
+    for execution in initialization.executions:
+        _matching(initialization, execution)
+
     resources = initialization.resources(*MORPH_RESOURCE_PARAMETERS)
     if not resources:
         resources = initialization.config.get_resources_of_type(SKOS_VOCABULARY_RESOURCE)
@@ -194,14 +240,24 @@ def _initialize_vocabulary(initialization) -> ReconciliationContext:
                     memory_limit = initialization.memory_limit,
                 ),
             )
-        # The IRI is expanded, unless it names an unset variable, but the URL is
-        # kept as declared: expanded, it may hold a secret read from the
-        # environment (an API key), and the context is written to disk.
+        # A value of the mapping reaches the resource the configuration file
+        # resolves it to, which the index was built for.
+        context.alias(resource.name, mapping_value)
+
+    # A resource is also reachable through its IRI and URL, unless the mapping
+    # uses them for another resource or a resource declared before it in the
+    # configuration file has them, which is how the configuration resolves them.
+    # The IRI is expanded, unless it names an unset variable, but the URL is kept
+    # as declared: expanded, it may hold a secret read from the environment (an
+    # API key), and the context is written to disk.
+    for resource in initialization.config.resources.values():
+        if resource.name not in context.indexes:
+            continue
         try:
             iri = resource.get_iri()
         except ValueError:
             iri = ""
-        context.alias(resource.name, mapping_value, iri, resource.url)
+        context.alias(resource.name, iri, resource.url, replace=False)
 
     return context
 
@@ -244,22 +300,28 @@ def _reconcile_rows(values, groups, lookup) -> list:
     value       = (GREL_VALUE_PARAM, GREL_VALUE_PARAMETER),
     resource    = MORPH_RESOURCE_PARAMETERS,
     attribute   = MergedAliases(MORPH_ATTRIBUTE_PARAMETERS),
+    matching    = MORPH_FN_MATCHING,
 )
-def reconcile_vocabulary_concept(context, value, resource=None, attribute=None):
+def reconcile_vocabulary_concept(context, value, resource=None, attribute=None, matching=None):
     """Reconcile each of *value* against a SKOS vocabulary fetched from a URL."""
     resources  = _per_row(resource, len(value))
     attributes = _per_row(attribute, len(value))
+    # A single constant, which the initializer has checked, in any case.
+    matchings  = _per_row(EXACT_MATCHING if matching is None else matching, len(value))
 
-    # The rows reconciled against the same resource and attributes, which are
-    # usually all of them, are looked up together.
+    # The rows reconciled against the same resource and attributes, in the same
+    # way, which are usually all of them, are looked up together.
     groups: dict[tuple, list[int]] = {}
-    for row, (row_resource, row_attribute) in enumerate(zip(resources, attributes)):
-        key = (row_resource, _attributes(row_attribute))
+    for row, (row_resource, row_attribute, row_matching) in enumerate(
+        zip(resources, attributes, matchings)
+    ):
+        key = (row_resource, _attributes(row_attribute), row_matching)
         groups.setdefault(key, []).append(row)
 
     def lookup(key, values):
-        row_resource, row_attributes = key
-        return context.get(row_resource).lookup_many(values, row_attributes)
+        row_resource, row_attributes, row_matching = key
+        index = context.get(row_resource, parse_matching(row_matching))
+        return index.lookup_many(values, row_attributes)
 
     return _reconcile_rows(value, groups, lookup)
 

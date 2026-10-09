@@ -24,6 +24,8 @@ TEST_DIR = os.path.dirname(os.path.realpath(__file__))
 MAPPING = os.path.join(TEST_DIR, 'mapping.ttl')
 VOCABULARY = os.path.join(TEST_DIR, 'disease_vocabulary.ttl')
 VOCABULARY_IRI_MAPPING = os.path.join(TEST_DIR, 'mapping_vocabulary_iri.ttl')
+UPPERCASE_MAPPING = os.path.join(TEST_DIR, 'mapping_uppercase.ttl')
+MATCHING_MODES_MAPPING = os.path.join(TEST_DIR, 'mapping_matching_modes.ttl')
 
 SKOS = 'http://www.w3.org/2004/02/skos/core#'
 # The predicate the mappings relate a patient to the reconciled disease with.
@@ -395,19 +397,40 @@ def test_reconcile_vocabulary_referenced_by_its_iri():
     assert_isomorphic(expected_graph(), g_morph)
 
 
-def test_reconcile_case_insensitive_matching():
-    """Case-insensitive matching reconciles values that differ in case only."""
-    g_morph = morph_kgc.materialize(config(
-        f'resource_type=SKOS_VOCABULARY\n'
-        f'url={VOCABULARY}\n'
-        f'matching=CASE-INSENSITIVE',
-        mapping=os.path.join(TEST_DIR, 'mapping_uppercase.ttl'),
-    ))
+def with_matching(matching):
+    """
+    The replacement adding a matching input to the execution of mapping.ttl or
+    mapping_uppercase.ttl.
+    """
+    return (
+        'rml:inputValue skos:prefLabel , skos:altLabel\n    ]',
+        'rml:inputValue skos:prefLabel , skos:altLabel\n    ] ;\n'
+        '    rml:input [\n'
+        '        rml:parameter morph-fn:matching ;\n'
+        f'        rml:inputValue {matching}\n'
+        '    ]',
+    )
 
+
+def reconciled_graph():
     g = Dataset()
     g.parse(os.path.join(TEST_DIR, 'output_reconciled.nq'))
+    return g
 
-    assert_isomorphic(g, g_morph)
+
+@pytest.mark.parametrize('matching', ['"CASE-INSENSITIVE"', '"case-insensitive"', '" Case-Insensitive "'])
+def test_reconcile_case_insensitive_matching(tmp_path, matching):
+    """
+    Case-insensitive matching, which the execution asks for in any case,
+    reconciles values that differ in case only.
+    """
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=mapping_copy(tmp_path, with_matching(matching), mapping=UPPERCASE_MAPPING),
+    ))
+
+    assert_isomorphic(reconciled_graph(), g_morph)
 
 
 def test_reconcile_from_yarrrml():
@@ -418,21 +441,389 @@ def test_reconcile_from_yarrrml():
         mapping=os.path.join(TEST_DIR, 'mapping.yarrrml'),
     ))
 
-    g = Dataset()
-    g.parse(os.path.join(TEST_DIR, 'output_reconciled.nq'))
-
-    assert_isomorphic(g, g_morph)
+    assert_isomorphic(reconciled_graph(), g_morph)
 
 
-def test_exact_matching_by_default():
+@pytest.mark.parametrize('replacements', [(), (with_matching('"EXACT"'),), (with_matching('"exact"'),)])
+def test_exact_matching_by_default(tmp_path, replacements):
     """Exact matching is the default, so a value in another case matches nothing."""
     g_morph = morph_kgc.materialize(config(
         f'resource_type=SKOS_VOCABULARY\n'
         f'url={VOCABULARY}',
-        mapping=os.path.join(TEST_DIR, 'mapping_uppercase.ttl'),
+        mapping=mapping_copy(tmp_path, *replacements, mapping=UPPERCASE_MAPPING),
     ))
 
     assert len(g_morph) == 0
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_executions_matching_differently_download_the_vocabulary_once(processes):
+    """
+    Two executions reconciling against the same vocabulary, one exactly and the
+    other case-insensitively, each match as they ask, in every worker process,
+    while the vocabulary is downloaded once.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={server.url}/vocabulary\n'
+            f'username={USERNAME}\n'
+            f'password={PASSWORD}',
+            mapping=MATCHING_MODES_MAPPING,
+            processes=processes,
+        ))
+
+        assert [path for path, _ in server.requests] == ['/vocabulary']
+
+    assert reconciled(g_morph, 'https://example.org/kg/diseaseExact') == {('pid_00002', NARCOLEPSY)}
+    assert reconciled(g_morph, 'https://example.org/kg/diseaseCaseInsensitive') == {
+        ('pid_00001', ATAXIA), ('pid_00002', NARCOLEPSY),
+    }
+
+
+@pytest.mark.parametrize('attributes, expected', [
+    # Without the option, every literal of the vocabulary, its notations too.
+    ('', {('pid_00001', ATAXIA), ('pid_00002', NARCOLEPSY), ('pid_00003', NARCOLEPSY)}),
+    (f'attributes={SKOS}prefLabel,{SKOS}altLabel', {('pid_00001', ATAXIA), ('pid_00002', NARCOLEPSY)}),
+])
+def test_executions_matching_differently_name_different_attributes(tmp_path, attributes, expected):
+    """
+    An execution matching exactly against the attribute it names and one
+    matching case-insensitively against those of the resource each get theirs.
+    """
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        'pid,disease_label\n'
+        'pid_00001,Early-onset spastic ataxia-myoclonic epilepsy-neuropathy syndrome\n'
+        'pid_00002,adca-dn\n'
+        'pid_00003,orpha:314404\n',
+        encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValueMap [ rml:reference "disease_label" ]\n    ] .',
+         'rml:inputValueMap [ rml:reference "disease_label" ]\n    ] ;\n'
+         '    rml:input [\n'
+         '        rml:parameter morph-fn:matching ;\n'
+         '        rml:inputValue "CASE-INSENSITIVE"\n'
+         '    ] .'),
+        mapping=os.path.join(TEST_DIR, 'mapping_two_executions.ttl'),
+    )
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}\n'
+        f'{attributes}',
+        mapping=mapping,
+    ))
+
+    assert reconciled(g_morph, 'https://example.org/kg/diseaseByAltLabel') == {('pid_00001', ATAXIA)}
+    assert reconciled(g_morph, 'https://example.org/kg/disease') == expected
+
+
+def test_execution_matching_case_insensitively_attributes_from_the_data(tmp_path):
+    """
+    An execution reading its attributes from the data matches
+    case-insensitively against any literal of the vocabulary, next to one
+    matching exactly against the attribute it names.
+    """
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        'pid,disease_label,attribute\n'
+        f'pid_00001,EARLY-ONSET SPASTIC ATAXIA-MYOCLONIC EPILEPSY-NEUROPATHY SYNDROME,{SKOS}altLabel\n'
+        f'pid_00002,orpha:314404,{SKOS}notation\n'
+        f'pid_00003,ADCA-DN,{SKOS}altLabel\n'
+        f'pid_00004,adca-dn,{SKOS}prefLabel\n',
+        encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValueMap [ rml:reference "disease_label" ]\n    ] .',
+         'rml:inputValueMap [ rml:reference "disease_label" ]\n    ] ;\n'
+         '    rml:input [\n'
+         '        rml:parameter grel:attributeIRI ;\n'
+         '        rml:inputValueMap [ rml:reference "attribute" ]\n'
+         '    ] ;\n'
+         '    rml:input [\n'
+         '        rml:parameter morph-fn:matching ;\n'
+         '        rml:inputValue "CASE-INSENSITIVE"\n'
+         '    ] .'),
+        mapping=os.path.join(TEST_DIR, 'mapping_two_executions.ttl'),
+    )
+
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=mapping,
+    ))
+
+    assert reconciled(g_morph, 'https://example.org/kg/diseaseByAltLabel') == {('pid_00003', NARCOLEPSY)}
+    assert reconciled(g_morph, 'https://example.org/kg/disease') == {
+        ('pid_00001', ATAXIA), ('pid_00002', NARCOLEPSY), ('pid_00003', NARCOLEPSY),
+    }
+
+
+@pytest.mark.parametrize('matched_attributes, expected', [
+    (
+        [('EXACT', (f'{SKOS}prefLabel',)), ('CASE-INSENSITIVE', (f'{SKOS}altLabel',))],
+        {'EXACT': {f'{SKOS}prefLabel'}, 'CASE-INSENSITIVE': {f'{SKOS}altLabel'}},
+    ),
+    (
+        # An execution reading its attributes from the data matches against
+        # every literal, in its own matching only.
+        [('EXACT', (f'{SKOS}prefLabel',)), ('CASE-INSENSITIVE', None)],
+        {'EXACT': {f'{SKOS}prefLabel'},
+         'CASE-INSENSITIVE': {f'{SKOS}prefLabel', f'{SKOS}altLabel', f'{SKOS}notation'}},
+    ),
+    (
+        [('CASE-INSENSITIVE', (f'{SKOS}altLabel',))],
+        {'CASE-INSENSITIVE': {f'{SKOS}altLabel'}},
+    ),
+])
+def test_only_the_matchings_executions_use_are_indexed(tmp_path, matched_attributes, expected):
+    """
+    A vocabulary gets an index for each way the executions match values against
+    it, holding the attributes the executions matching that way match against.
+    """
+    from morph_kgc.reconciliation import skos
+
+    resource = ResourceConfig(
+        name='disease_vocabulary', resource_type='SKOS_VOCABULARY', url=VOCABULARY,
+    )
+    indexes = skos.build_index(
+        resource, matched_attributes, state_dir=str(tmp_path), memory_limit='512MB',
+    )
+
+    assert {matching: set(index.indexed_attributes) for matching, index in indexes.items()} == expected
+
+
+def test_matching_in_legacy_fnml():
+    """The matching is a constant value map in the legacy FNML vocabulary."""
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=os.path.join(TEST_DIR, 'mapping_legacy_fnml.ttl'),
+    ))
+
+    assert_isomorphic(reconciled_graph(), g_morph)
+
+
+@pytest.mark.parametrize('parameter', [
+    '                    - parameter: morph-fn:matching\n'
+    '                      value: CASE-INSENSITIVE\n',
+    '                    - [morph-fn:matching, case-insensitive]\n',
+])
+def test_matching_in_yarrrml(tmp_path, parameter):
+    """The matching is a plain value in YARRRML, which no prefix expands."""
+    mapping = mapping_copy(
+        tmp_path,
+        ('patients.csv', 'patients_uppercase.csv'),
+        ('                      value: skos:altLabel\n',
+         '                      value: skos:altLabel\n' + parameter),
+        mapping=os.path.join(TEST_DIR, 'mapping.yarrrml'),
+    )
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=mapping,
+    ))
+
+    assert_isomorphic(reconciled_graph(), g_morph)
+
+
+def test_matching_in_a_yarrrml_inline_function(tmp_path):
+    """The matching is an input of a YARRRML inline function as well."""
+    mapping = tmp_path / 'mapping.yarrrml'
+    mapping.write_text(
+        'prefixes:\n'
+        '    grel: http://users.ugent.be/~bjdmeest/function/grel.ttl#\n'
+        '    morph-fr: "urn:morph:function:reconciliation:"\n'
+        '    morph-fn: "urn:morph:function:"\n'
+        '    sio: http://semanticscience.org/resource/\n'
+        'mappings:\n'
+        '    patients:\n'
+        '        sources:\n'
+        '            - access: test/rml-fnml/reconciliation/patients_uppercase.csv\n'
+        '              referenceFormulation: csv\n'
+        '        subjects: https://example.org/kg/patient/$(pid)\n'
+        '        predicateobjects:\n'
+        '            - p: sio:SIO_000255\n'
+        '              o:\n'
+        '                function: morph-fr:reconcileVocabularyConcept(morph-fn:resource = disease_vocabulary, '
+        'grel:valueParam = $(disease_label), morph-fn:matching = CASE-INSENSITIVE)\n'
+        '                type: iri\n',
+        encoding='utf-8',
+    )
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=str(mapping),
+    ))
+
+    assert_isomorphic(reconciled_graph(), g_morph)
+
+
+@pytest.mark.parametrize('alt_labels_matching, expected', [
+    ('CASE-INSENSITIVE', {('pid_00002', NARCOLEPSY, 'byUrl'), ('pid_00001', ATAXIA, 'byName')}),
+    # Matched exactly, the upper-case labels match no alternative label.
+    (None, {('pid_00002', NARCOLEPSY, 'byUrl')}),
+])
+def test_vocabulary_url_declared_by_two_resources(tmp_path, alt_labels_matching, expected):
+    """
+    A mapping naming a vocabulary by its URL reconciles against the resource the
+    configuration file resolves it to, the first declaring the URL, in the way
+    it asks for, even when another resource declares the same URL and is
+    reconciled against in another way.
+    """
+    def execution(name, resource, matching):
+        matching_input = (
+            '    rml:input [\n'
+            '        rml:parameter morph-fn:matching ;\n'
+            f'        rml:inputValue "{matching}"\n'
+            '    ] ;\n'
+        ) if matching else ''
+        return (
+            f'<#{name}>\n'
+            '    rml:function morph-fr:reconcileVocabularyConcept ;\n'
+            f'{matching_input}'
+            '    rml:input [\n'
+            '        rml:parameter morph-fn:resource ;\n'
+            f'        rml:inputValue "{resource}"\n'
+            '    ] ;\n'
+            '    rml:input [\n'
+            '        rml:parameter grel:valueParam ;\n'
+            '        rml:inputValueMap [ rml:reference "disease_label" ]\n'
+            '    ] .\n\n'
+        )
+
+    def object_map(predicate, execution_name):
+        return (
+            '    rml:predicateObjectMap [\n'
+            f'        rml:predicate ex:{predicate} ;\n'
+            f'        rml:objectMap [ rml:functionExecution <#{execution_name}> ; rml:termType rml:IRI ]\n'
+            '    ]'
+        )
+
+    mapping = tmp_path / 'mapping.ttl'
+    mapping.write_text(
+        '@prefix rml: <http://w3id.org/rml/> .\n'
+        '@prefix grel: <http://users.ugent.be/~bjdmeest/function/grel.ttl#> .\n'
+        '@prefix morph-fr: <urn:morph:function:reconciliation:> .\n'
+        '@prefix morph-fn: <urn:morph:function:> .\n'
+        '@prefix ex: <https://example.org/kg/> .\n\n'
+        '<#PatientsMapping>\n'
+        '    a rml:TriplesMap ;\n'
+        '    rml:logicalSource [\n'
+        '        rml:source "test/rml-fnml/reconciliation/patients_uppercase.csv" ;\n'
+        '        rml:referenceFormulation rml:CSV\n'
+        '    ] ;\n'
+        '    rml:subjectMap [ rml:template "https://example.org/kg/patient/{pid}" ] ;\n'
+        f'{object_map("byUrl", "ByUrl")} ;\n'
+        f'{object_map("byName", "ByName")} .\n\n'
+        + execution('ByUrl', VOCABULARY.replace(os.sep, '/'), 'CASE-INSENSITIVE')
+        + execution('ByName', 'alt_labels', alt_labels_matching),
+        encoding='utf-8',
+    )
+
+    g_morph = morph_kgc.materialize(
+        f'[CONFIGURATION]\n'
+        f'output_format=N-QUADS\n'
+        f'[RESOURCE:pref_labels]\n'
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}\n'
+        f'attributes=skos:prefLabel\n'
+        f'[RESOURCE:alt_labels]\n'
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}\n'
+        f'attributes=skos:altLabel\n'
+        f'[DataSource]\n'
+        f'mappings={mapping}'
+    )
+
+    assert {
+        (patient, concept, predicate.rsplit('/', 1)[1])
+        for predicate in ('https://example.org/kg/byUrl', 'https://example.org/kg/byName')
+        for patient, concept in reconciled(g_morph, predicate)
+    } == expected
+
+
+@pytest.mark.parametrize('binding', [
+    'rml:inputValueMap [ rml:reference "disease_label" ]',
+    'rml:inputValueMap [ rml:template "{disease_label}" ]',
+    'rml:inputValueMap [ rml:functionExecution <#Matching> ]',
+    # A constant, but two of them.
+    'rml:inputValue "EXACT" , "CASE-INSENSITIVE"',
+])
+def test_matching_not_given_as_a_single_constant(tmp_path, binding):
+    """
+    The vocabulary is indexed before any data is read, so how values are matched
+    cannot depend on the data. The mistake is reported before it is downloaded.
+    """
+    old, new = with_matching('"CASE-INSENSITIVE"')
+    mapping = mapping_copy(
+        tmp_path,
+        (old,
+         new.replace('rml:inputValue "CASE-INSENSITIVE"', binding) + ' .\n\n'
+         '<#Matching>\n'
+         '    rml:function grel:toUpperCase ;\n'
+         '    rml:input [\n'
+         '        rml:parameter grel:valueParameter ;\n'
+         '        rml:inputValue "case-insensitive"\n'
+         '    ]'),
+        mapping=UPPERCASE_MAPPING,
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=r"must bind 'urn:morph:function:matching' at most once, to a constant"):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}',
+                mapping=mapping,
+            ))
+
+        assert server.requests == []
+
+
+@pytest.mark.parametrize('matching', ['FUZZY', 'CASE_INSENSITIVE', 'CASE INSENSITIVE', ''])
+def test_invalid_matching(tmp_path, matching):
+    """A matching that is not one of those known fails, naming them."""
+    error = (
+        f"binds 'urn:morph:function:matching' to '{matching}', which is not valid. "
+        "Must be one of: CASE-INSENSITIVE, EXACT."
+    )
+    with pytest.raises(ValueError, match=re.escape(error)):
+        morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={VOCABULARY}',
+            mapping=mapping_copy(tmp_path, with_matching(f'"{matching}"'), mapping=UPPERCASE_MAPPING),
+        ))
+
+
+@pytest.mark.parametrize('matching', ['CASE-INSENSITIVE', 'EXACT'])
+def test_matching_option_of_the_resource(matching):
+    """
+    How values are matched is said by the mapping: a 'matching' option in the
+    resource fails, rather than being ignored, before the vocabulary is
+    downloaded.
+    """
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=re.escape(
+            "Resource 'disease_vocabulary' declares the option 'matching', which a "
+            "resource does not take"
+        )):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}\n'
+                f'matching={matching}',
+                mapping=UPPERCASE_MAPPING,
+            ))
+
+        assert server.requests == []
 
 
 # The attribute input of mapping.ttl, removed by the tests of executions that
