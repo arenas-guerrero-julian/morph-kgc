@@ -706,6 +706,10 @@ def test_vocabulary_url_declared_by_two_resources(tmp_path, alt_labels_matching,
             '    ]'
         )
 
+    # The mapping and the configuration file name the vocabulary by the same
+    # URL, written with forward slashes: a backslash of a Windows path would be
+    # an escape in the Turtle string of the mapping.
+    vocabulary = VOCABULARY.replace(os.sep, '/')
     mapping = tmp_path / 'mapping.ttl'
     mapping.write_text(
         '@prefix rml: <http://w3id.org/rml/> .\n'
@@ -722,7 +726,7 @@ def test_vocabulary_url_declared_by_two_resources(tmp_path, alt_labels_matching,
         '    rml:subjectMap [ rml:template "https://example.org/kg/patient/{pid}" ] ;\n'
         f'{object_map("byUrl", "ByUrl")} ;\n'
         f'{object_map("byName", "ByName")} .\n\n'
-        + execution('ByUrl', VOCABULARY.replace(os.sep, '/'), 'CASE-INSENSITIVE')
+        + execution('ByUrl', vocabulary, 'CASE-INSENSITIVE')
         + execution('ByName', 'alt_labels', alt_labels_matching),
         encoding='utf-8',
     )
@@ -732,11 +736,11 @@ def test_vocabulary_url_declared_by_two_resources(tmp_path, alt_labels_matching,
         f'output_format=N-QUADS\n'
         f'[RESOURCE:pref_labels]\n'
         f'resource_type=SKOS_VOCABULARY\n'
-        f'url={VOCABULARY}\n'
+        f'url={vocabulary}\n'
         f'attributes=skos:prefLabel\n'
         f'[RESOURCE:alt_labels]\n'
         f'resource_type=SKOS_VOCABULARY\n'
-        f'url={VOCABULARY}\n'
+        f'url={vocabulary}\n'
         f'attributes=skos:altLabel\n'
         f'[DataSource]\n'
         f'mappings={mapping}'
