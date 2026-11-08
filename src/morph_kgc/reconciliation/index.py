@@ -32,6 +32,16 @@ EXACT_MATCHING = "EXACT"
 CASE_INSENSITIVE_MATCHING = "CASE-INSENSITIVE"
 VALID_MATCHINGS = {EXACT_MATCHING, CASE_INSENSITIVE_MATCHING}
 
+# Policies for a value matching several concepts, which an execution chooses
+# with the ambiguity parameter, and the 'ambiguity' option of a resource sets
+# the default of: one term per concept, no term, or aborting the run.
+AMBIGUITY_ALL = "ALL"
+AMBIGUITY_NONE = "NONE"
+AMBIGUITY_FAIL = "FAIL"
+VALID_AMBIGUITIES = {AMBIGUITY_ALL, AMBIGUITY_NONE, AMBIGUITY_FAIL}
+# The resource option setting the policy of the values reconciled against it.
+AMBIGUITY_OPTION = "ambiguity"
+
 # The columns of the file of an index.
 INDEX_COLUMNS = {"key": "VARCHAR", "attribute": "VARCHAR", "concept": "VARCHAR"}
 
@@ -43,6 +53,12 @@ def parse_matching(value) -> str | None:
     """The matching strategy *value* names, whatever its case, or None."""
     matching = str(value).strip().upper()
     return matching if matching in VALID_MATCHINGS else None
+
+
+def parse_ambiguity(value) -> str | None:
+    """The policy for ambiguous values *value* names, whatever its case, or None."""
+    ambiguity = str(value).strip().upper()
+    return ambiguity if ambiguity in VALID_AMBIGUITIES else None
 
 
 def normalize(value, matching: str) -> str:
@@ -229,10 +245,27 @@ class ReconciliationContext:
     indexes: dict[str, dict[str, ConceptIndex]] = field(default_factory=dict)
     # any other value a mapping may use for a resource (its URL) -> resource name
     aliases: dict[str, str] = field(default_factory=dict)
+    # resource name -> the policy for the values matching several of its
+    # concepts, when an execution does not choose one
+    ambiguities: dict[str, str] = field(default_factory=dict)
+    # The ambiguous values this process has reported. The only part of the
+    # context that is not read-only, so that each value is reported once
+    # whatever the number of rows and mapping rules holding it; it is written
+    # to disk empty, and every process fills its own.
+    reported: set = field(default_factory=set, compare=False, repr=False)
 
-    def add(self, name: str, indexes: dict[str, ConceptIndex]) -> None:
-        """Register the indexes built for the resource *name*, by matching."""
+    def add(
+        self,
+        name: str,
+        indexes: dict[str, ConceptIndex],
+        ambiguity: str = AMBIGUITY_ALL,
+    ) -> None:
+        """
+        Register the indexes built for the resource *name*, by matching, and its
+        policy for ambiguous values.
+        """
         self.indexes[name] = indexes
+        self.ambiguities[name] = ambiguity
 
     def alias(self, name: str, *aliases: str, replace: bool = True) -> None:
         """
@@ -250,7 +283,7 @@ class ReconciliationContext:
         by its config section name or by its URL. When the mapping does not name
         a resource and exactly one is available, that one is used.
         """
-        indexes = self._indexes(resource)
+        indexes = self.indexes[self.name(resource)]
         if matching not in indexes:
             raise ValueError(
                 f"The mapping reconciles against the resource '{resource}' with "
@@ -258,11 +291,18 @@ class ReconciliationContext:
             )
         return indexes[matching]
 
-    def _indexes(self, resource) -> dict[str, ConceptIndex]:
-        """The indexes of *resource*, by matching."""
+    def ambiguity(self, resource=None) -> str:
+        """The policy of *resource*, named as in :meth:`get`, for ambiguous values."""
+        return self.ambiguities.get(self.name(resource), AMBIGUITY_ALL)
+
+    def name(self, resource=None) -> str:
+        """
+        The name of the resource the mapping names *resource*: its section
+        name, or any of its aliases, or nothing when only one is available.
+        """
         if resource is None or resource == "":
             if len(self.indexes) == 1:
-                return next(iter(self.indexes.values()))
+                return next(iter(self.indexes))
             raise ValueError(
                 "The mapping does not say which resource to reconcile against, "
                 f"and {len(self.indexes)} are available "
@@ -282,4 +322,25 @@ class ReconciliationContext:
                 f"file as '[RESOURCE:{resource}]'."
             )
 
-        return self.indexes[name]
+        return name
+
+
+@dataclass
+class QueryContext:
+    """
+    The shared context of the SPARQL reconciliation function: the index of the
+    answer to every query of the mapping, by the endpoint it is sent to and the
+    query, and the policy of each endpoint for ambiguous values.
+    """
+
+    # (endpoint, query) -> index of its answer
+    indexes: dict[tuple[str, str], ConceptIndex] = field(default_factory=dict)
+    # endpoint -> the policy for the values matching several of the entities
+    # its answers return, when an execution does not choose one
+    ambiguities: dict[str, str] = field(default_factory=dict)
+    # The ambiguous values this process has reported, as in ReconciliationContext.
+    reported: set = field(default_factory=set, compare=False, repr=False)
+
+    def ambiguity(self, endpoint: str) -> str:
+        """The policy of *endpoint* for ambiguous values."""
+        return self.ambiguities.get(endpoint, AMBIGUITY_ALL)

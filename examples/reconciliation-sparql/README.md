@@ -128,6 +128,7 @@ all.
 | `username`, `password` | HTTP Basic Authentication credentials. |
 | `method` | `GET` or `POST`. By default, `GET`, or `POST` for a query too long for a URL. |
 | `timeout` | seconds to wait for the answer to the query (default `300`). |
+| `ambiguity` | the policy for the values matching several entities, when the execution sets none: `ALL` (default), `NONE` or `FAIL`. |
 
 ## Function parameters
 
@@ -136,10 +137,17 @@ all.
 | `grel:valueParam` | the value to reconcile. |
 | `morph-fn:sparqlEndpointUrl` | the URL of the SPARQL endpoint the query is sent to. |
 | `morph-fn:sparqlQuery` | the SELECT query returning `?entity_iri` and `?matching_value_1`. |
+| `morph-fn:ambiguity` | what a value matching several entities is reconciled to: `ALL` (default), `NONE` or `FAIL`. A constant, overriding the `ambiguity` option of the resource declaring the endpoint. |
 
 The endpoint and the query are constants of the mapping, since they are sent
 before any data is read. A value matching no entity yields no triple. A value
-matching several entities yields one triple per matched entity.
+matching several entities is ambiguous, and yields one triple per matched entity
+with `ALL` (the default), no triple with `NONE`, and aborts the run with `FAIL`.
+It is reported in the log, with the entities it matches, as a record starting
+with `MULTIPLE_MATCH`: a warning with `NONE`, the error with `FAIL`, and a debug
+record with `ALL`. The policy is a constant of the execution, or else the
+`ambiguity` option of the resource declaring the endpoint, as in
+[`../reconciliation`](../reconciliation/README.md#ambiguous-values).
 
 ## What this example generates
 
