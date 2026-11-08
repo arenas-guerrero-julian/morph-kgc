@@ -126,18 +126,19 @@ url=https://example.org/vocabulary/disease
 ambiguity=NONE
 ```
 
-Each ambiguous value is reported in the log, together with the concepts it
-matches, as a record starting with `MULTIPLE_MATCH`. With `NONE` it is a warning,
-so that the values left without a triple can be reviewed (set `logging_file` in
-the configuration file to keep them in a file):
+With `NONE`, each ambiguous value is reported in the log, together with the
+concepts it matches, as a warning starting with `MULTIPLE_MATCH`, so that the
+values left without a triple can be reviewed (set `logging_file` in the
+configuration file to keep them in a file):
 
 ```
 MULTIPLE_MATCH: value 'Autosomal dominant cerebellar ataxia-deafness-narcolepsy syndrome' matches 2 entities of resource 'disease_vocabulary': <https://data.boehringer.com/id/00036/10077339>, <https://example.org/vocabulary/disease/adca-dn>. No triple is generated for it, as the ambiguity policy is NONE.
 ```
 
-With `FAIL`, the error aborting the run is that report, and with `ALL` it is a
-debug record (`logging_level=DEBUG`). A value is reported once by each process,
-whatever the number of rows and mapping rules holding it.
+With `ALL`, the report is a debug record (`logging_level=DEBUG`). With `FAIL`,
+it is the message of the error aborting the run, rather than a record of the
+log. A process writes each record once, however many rows and mapping rules
+hold the value.
 
 ## YARRRML
 

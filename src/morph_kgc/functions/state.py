@@ -14,7 +14,9 @@ The context is persisted to disk (one pickle file per function) rather than kept
 in a service or a background process, so that the worker processes spawned by
 the multiprocess executor read it back instead of rebuilding it. Each worker
 loads a context at most once, the first time it executes the function, and
-keeps it in memory afterwards.
+keeps it in memory afterwards. A function may keep bookkeeping of its own on
+the context it was handed, such as the reconciliation functions remembering
+what they have logged: it stays in the process, and is never written back.
 
 A context too large to hold in memory keeps its data in Parquet files the
 initializer writes to the state directory of the run, and only holds handles

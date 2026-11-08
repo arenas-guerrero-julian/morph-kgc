@@ -89,8 +89,9 @@ entities is ambiguous, and ``morph-fn:ambiguity`` says what it is reconciled to:
 - ``NONE``: ``None``, so that no triple is generated for it.
 - ``FAIL``: nothing, as the run is aborted.
 
-Like ``morph-fn:matching``, it is a constant, which is checked before any
-vocabulary is downloaded or query sent. The ``ambiguity`` option of the
+Like ``morph-fn:matching``, it is a constant, which a function checks when it
+is initialized, before it downloads any vocabulary or sends any query. The
+``ambiguity`` option of the
 ``[RESOURCE:<name>]`` section of a vocabulary or an endpoint sets the policy of
 the executions that do not choose one::
 
@@ -99,10 +100,11 @@ the executions that do not choose one::
     url=https://example.org/vocabulary/disease
     ambiguity=NONE
 
-An ambiguous value is reported, once per process, in a log record starting
-with ``MULTIPLE_MATCH`` that gives the value and the IRIs of every entity it
-matches: a warning when no triple is generated for it, and a debug record
-otherwise. With ``FAIL``, the error aborting the run gives the same report.
+An ambiguous value is reported in a log record starting with ``MULTIPLE_MATCH``
+that gives the value and the IRIs of every entity it matches: a warning with
+``NONE``, as no triple is generated for it, and a debug record with ``ALL``. A
+process writes each record once, however many rows and mapping rules hold the
+value. With ``FAIL``, the report is the message of the error aborting the run.
 
 An object map using a function needs
 ``rml:termType rml:IRI`` (``rr:termType rr:IRI``, ``type: iri`` in YARRRML):
@@ -163,21 +165,22 @@ _AMBIGUITY_OUTCOMES = {
 }
 
 
-def _result(context, report_key, target, ambiguity, value, matches):
+def _result(context, target, ambiguity, value, matches):
     """
     What *value* is reconciled to, given the IRIs of the entities of *target*
     it *matches*: the one it matches, None when it matches none, and, when it
     matches several, as the *ambiguity* policy says: all of them, None, or an
     error aborting the run.
-
-    An ambiguous value is reported once by each process, under *report_key*,
-    which tells apart the lookups of the same value that may match differently.
     """
     if not matches:
         LOGGER.debug(f"{NO_MATCH}: value {value!r} matches no entity of {target}.")
         return None
     if len(matches) == 1:
         return matches[0]
+
+    if ambiguity == AMBIGUITY_ALL and not LOGGER.isEnabledFor(logging.DEBUG):
+        # Reported in no record, so that the default policy costs nothing.
+        return matches
 
     report = (
         f"{MULTIPLE_MATCH}: value {value!r} matches {len(matches)} entities of "
@@ -186,13 +189,16 @@ def _result(context, report_key, target, ambiguity, value, matches):
     )
     if ambiguity == AMBIGUITY_FAIL:
         raise ValueError(
-            f"{report} Set '{MORPH_FN_AMBIGUITY}' or the '{AMBIGUITY_OPTION}' "
-            f"option of the resource to {AMBIGUITY_ALL} or {AMBIGUITY_NONE} to "
-            "reconcile it to all the entities it matches, or to none."
+            f"{report} To reconcile it to all the entities it matches, or to none, "
+            f"set the policy to {AMBIGUITY_ALL} or {AMBIGUITY_NONE}: "
+            f"'{MORPH_FN_AMBIGUITY}' in the execution, or else the "
+            f"'{AMBIGUITY_OPTION}' option of the resource."
         )
 
-    if (report_key, value) not in context.reported:
-        context.reported.add((report_key, value))
+    # Each record is written once by each process, however many rows and
+    # mapping rules hold the value.
+    if report not in context.reported:
+        context.reported.add(report)
         # A value without a triple is a gap in the knowledge graph.
         LOGGER.log(logging.DEBUG if ambiguity == AMBIGUITY_ALL else logging.WARNING, report)
 
@@ -426,17 +432,14 @@ def _reconcile_rows(context, values, groups, lookup) -> list:
     """
     Reconcile *values*, the rows of each group of *groups* (key -> row
     numbers) with a single call to ``lookup(key, values)``, which returns the
-    entities each value matches, what they are entities of, the policy for
-    ambiguous values, and the key their reports are told apart by: the lookup
-    and the policy, however the mapping spells them.
+    entities each value matches, what they are entities of, and the policy for
+    ambiguous values.
     """
     results = [None] * len(values)
     for key, rows in groups.items():
-        matches, target, ambiguity, report_key = lookup(key, [values[row] for row in rows])
+        matches, target, ambiguity = lookup(key, [values[row] for row in rows])
         for row, row_matches in zip(rows, matches):
-            results[row] = _result(
-                context, report_key, target, ambiguity, values[row], row_matches,
-            )
+            results[row] = _result(context, target, ambiguity, values[row], row_matches)
     return results
 
 
@@ -471,16 +474,12 @@ def reconcile_vocabulary_concept(
 
     def lookup(key, values):
         row_resource, row_attributes, row_matching, row_ambiguity = key
-        name          = context.name(row_resource)
-        row_matching  = parse_matching(row_matching)
-        index         = context.get(name, row_matching)
-        attributes    = row_attributes or index.attributes()
-        row_ambiguity = _row_ambiguity(row_ambiguity, context.ambiguity(name))
+        name  = context.name(row_resource)
+        index = context.get(name, parse_matching(row_matching))
         return (
-            index.lookup_many(values, attributes),
+            index.lookup_many(values, row_attributes),
             f"resource '{name}'",
-            row_ambiguity,
-            (name, frozenset(map(str, attributes)), row_matching, row_ambiguity),
+            _row_ambiguity(row_ambiguity, context.ambiguity(name)),
         )
 
     return _reconcile_rows(context, value, groups, lookup)
@@ -617,12 +616,10 @@ def reconcile_entity_over_sparql(context, value, endpoint=None, query=None, ambi
 
     def lookup(key, values):
         row_endpoint, row_query, row_ambiguity = key
-        row_ambiguity = _row_ambiguity(row_ambiguity, context.ambiguity(row_endpoint))
         return (
             context.indexes[(row_endpoint, row_query)].lookup_many(values),
             f"SPARQL endpoint '{row_endpoint}'",
-            row_ambiguity,
-            (row_endpoint, row_query, row_ambiguity),
+            _row_ambiguity(row_ambiguity, context.ambiguity(row_endpoint)),
         )
 
     return _reconcile_rows(context, value, groups, lookup)
