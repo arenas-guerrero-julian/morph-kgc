@@ -8,10 +8,11 @@ SPARQL endpoint reconciliation
 ==============================
 Builds a :class:`~morph_kgc.reconciliation.index.ConceptIndex` from the answer
 of a SPARQL endpoint to a SELECT query of the mapping. The query may read any
-knowledge graph, and projects two variables:
+knowledge graph, and projects:
 
 - ``?entity_iri``, the entity a value is reconciled with.
-- ``?matching_value_1``, the value the entity is matched by.
+- ``?matching_value_1``, the value the entity is matched by, and, for an entity
+  matched by several values together, ``?matching_value_2`` and so on.
 
 For instance::
 
@@ -22,6 +23,25 @@ For instance::
                         schema:identifier ?matching_value_1 .
         }
     }
+
+An entity identified by a code within a coding system, which only the two
+together identify, is matched by both::
+
+    PREFIX schema: <https://schema.org/>
+    SELECT ?entity_iri ?matching_value_1 ?matching_value_2 WHERE {
+        GRAPH ?g {
+            ?entity_iri a schema:MedicalCode ;
+                        schema:codeValue ?matching_value_1 ;
+                        schema:codingSystem ?matching_value_2 .
+        }
+    }
+
+The execution of the mapping then binds as many values, matched to the
+variables by position (``grel:valueParam1``, or ``grel:valueParam``, to
+``?matching_value_1``, ``grel:valueParam2`` to ``?matching_value_2``...), and
+a row is reconciled with the entities matched by all its values, compared one
+by one: each is a column of the index, never joined with the others into a
+string, which could make different tuples of values look alike.
 
 The query is sent once, during the context initialization phase, and exactly as
 written. Its answer is downloaded to the state directory of the run and read as
@@ -57,7 +77,7 @@ from urllib.parse import urlencode, urlsplit
 import pyoxigraph
 
 from .._version import __version__
-from ..constants import LOGGING_NAMESPACE
+from ..constants import GREL_VALUE_PARAM, LOGGING_NAMESPACE
 from ..http import Download, download
 from .index import ConceptIndex, ConceptIndexBuilder
 
@@ -76,10 +96,12 @@ RESULTS_FORMATS = {
     "text/tab-separated-values":       pyoxigraph.QueryResultsFormat.TSV,
 }
 
-# The variables the query projects.
+# The variables the query projects: the entity, and the values it is matched by,
+# numbered from 1.
 ENTITY_VARIABLE   = "entity_iri"
-MATCHING_VARIABLE = "matching_value_1"
-MATCHING_VARIABLES = re.compile(r"matching_value_\d+")
+MATCHING_VARIABLE_PREFIX = "matching_value_"
+MATCHING_VARIABLE = f"{MATCHING_VARIABLE_PREFIX}1"
+MATCHING_VARIABLES = re.compile(rf"{MATCHING_VARIABLE_PREFIX}(\d+)")
 
 VALID_METHODS = {"GET", "POST"}
 
@@ -188,11 +210,17 @@ def run_query(resource, query: str, state_dir: str) -> Download:
         ) from exc
 
 
-def read_solutions(endpoint: str, answer: Download):
+def matching_variables(arity: int = 1) -> list[str]:
+    """The variables matched against the *arity* values a row is reconciled by."""
+    return [f"{MATCHING_VARIABLE_PREFIX}{position}" for position in range(1, arity + 1)]
+
+
+def read_solutions(endpoint: str, answer: Download, arity: int = 1):
     """
     The variables the answer of *endpoint* in the file *answer* projects, if
     it says, and an iterator of its solutions, read as a stream: for each, the
-    term bound to ?entity_iri and to ?matching_value_1, as (kind, value) pairs
+    term bound to ?entity_iri, and the tuple of the terms bound to the *arity*
+    variables ?matching_value_1, ?matching_value_2..., as (kind, value) pairs
     whose kind is ``uri`` for an IRI.
     """
     json_format = pyoxigraph.QueryResultsFormat.JSON
@@ -204,7 +232,7 @@ def read_solutions(endpoint: str, answer: Download):
             raise _not_results(endpoint, answer, exc) from exc
         # The head is mandatory in SPARQL results, but an endpoint omitting it
         # is not worth failing for: the bindings then speak for the projection.
-        return _read_json_solutions(endpoint, answer, exc)
+        return _read_json_solutions(endpoint, answer, exc, arity)
 
     if not isinstance(results, pyoxigraph.QuerySolutions):
         raise _not_results(endpoint, answer, "it is the answer to an ASK query")
@@ -217,16 +245,21 @@ def read_solutions(endpoint: str, answer: Download):
         )
 
     variables = [variable.value for variable in results.variables]
-    if ENTITY_VARIABLE not in variables or MATCHING_VARIABLE not in variables:
+    matched = matching_variables(arity)
+    if any(variable not in variables for variable in (ENTITY_VARIABLE, *matched)):
         # check_variables says which is missing.
         return variables, iter(())
     # By position, much faster than by name over millions of solutions.
-    entity, value = variables.index(ENTITY_VARIABLE), variables.index(MATCHING_VARIABLE)
+    entity = variables.index(ENTITY_VARIABLE)
+    values = [variables.index(variable) for variable in matched]
 
     def solutions():
         try:
             for solution in results:
-                yield _solution_term(solution[entity]), _solution_term(solution[value])
+                yield (
+                    _solution_term(solution[entity]),
+                    tuple(_solution_term(solution[value]) for value in values),
+                )
         except SyntaxError as exc:
             if results_format == json_format:
                 # A term the streaming parser rejects and json.load may not: a
@@ -259,7 +292,7 @@ def _solution_term(term) -> tuple[str, str] | None:
     return type(term).__name__.lower(), getattr(term, "value", None)
 
 
-def _read_json_solutions(endpoint: str, answer: Download, reason):
+def _read_json_solutions(endpoint: str, answer: Download, reason, arity: int = 1):
     """The solutions of an answer in JSON the streaming parser rejects, in memory."""
     try:
         with open(answer.path, "rb") as answer_file:
@@ -282,9 +315,14 @@ def _read_json_solutions(endpoint: str, answer: Download, reason):
             return None
         return binding.get("type"), binding.get("value")
 
+    matched = matching_variables(arity)
+
     def solutions():
         for binding in bindings:
-            yield term(binding.get(ENTITY_VARIABLE)), term(binding.get(MATCHING_VARIABLE))
+            yield (
+                term(binding.get(ENTITY_VARIABLE)),
+                tuple(term(binding.get(variable)) for variable in matched),
+            )
 
     return variables, solutions()
 
@@ -308,11 +346,14 @@ def _error_body(error: HTTPError) -> bytes:
         return b""
 
 
-def check_variables(endpoint: str, variables) -> None:
+def check_variables(endpoint: str, variables, arity: int = 1) -> None:
     """
     Make sure the query projects the variables reconciliation reads, rather than
-    letting a misspelled one silently reconcile every value against nothing.
+    letting a misspelled one silently reconcile every value against nothing:
+    ?entity_iri, and one ?matching_value_<i> for each of the *arity* values the
+    mapping matches entities by, numbered from 1.
     """
+    projected = " ".join(f"?{variable}" for variable in variables) or "nothing"
     missing = [
         variable
         for variable in (ENTITY_VARIABLE, MATCHING_VARIABLE)
@@ -324,31 +365,45 @@ def check_variables(endpoint: str, variables) -> None:
             f"{' and '.join(f'?{variable}' for variable in missing)}. It must "
             f"project ?{ENTITY_VARIABLE}, the entity a value is reconciled with, "
             f"and ?{MATCHING_VARIABLE}, the value the entity is matched by. It "
-            f"projects: {' '.join(f'?{variable}' for variable in variables) or 'nothing'}."
+            f"projects: {projected}."
         )
 
-    unsupported = [
-        variable
-        for variable in variables
-        if MATCHING_VARIABLES.fullmatch(variable) and variable != MATCHING_VARIABLE
+    numbered = [
+        variable for variable in variables if MATCHING_VARIABLES.fullmatch(variable)
     ]
-    if unsupported:
+    expected = matching_variables(len(numbered))
+    if sorted(numbered) != sorted(expected):
+        unexpected = [variable for variable in numbered if variable not in expected]
         raise ValueError(
             f"The SPARQL query sent to '{endpoint}' projects "
-            f"{' '.join(f'?{variable}' for variable in unsupported)}, but a value "
-            f"is only matched against ?{MATCHING_VARIABLE}. To match a value "
-            "against several properties, bind them all to "
-            f"?{MATCHING_VARIABLE}, e.g. with a UNION."
+            f"{' '.join(f'?{variable}' for variable in unexpected)}, but the "
+            f"values an entity is matched by are projected as "
+            f"{', '.join(f'?{variable}' for variable in matching_variables(3))}... "
+            "numbered from 1, without gaps or leading zeros. It projects: "
+            f"{projected}."
+        )
+
+    if len(numbered) != arity:
+        raise ValueError(
+            f"The SPARQL query sent to '{endpoint}' matches entities by "
+            f"{len(numbered)} value(s), "
+            f"{' '.join(f'?{variable}' for variable in expected)}, but the "
+            f"mapping reconciles {arity} value(s) with it. Bind one value to "
+            "reconcile per variable, matched by position: "
+            f"'{GREL_VALUE_PARAM}1' (or '{GREL_VALUE_PARAM}') to "
+            f"?{MATCHING_VARIABLE}, '{GREL_VALUE_PARAM}2' to "
+            f"?{MATCHING_VARIABLE_PREFIX}2, and so on."
         )
 
 
-def _index_solutions(solutions, state_dir: str, memory_limit: str):
+def _index_solutions(solutions, state_dir: str, memory_limit: str, arity: int = 1):
     """The index of *solutions*, and how many bound ?entity_iri to no IRI."""
     not_iris = 0
-    with ConceptIndexBuilder(state_dir, memory_limit) as builder:
-        for entity, value in solutions:
-            # Unbound in this solution, e.g. by an OPTIONAL pattern.
-            if entity is None or value is None or value[1] is None:
+    with ConceptIndexBuilder(state_dir, memory_limit, arity=arity) as builder:
+        for entity, values in solutions:
+            # Unbound in this solution, e.g. by an OPTIONAL pattern: an entity
+            # is only matched by all its values.
+            if entity is None or any(value is None or value[1] is None for value in values):
                 continue
             # A blank node or a literal identifies no entity outside the answer.
             if entity[0] != "uri":
@@ -356,25 +411,31 @@ def _index_solutions(solutions, state_dir: str, memory_limit: str):
                 continue
             # The answer says nothing of attributes: the values are indexed
             # under a single, unnamed one.
-            builder.add("", value[1], entity[1])
+            matched = values[0][1] if arity == 1 else tuple(value[1] for value in values)
+            builder.add("", matched, entity[1])
         return builder.build(), not_iris
 
 
-def build_index(resource, query: str, *, state_dir: str, memory_limit: str) -> ConceptIndex:
-    """Build the index of *query* sent to the endpoint of *resource*, in *state_dir*."""
+def build_index(
+    resource, query: str, *, state_dir: str, memory_limit: str, arity: int = 1,
+) -> ConceptIndex:
+    """
+    Build the index of *query* sent to the endpoint of *resource*, in
+    *state_dir*, matching entities by the *arity* values the mapping binds.
+    """
     endpoint = resource.get_url()
     answer = run_query(resource, query, state_dir)
     try:
-        variables, solutions = read_solutions(endpoint, answer)
+        variables, solutions = read_solutions(endpoint, answer, arity)
         if variables is not None:
-            check_variables(endpoint, variables)
+            check_variables(endpoint, variables, arity)
 
         try:
-            index, not_iris = _index_solutions(solutions, state_dir, memory_limit)
+            index, not_iris = _index_solutions(solutions, state_dir, memory_limit, arity)
         except _StreamingError as exc:
             # Indexed anew from the start, by a new builder.
-            _, solutions = _read_json_solutions(endpoint, answer, exc)
-            index, not_iris = _index_solutions(solutions, state_dir, memory_limit)
+            _, solutions = _read_json_solutions(endpoint, answer, exc, arity)
+            index, not_iris = _index_solutions(solutions, state_dir, memory_limit, arity)
     finally:
         answer.remove()
 
@@ -386,9 +447,10 @@ def build_index(resource, query: str, *, state_dir: str, memory_limit: str) -> C
         )
 
     if index.concept_count:
+        by = "value(s)" if arity == 1 else f"tuple(s) of {arity} values"
         LOGGER.info(
             f"SPARQL endpoint '{endpoint}': indexed {index.concept_count} "
-            f"entity(ies) by {len(index)} value(s)."
+            f"entity(ies) by {len(index)} {by}."
         )
     else:
         hint = ""

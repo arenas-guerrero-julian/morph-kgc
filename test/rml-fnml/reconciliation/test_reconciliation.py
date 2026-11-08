@@ -1521,7 +1521,9 @@ def test_reconcile_entity_over_sparql_from_yarrrml():
     (
         'SELECT ?entity_iri ?matching_value_1 ?matching_value_2 WHERE { GRAPH ?g { '
         '?entity_iri <https://schema.org/identifier> ?matching_value_1, ?matching_value_2 } }',
-        r'projects \?matching_value_2',
+        # The mapping reconciles a single value.
+        r'matches entities by 2 value\(s\), \?matching_value_1 \?matching_value_2, '
+        r'but the mapping reconciles 1 value\(s\) with it\.',
     ),
 ])
 def test_query_projecting_other_variables(tmp_path, query, error):
@@ -2387,3 +2389,369 @@ def test_ambiguous_value_over_sparql_reported_under_each_policy(
     # The public endpoint, under ALL as well, is reported in a record of its own.
     assert report + 'A triple is generated for each of them, as the ambiguity policy is ALL.' \
         in multiple_match_reports(caplog, 'DEBUG')
+
+
+# ── Entities matched by several values ────────────────────────────────────────
+
+CODES_MAPPING = os.path.join(TEST_DIR, 'mapping_sparql_codes.ttl')
+CODES_QUERY = """
+            PREFIX schema: <https://schema.org/>
+            SELECT ?entity_iri ?matching_value_1 ?matching_value_2 WHERE {
+                GRAPH ?g {
+                    ?entity_iri a schema:MedicalCode ;
+                                schema:codeValue ?matching_value_1 ;
+                                schema:codingSystem ?matching_value_2 .
+                }
+            }
+        """
+# The values of mapping_sparql_codes.ttl, as it binds them.
+CODE_INPUT = (
+    '    rml:input [\n'
+    '        rml:parameter grel:valueParam1 ;\n'
+    '        rml:inputValueMap [ rml:reference "code" ]\n'
+    '    ]'
+)
+SCHEME_INPUT = (
+    '    rml:input [\n'
+    '        rml:parameter grel:valueParam2 ;\n'
+    '        rml:inputValueMap [ rml:reference "scheme" ]\n'
+    '    ]'
+)
+# The codes each patient of diagnoses.csv is diagnosed with.
+DIAGNOSES = {
+    ('urn:id:p1', 'https://data.com/id/6'),
+    ('urn:id:p2', 'https://data.com/id/7'),
+    ('urn:id:p3', 'https://data.com/id/8'),
+    ('urn:id:p4', 'https://data.com/id/9'),
+    ('urn:id:p5', 'https://data.com/id/10'),
+}
+
+
+def codes_mapping(tmp_path, server, *replacements, path='/public/sparql'):
+    """A copy of mapping_sparql_codes.ttl querying *path* of *server*."""
+    return sparql_mapping(
+        tmp_path, (MAPPING_ENDPOINT, f'{server.url}{path}'), *replacements, mapping=CODES_MAPPING,
+    )
+
+
+def diagnoses(g_morph):
+    return {(str(s), str(o)) for s, o in g_morph.subject_objects(URIRef(
+        'https://example.org/ontology/diagnosedWith'
+    ))}
+
+
+def test_reconcile_entities_by_two_values():
+    """
+    Rows are reconciled with the entities matched by both their code and their
+    coding system: values holding ',', '|' and whitespace are compared one by
+    one, so that the codes of 'A|1' in 'ICD-10' and 'A' in '1|ICD-10', or of
+    'B, C' in 'SNOMED CT' and 'B' in ' C,SNOMED CT', are told apart. The
+    query is sent once.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql'), mapping=CODES_MAPPING,
+        ))
+
+        assert server.requests == [('/sparql', CODES_QUERY)]
+
+    assert_isomorphic(expected_sparql_graph('output_sparql_codes.nq'), g_morph)
+
+
+@pytest.mark.parametrize('path, expected', [
+    ('/public/sparql/no-head', DIAGNOSES),
+    ('/public/sparql/results-first', DIAGNOSES),
+    ('/public/sparql/gzip', DIAGNOSES),
+    # The parser of answers in XML trims the whitespace a literal starts with,
+    # unless the endpoint escapes it ('&#32;'), which rdflib does not: the
+    # coding system ' C,SNOMED CT' then reads 'C,SNOMED CT'.
+    ('/public/sparql/xml', DIAGNOSES - {('urn:id:p5', 'https://data.com/id/10')}),
+])
+def test_reconcile_entities_by_two_values_from_answers_in_other_shapes(tmp_path, path, expected):
+    """Every way of reading an answer reads all the values of its solutions."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(tmp_path, server, path=path),
+        ))
+
+    assert diagnoses(g_morph) == expected
+
+
+def test_reconcile_entities_by_two_values_with_multiple_processes():
+    """Worker processes look the tuples of values up in the index on disk."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql'), mapping=CODES_MAPPING, processes=4,
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES
+
+
+@pytest.mark.parametrize('replacements', [
+    (('grel:valueParam1', 'grel:valueParam'),),
+    (('grel:valueParam1', 'grel:valueParameter1'), ('grel:valueParam2', 'grel:valueParameter2')),
+    (('grel:valueParam1', 'grel:valueParameter'),),
+    # The inputs of an execution have no order.
+    ((f'{CODE_INPUT} ;\n{SCHEME_INPUT}', f'{SCHEME_INPUT} ;\n{CODE_INPUT}'),),
+])
+def test_value_parameters_numbered_under_any_spelling(tmp_path, replacements):
+    """
+    The values are matched to the variables by the number of their parameter,
+    under either GREL spelling, the first of them unnumbered or not.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(tmp_path, server, *replacements),
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES
+
+
+def test_values_matched_by_position(tmp_path):
+    """The code bound as the second value is matched against coding systems."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server,
+                ('rml:reference "code"', 'rml:reference "SCHEME"'),
+                ('rml:reference "scheme"', 'rml:reference "code"'),
+                ('rml:reference "SCHEME"', 'rml:reference "scheme"'),
+            ),
+        ))
+
+    assert len(g_morph) == 0
+
+
+def test_constant_value(tmp_path):
+    """A value may be a constant, such as the coding system all rows are in."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server,
+                ('rml:inputValueMap [ rml:reference "scheme" ]', 'rml:inputValue "ICD-10"'),
+            ),
+        ))
+
+    # The coding system of every row is ICD-10, even when its scheme is empty.
+    assert diagnoses(g_morph) == {
+        (f'urn:id:{patient}', 'https://data.com/id/6') for patient in ('p1', 'p2', 'p6', 'p7')
+    }
+
+
+@pytest.mark.parametrize('third_value, expected', [('"Diagnosis"', DIAGNOSES), ('"Procedure"', set())])
+def test_reconcile_entities_by_three_values(tmp_path, third_value, expected):
+    """Entities are matched by any number of values."""
+    query = CODES_QUERY.replace(
+        '?matching_value_2 WHERE {', '?matching_value_2 ?matching_value_3 WHERE {',
+    ).replace(
+        'schema:codingSystem ?matching_value_2 .\n                }',
+        'schema:codingSystem ?matching_value_2 .\n                }\n'
+        '                BIND("Diagnosis" AS ?matching_value_3)',
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server,
+                (CODES_QUERY, query),
+                (SCHEME_INPUT, SCHEME_INPUT + ' ;\n'
+                 '    rml:input [ rml:parameter grel:valueParam3 ; '
+                 f'rml:inputValue {third_value} ]'),
+            ),
+        ))
+
+    assert diagnoses(g_morph) == expected
+
+
+def test_reconcile_entities_by_two_values_from_yarrrml(tmp_path):
+    """The values are numbered parameters in YARRRML as well."""
+    mapping = tmp_path / 'mapping.yarrrml'
+    with VocabularyServer() as server:
+        mapping.write_text(
+            'prefixes:\n'
+            '    grel: http://users.ugent.be/~bjdmeest/function/grel.ttl#\n'
+            '    morph-fn: "urn:morph:function:"\n'
+            '    bi: https://example.org/ontology/\n'
+            'mappings:\n'
+            '    diagnoses:\n'
+            '        sources:\n'
+            '            - access: test/rml-fnml/reconciliation/diagnoses.csv\n'
+            '              referenceFormulation: csv\n'
+            '        subjects: urn:id:$(patient_id)\n'
+            '        predicateobjects:\n'
+            '            - p: bi:diagnosedWith\n'
+            '              o:\n'
+            '                function: morph-fn:reconcileEntityOverSPARQL\n'
+            '                type: iri\n'
+            '                parameters:\n'
+            '                    - parameter: morph-fn:sparqlEndpointUrl\n'
+            f'                      value: {server.url}/public/sparql\n'
+            '                    - parameter: morph-fn:sparqlQuery\n'
+            '                      value: |\n'
+            + ''.join(f'                        {line.strip()}\n' for line in CODES_QUERY.strip().splitlines())
+            + '                    - [grel:valueParam2, $(scheme)]\n'
+            '                    - [grel:valueParam1, $(code)]\n',
+            encoding='utf-8',
+        )
+        g_morph = morph_kgc.materialize(sparql_config(mapping=str(mapping)))
+
+    assert diagnoses(g_morph) == DIAGNOSES
+
+
+def test_entity_missing_a_value_is_not_matched(tmp_path):
+    """An entity a solution binds no coding system to is matched by no row."""
+    query = CODES_QUERY.replace(
+        'schema:codingSystem ?matching_value_2 .',
+        '.\n                    OPTIONAL { ?entity_iri schema:codingSystem ?matching_value_2 '
+        'FILTER(?matching_value_2 != "ICD 10") }',
+    ).replace('schema:codeValue ?matching_value_1 ;', 'schema:codeValue ?matching_value_1')
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query)),
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES - {('urn:id:p2', 'https://data.com/id/7')}
+
+
+def test_ambiguous_tuple_of_values(tmp_path, caplog):
+    """A tuple of values matching several entities is ambiguous as a whole."""
+    # 'ICD 10' read as 'ICD-10' makes 'A|1' in 'ICD-10' match the codes of 6 and 7.
+    query = CODES_QUERY.replace(
+        'schema:codingSystem ?matching_value_2 .\n                }',
+        'schema:codingSystem ?system .\n                }\n'
+        '                BIND(IF(?system = "ICD 10", "ICD-10", ?system) AS ?matching_value_2)',
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql', 'ambiguity=NONE'),
+            mapping=sparql_mapping(tmp_path, (CODES_QUERY, query), mapping=CODES_MAPPING),
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES - {
+        ('urn:id:p1', 'https://data.com/id/6'), ('urn:id:p2', 'https://data.com/id/7'),
+    }
+    assert multiple_match_reports(caplog) == [
+        f"MULTIPLE_MATCH: value ('A|1', 'ICD-10') matches 2 entities of SPARQL endpoint "
+        f"'{MAPPING_ENDPOINT}': <https://data.com/id/6>, <https://data.com/id/7>. "
+        f"No triple is generated for it, as the ambiguity policy is NONE.",
+    ]
+
+
+def test_query_matching_by_fewer_values_than_the_mapping(tmp_path):
+    """A query projecting fewer values than the mapping binds fails, saying how many."""
+    query = CODES_QUERY.replace(' ?matching_value_2 WHERE', ' WHERE').replace(
+        'schema:codingSystem ?matching_value_2', 'schema:codingSystem ?system',
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            r'matches entities by 1 value\(s\), \?matching_value_1, but the mapping '
+            r"reconciles 2 value\(s\) with it\. Bind one value to reconcile per variable"
+        )):
+            morph_kgc.materialize(sparql_config(
+                mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query)),
+            ))
+
+
+@pytest.mark.parametrize('variable', ['matching_value_3', 'matching_value_02', 'matching_value_0'])
+def test_query_projecting_values_not_numbered_from_1(tmp_path, variable):
+    """The variables of the values are numbered from 1, without gaps or leading zeros."""
+    query = CODES_QUERY.replace('?matching_value_2', f'?{variable}')
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            rf'projects \?{variable}, but the values an entity is matched by are '
+            r'projected as \?matching_value_1, \?matching_value_2, \?matching_value_3\.\.\. '
+            r'numbered from 1, without gaps or leading zeros\.'
+        )):
+            morph_kgc.materialize(sparql_config(
+                mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query)),
+            ))
+
+
+@pytest.mark.parametrize('replacements, error', [
+    # No value at all.
+    (((f'{CODE_INPUT} ;\n{SCHEME_INPUT}', '    rml:input [ rml:parameter morph-fn:unused ; '
+       'rml:inputValue "x" ]'),),
+     r"binds no value to reconcile\. Bind it to "
+     r"'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam'\."),
+    # A gap.
+    ((('grel:valueParam2', 'grel:valueParam3'),),
+     r'binds value\(s\) 1, 3 to reconcile but not 2\. The values are numbered from 1'),
+    # The first value twice, numbered and not.
+    (((SCHEME_INPUT, SCHEME_INPUT + ' ;\n'
+       '    rml:input [ rml:parameter grel:valueParam ; rml:inputValue "A|1" ]'),),
+     r'binds value 1 to reconcile 2 times, to '
+     r'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam, '
+     r'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam1\. Bind it once'),
+    # The second value twice, under the same parameter.
+    ((('rml:inputValueMap [ rml:reference "scheme" ]',
+       'rml:inputValueMap [ rml:reference "scheme" ], [ rml:reference "code" ]'),),
+     r'binds value 2 to reconcile 2 times'),
+])
+def test_values_not_bound_once_each_from_1(tmp_path, replacements, error):
+    """
+    Values bound other than once each, numbered from 1, fail before the query
+    is sent.
+    """
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=error):
+            morph_kgc.materialize(sparql_config(
+                mapping=codes_mapping(tmp_path, server, *replacements),
+            ))
+
+        assert server.requests == []
+
+
+def test_same_query_reconciling_different_numbers_of_values(tmp_path):
+    """
+    Executions sending the same query to the same endpoint reconcile as many
+    values, the number of those it projects, which fails before it is sent.
+    """
+    mapping = sparql_mapping(
+        tmp_path,
+        with_sparql_execution_input(
+            '<#ClinicalTrialReconciliationAgain>', 'grel:valueParam2', '"ICD-10"',
+        ),
+        mapping=SEVERAL_SPARQL_MAPPING,
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            r"Executions '.*' and '.*' of function "
+            r"'urn:morph:function:reconcileEntityOverSPARQL' send the same query to "
+            r"'https://data\.com/database/query', but reconcile (1 and 2|2 and 1) values with it\."
+        )):
+            morph_kgc.materialize(sparql_config(several_endpoints(server), mapping=mapping))
+
+        assert server.requests == []
+
+
+def test_vocabulary_concepts_matched_by_the_first_value_numbered(tmp_path):
+    """The value reconciled against a vocabulary may be numbered as the first."""
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=mapping_copy(tmp_path, ('grel:valueParam ;', 'grel:valueParameter1 ;')),
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+def test_vocabulary_concepts_matched_by_two_values(tmp_path):
+    """The concepts of a vocabulary are matched by a single value, before it is downloaded."""
+    mapping = mapping_copy(tmp_path, (
+        'rml:inputValue skos:prefLabel , skos:altLabel\n    ]',
+        'rml:inputValue skos:prefLabel , skos:altLabel\n    ]'
+        + execution_input('grel:valueParam2', '"ICD-10"'),
+    ))
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            r"binds 2 values to reconcile, but the concepts of a vocabulary are matched by "
+            r"a single value\."
+        )):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}',
+                mapping=mapping,
+            ))
+
+        assert server.requests == []

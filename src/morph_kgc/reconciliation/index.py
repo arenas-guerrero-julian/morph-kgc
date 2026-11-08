@@ -9,7 +9,9 @@ Concept index
 What a reconciliation function is initialized with: for each indexed attribute
 (``skos:prefLabel``, ``skos:altLabel``, ...) the values it takes, and the
 concepts they identify. The answer to a SPARQL query, which says nothing of
-attributes, is indexed under a single, unnamed one.
+attributes, is indexed under a single, unnamed one, and may match entities by
+several values together, such as a code and the scheme it belongs to: an index
+then holds a column for each, and is looked up by the tuple of their values.
 
 The index is built once during the context initialization phase and is then
 read-only, which is what makes it safe to share across mapping rules and worker
@@ -42,8 +44,27 @@ VALID_AMBIGUITIES = {AMBIGUITY_ALL, AMBIGUITY_NONE, AMBIGUITY_FAIL}
 # The resource option setting the policy of the values reconciled against it.
 AMBIGUITY_OPTION = "ambiguity"
 
-# The columns of the file of an index.
-INDEX_COLUMNS = {"key": "VARCHAR", "attribute": "VARCHAR", "concept": "VARCHAR"}
+
+
+def key_columns(arity: int = 1) -> tuple[str, ...]:
+    """
+    The columns of the file of an index holding the values an entry is looked
+    up by, one per value of the *arity* it matches entities by.
+    """
+    return ("key", *(f"key_{position}" for position in range(2, arity + 1)))
+
+
+def index_columns(arity: int = 1) -> dict[str, str]:
+    """The columns of the file of an index matching entities by *arity* values."""
+    return {
+        **{column: "VARCHAR" for column in key_columns(arity)},
+        "attribute": "VARCHAR",
+        "concept": "VARCHAR",
+    }
+
+
+# The columns of the file of an index matching entities by a single value.
+INDEX_COLUMNS = index_columns()
 
 # The entries of the concepts that were not excluded.
 INCLUDED = "WHERE concept NOT IN (SELECT concept FROM excluded)"
@@ -89,6 +110,9 @@ class ConceptIndex:
     # The number of parts (row groups) of the file, which a lookup of a single
     # value reads one of.
     row_groups: int = 1
+    # The number of values an entity is matched by, each looked up exactly, as
+    # a whole: a value is a tuple of that many when more than one.
+    arity: int = 1
 
     # -- Looking up ---------------------------------------------------------
 
@@ -117,37 +141,71 @@ class ConceptIndex:
             attributes = (attributes,)
         attributes = [str(attribute) for attribute in attributes]
 
-        keys = [None if value is None else normalize(value, self.matching) for value in values]
+        keys = [self._key(value) for value in values]
         distinct_keys = {key for key in keys if key is not None}
 
-        concepts: dict[str, list[str]] = {}
+        concepts: dict[tuple[str, ...], list[str]] = {}
         if distinct_keys and attributes:
+            columns = key_columns(self.arity)
             query = (
-                "SELECT t.key, t.concept FROM {table} AS t "
+                f"SELECT {', '.join(f't.{column}' for column in columns)}, t.concept "
+                "FROM {table} AS t "
                 f"WHERE t.attribute IN ({', '.join('?' for _ in attributes)}) AND "
             )
             if len(distinct_keys) < self.row_groups:
                 # A value is looked up in the one part of the file that may hold
                 # it, while values spread over the file make it read every part:
                 # a few values are cheaper to look up one by one.
+                condition = " AND ".join(f"t.{column} = ?" for column in columns)
                 rows = [
                     row
                     for key in distinct_keys
-                    for row in self.table.select(query + "t.key = ?", [*attributes, key])
+                    for row in self.table.select(query + condition, [*attributes, *key])
                 ]
             else:
-                rows = self.table.select(
-                    query + "t.key IN (SELECT key FROM lookup_keys)",
-                    attributes,
-                    lookup_keys=pd.DataFrame({"key": list(distinct_keys)}, dtype=object),
+                # Values matched together are matched as a whole, column by
+                # column: never joined into a string, which could make
+                # different tuples look alike.
+                condition = "t.key IN (SELECT key FROM lookup_keys)"
+                if self.arity > 1:
+                    condition += (
+                        f" AND ({', '.join(f't.{column}' for column in columns)}) "
+                        f"IN (SELECT {', '.join(columns)} FROM lookup_keys)"
+                    )
+                lookup_keys = pd.DataFrame(
+                    {
+                        column: [key[position] for key in distinct_keys]
+                        for position, column in enumerate(columns)
+                    },
+                    dtype=object,
                 )
-            for key, concept in rows:
-                concepts.setdefault(key, []).append(concept)
+                rows = self.table.select(query + condition, attributes, lookup_keys=lookup_keys)
+            for *key, concept in rows:
+                concepts.setdefault(tuple(key), []).append(concept)
 
         return [
             sorted(set(concepts.get(key, ()))) if key is not None else []
             for key in keys
         ]
+
+    def _key(self, value) -> tuple[str, ...] | None:
+        """
+        The normalized values *value* is looked up by: a single value, or the
+        tuple of the values an entity is matched by, when more than one. None
+        when any of them is missing.
+        """
+        if self.arity == 1:
+            components = (value,)
+        elif isinstance(value, (tuple, list)) and len(value) == self.arity:
+            components = tuple(value)
+        else:
+            raise ValueError(
+                f"The index matches entities by {self.arity} values, so it is "
+                f"looked up by tuples of {self.arity} values, not by {value!r}."
+            )
+        if any(component is None for component in components):
+            return None
+        return tuple(normalize(component, self.matching) for component in components)
 
     # -- Reporting ----------------------------------------------------------
 
@@ -161,18 +219,22 @@ class ConceptIndexBuilder:
     is given), streaming their entries to disk as they are added, so that
     building the indexes of a vocabulary takes the same memory whatever its
     size. The entries of every matching go to a single scratch database, which
-    keeps them within one memory limit.
+    keeps them within one memory limit. The indexes match entities by *arity*
+    values.
     """
 
-    def __init__(self, state_dir: str, memory_limit: str, *matchings: str) -> None:
+    def __init__(
+        self, state_dir: str, memory_limit: str, *matchings: str, arity: int = 1,
+    ) -> None:
         self.matchings = matchings or (EXACT_MATCHING,)
+        self.arity = arity
         self._builder = TableBuilder(state_dir, memory_limit)
         # matching -> scratch table of its entries
         self._entries = {
             matching: f"entries_{number}" for number, matching in enumerate(self.matchings)
         }
         for table in self._entries.values():
-            self._builder.create(table, INDEX_COLUMNS)
+            self._builder.create(table, index_columns(arity))
         self._builder.create("excluded", {"concept": "VARCHAR"})
         self._attributes: dict[str, dict[str, None]] = {
             matching: {} for matching in self.matchings
@@ -187,11 +249,14 @@ class ConceptIndexBuilder:
     def add(self, attribute: str, value, concept: str, matching: str | None = None) -> None:
         """
         Index *concept* under the value its *attribute* takes, for *matching*:
-        the first of the builder when not given.
+        the first of the builder when not given. The value is the tuple of the
+        values the concept is matched by, when more than one.
         """
         matching = matching or self.matchings[0]
+        components = (value,) if self.arity == 1 else tuple(value)
         self._builder.append(
-            self._entries[matching], (normalize(value, matching), attribute, concept),
+            self._entries[matching],
+            (*(normalize(component, matching) for component in components), attribute, concept),
         )
         self._attributes[matching][attribute] = None
 
@@ -209,9 +274,10 @@ class ConceptIndexBuilder:
         to its file and return it.
         """
         matching = matching or self.matchings[0]
+        keys = ", ".join(key_columns(self.arity))
         table = self._builder.write(
-            f"SELECT DISTINCT key, attribute, concept FROM {self._entries[matching]} "
-            f"{INCLUDED} ORDER BY key, attribute, concept",
+            f"SELECT DISTINCT {keys}, attribute, concept FROM {self._entries[matching]} "
+            f"{INCLUDED} ORDER BY {keys}, attribute, concept",
             prefix="index-",
         )
         # The number of entries and of row groups is read from the footer of
@@ -230,6 +296,7 @@ class ConceptIndexBuilder:
             size               = size,
             concept_count      = concept_count,
             row_groups         = max(row_groups, 1),
+            arity              = self.arity,
         )
 
 

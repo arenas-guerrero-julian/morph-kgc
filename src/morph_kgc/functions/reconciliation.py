@@ -76,6 +76,13 @@ matched by::
             rml:inputValueMap [ rml:reference "clinical_trial_id" ]
         ] .
 
+An entity only several values identify together, such as a code within a
+coding system, is matched by all of them: the query projects
+``?matching_value_2`` and so on, and the execution binds as many values,
+matched to the variables by position: ``grel:valueParam1`` (or
+``grel:valueParam``), ``grel:valueParam2``... The values are compared one by
+one, never joined into a string.
+
 Its configuration file only declares the endpoints that need credentials or
 other access options, in a ``[RESOURCE:<name>]`` section whose ``url`` is the
 endpoint.
@@ -148,9 +155,14 @@ from ..reconciliation.index import (
     parse_matching,
 )
 from .bif_decorator import stateful_bif
-from .param_resolver import MergedAliases
+from .param_resolver import MergedAliases, NumberedParameter
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
+
+# The values to reconcile, matched by position to the values an entity is
+# matched by: grel:valueParam1 (or grel:valueParam), grel:valueParam2... under
+# either GREL spelling.
+VALUE_PARAMETERS = NumberedParameter((GREL_VALUE_PARAM, GREL_VALUE_PARAMETER))
 
 # How a reconciled value is reported: one matching no entity, and one matching
 # several.
@@ -270,6 +282,50 @@ def _resource_ambiguity(initialization, resource) -> str:
     return ambiguity
 
 
+def _value_count(initialization, execution) -> int:
+    """
+    The number of values *execution* reconciles, which it binds, by position,
+    to the value parameters: each exactly once, numbered from 1 without gaps.
+    """
+    positions = {
+        position: [
+            parameter_iri
+            for parameter_iri in parameter_iris
+            for _ in range(execution.bindings.get(parameter_iri, 0))
+        ]
+        for position, parameter_iris in VALUE_PARAMETERS.bound_positions(execution.bindings).items()
+    }
+    execution_name = (
+        f"Execution '{execution.execution_id}' of function '{initialization.function_iri}'"
+    )
+    if not positions:
+        raise ValueError(
+            f"{execution_name} binds no value to reconcile. Bind it to "
+            f"'{GREL_VALUE_PARAM}'."
+        )
+
+    for position, parameter_iris in sorted(positions.items()):
+        if len(parameter_iris) > 1:
+            raise ValueError(
+                f"{execution_name} binds value {position} to reconcile "
+                f"{len(parameter_iris)} times, to "
+                f"{', '.join(sorted(set(parameter_iris)))}. Bind it once: the "
+                "values to reconcile are told apart by their position, as RDF "
+                "puts no order on the inputs of an execution."
+            )
+
+    count = max(positions)
+    missing = [position for position in range(1, count + 1) if position not in positions]
+    if missing:
+        raise ValueError(
+            f"{execution_name} binds value(s) {', '.join(map(str, sorted(positions)))} "
+            f"to reconcile but not {', '.join(map(str, missing))}. The values are "
+            f"numbered from 1, without gaps: '{GREL_VALUE_PARAM}1' (or "
+            f"'{GREL_VALUE_PARAM}'), '{GREL_VALUE_PARAM}2', and so on."
+        )
+    return count
+
+
 def _row_ambiguity(ambiguity, default) -> str:
     """
     The policy for the ambiguous values of a row: the one the execution
@@ -347,6 +403,14 @@ def _initialize_vocabulary(initialization) -> ReconciliationContext:
     # A mistake in how an execution matches values, or in what it reconciles
     # an ambiguous value to, is reported before any vocabulary is downloaded.
     for execution in initialization.executions:
+        values = _value_count(initialization, execution)
+        if values > 1:
+            raise ValueError(
+                f"Execution '{execution.execution_id}' of function "
+                f"'{initialization.function_iri}' binds {values} values to "
+                "reconcile, but the concepts of a vocabulary are matched by a "
+                f"single value. Bind '{GREL_VALUE_PARAM}' only."
+            )
         _matching(initialization, execution)
         _ambiguity(initialization, execution)
 
@@ -447,7 +511,7 @@ def _reconcile_rows(context, values, groups, lookup) -> list:
     fun_id      = MORPH_RECONCILE_VOCABULARY_CONCEPT,
     initializer = _initialize_vocabulary,
     vectorized  = True,
-    value       = (GREL_VALUE_PARAM, GREL_VALUE_PARAMETER),
+    value       = VALUE_PARAMETERS,
     resource    = MORPH_RESOURCE_PARAMETERS,
     attribute   = MergedAliases(MORPH_ATTRIBUTE_PARAMETERS),
     matching    = MORPH_FN_MATCHING,
@@ -457,6 +521,8 @@ def reconcile_vocabulary_concept(
     context, value, resource=None, attribute=None, matching=None, ambiguity=None,
 ):
     """Reconcile each of *value* against a SKOS vocabulary fetched from a URL."""
+    # The single value of each row, which the initializer has checked.
+    value       = [row_values[0] for row_values in value]
     resources   = _per_row(resource, len(value))
     attributes  = _per_row(attribute, len(value))
     # A single constant, which the initializer has checked, in any case.
@@ -571,23 +637,38 @@ def _initialize_sparql(initialization) -> QueryContext:
     # A mistake in an execution, or in the resource declaring an endpoint, is
     # reported before any query is sent.
     context = QueryContext()
+    # (endpoint, query) -> the resource declaring the endpoint, and the number
+    # of values the executions sending the query reconcile, with the first of them
     queries = {}
     for execution in initialization.executions:
         endpoint = _constant(initialization, execution, MORPH_FN_SPARQL_ENDPOINT_URL)
         query    = _constant(initialization, execution, MORPH_FN_SPARQL_QUERY)
+        values   = _value_count(initialization, execution)
         _ambiguity(initialization, execution)
 
         if (endpoint, query) not in queries:
             resource = _endpoint_resource(initialization, endpoint)
             context.ambiguities[endpoint] = _resource_ambiguity(initialization, resource)
-            queries[(endpoint, query)] = resource
+            queries[(endpoint, query)] = (resource, values, execution.execution_id)
+            continue
 
-    for (endpoint, query), resource in queries.items():
+        _, other_values, other = queries[(endpoint, query)]
+        if values != other_values:
+            raise ValueError(
+                f"Executions '{other}' and '{execution.execution_id}' of function "
+                f"'{initialization.function_iri}' send the same query to "
+                f"'{endpoint}', but reconcile {other_values} and {values} values "
+                "with it. A query matches entities by as many values as the "
+                f"?{sparql.MATCHING_VARIABLE_PREFIX}<i> variables it projects."
+            )
+
+    for (endpoint, query), (resource, values, _) in queries.items():
         context.indexes[(endpoint, query)] = sparql.build_index(
             resource,
             query,
             state_dir    = initialization.state_dir,
             memory_limit = initialization.memory_limit,
+            arity        = values,
         )
 
     return context
@@ -597,15 +678,19 @@ def _initialize_sparql(initialization) -> QueryContext:
     fun_id      = MORPH_RECONCILE_ENTITY_OVER_SPARQL,
     initializer = _initialize_sparql,
     vectorized  = True,
-    value       = (GREL_VALUE_PARAM, GREL_VALUE_PARAMETER),
+    value       = VALUE_PARAMETERS,
     endpoint    = MORPH_FN_SPARQL_ENDPOINT_URL,
     query       = MORPH_FN_SPARQL_QUERY,
     ambiguity   = MORPH_FN_AMBIGUITY,
 )
 def reconcile_entity_over_sparql(context, value, endpoint=None, query=None, ambiguity=None):
-    """Reconcile each of *value* against the entities a SPARQL query returns."""
+    """
+    Reconcile each of *value* against the entities a SPARQL query returns: the
+    value of each row, or the tuple of its values, when it binds several.
+    """
     # Every execution bound a single constant endpoint and query, which the
     # initializer has indexed, and at most one policy, which it has checked.
+    value       = [row_values[0] if len(row_values) == 1 else row_values for row_values in value]
     endpoints   = _per_row(endpoint, len(value))
     queries     = _per_row(query, len(value))
     ambiguities = _per_row(ambiguity, len(value))
