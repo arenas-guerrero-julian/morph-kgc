@@ -2888,9 +2888,8 @@ MATCHED_TERMS = {
 
 def test_normalize_by_matching():
     """
-    LOWERCASE lower-cases each character as Lucene's LowerCaseFilter does, and
-    does nothing else; CASE-INSENSITIVE normalizes Unicode, collapses
-    whitespace and case-folds.
+    LOWERCASE lower-cases with str.lower(), and does nothing else;
+    CASE-INSENSITIVE normalizes Unicode, collapses whitespace and case-folds.
     """
     from morph_kgc.reconciliation.index import normalize
 
@@ -2900,9 +2899,9 @@ def test_normalize_by_matching():
     assert lowercase('Café ') == lowercase('café ') == 'café '
     assert lowercase('Café ') not in (lowercase('cafe'), lowercase('Café'), lowercase('café '))
     assert lowercase('Straße') == 'straße' != lowercase('strasse')
-    # Where str.lower() and Java's Character.toLowerCase(int) differ, as Lucene.
-    assert lowercase('İSTANBUL') == 'istanbul'
-    assert lowercase('ΟΔΟΣ ΣΟΦΙΑΣ') == 'οδοσ σοφιασ'
+    # As str.lower(), which Lucene's LowerCaseFilter differs from for these two.
+    assert lowercase('İSTANBUL') == 'i\u0307stanbul'
+    assert lowercase('ΟΔΟΣ ΣΟΦΙΑΣ') == 'οδος σοφιας'
     assert lowercase(' Ⅻ  ﬁ\t') == ' ⅻ  ﬁ\t'
 
     def case_insensitive(value):
@@ -2910,8 +2909,8 @@ def test_normalize_by_matching():
 
     assert case_insensitive('Café ') == case_insensitive('café  ') == 'café'
     assert case_insensitive('Straße') == case_insensitive('STRASSE') == 'strasse'
-    # Case-folding keeps the dot of 'İ', which lower-casing as Lucene drops.
-    assert case_insensitive('İSTANBUL') != case_insensitive('istanbul')
+    # Values LOWERCASE matches, it matches as well.
+    assert case_insensitive('İSTANBUL') == case_insensitive('i\u0307stanbul')
 
     assert normalize('Café ', 'EXACT') == 'Café '
 

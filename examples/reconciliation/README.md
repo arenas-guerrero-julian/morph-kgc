@@ -111,13 +111,12 @@ compared. In the examples below, the value `Café␠` ends with a space, which
 | `LOWERCASE` | lower-cased, and nothing else: no whitespace is trimmed or collapsed, and no Unicode normalization is applied. | `café␠`, `CAFÉ␠`; not `Café` (no space), `cafe`, `café␠␠` (two spaces) or `café␠` decomposed (NFD) | `straße`; not `strasse` |
 | `CASE-INSENSITIVE` | normalized (NFKC), with their whitespace collapsed, and case-folded. | `café␠`, `Café` (no space), `café␠␠` (two spaces), `café␠` decomposed (NFD)...; not `cafe` | `strasse`, `STRASSE`, `straße` |
 
-`LOWERCASE` matches as a Lucene index analyzing the values with
-`KeywordTokenizer` and `LowerCaseFilter` does, which lower-cases each character
-on its own: as Python's `str.lower()` does, but for `İ`, lower-cased to `i`,
-and a final `Σ`, to `σ`. `CASE-INSENSITIVE` matches more, which may turn a
-value matching a single concept into an ambiguous one, with one exception:
-case-folding turns `İ` into `i` followed by a combining dot above, so that it
-matches neither `i` nor `I`, which `LOWERCASE` matches it to.
+`LOWERCASE` lower-cases values with Python's `str.lower()`, which matches as a
+Lucene index analyzing them with `KeywordTokenizer` and `LowerCaseFilter` does,
+but for two characters: `LowerCaseFilter` lower-cases `İ` as `i`, where
+`str.lower()` gives `i` followed by a combining dot above, and a final `Σ` as
+`σ`, where `str.lower()` gives `ς`. `CASE-INSENSITIVE` matches more, which may
+turn a value matching a single concept into an ambiguous one.
 
 ## Ambiguous values
 

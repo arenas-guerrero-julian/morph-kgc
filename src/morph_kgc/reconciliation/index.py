@@ -31,21 +31,15 @@ from ..functions.tables import ParquetTable, TableBuilder, sql_string
 
 # Matching strategies, which an execution chooses with the matching parameter:
 # - EXACT: values are compared as they are.
-# - LOWERCASE: values are compared once lower-cased, and nothing else, as by a
-#   Lucene index analyzing them with KeywordTokenizer and LowerCaseFilter.
+# - LOWERCASE: values are compared once lower-cased by str.lower(), and nothing
+#   else, as by a Lucene index analyzing them with KeywordTokenizer and
+#   LowerCaseFilter (which lower-cases 'İ' as 'i', and a final 'Σ' as 'σ').
 # - CASE-INSENSITIVE: values are compared once normalized (NFKC), with their
 #   whitespace collapsed, and case-folded (so that 'ß' matches 'ss').
 EXACT_MATCHING = "EXACT"
 LOWERCASE_MATCHING = "LOWERCASE"
 CASE_INSENSITIVE_MATCHING = "CASE-INSENSITIVE"
 VALID_MATCHINGS = {EXACT_MATCHING, LOWERCASE_MATCHING, CASE_INSENSITIVE_MATCHING}
-
-# The characters str.lower() lower-cases otherwise than Java's
-# Character.toLowerCase(int), which Lucene's LowerCaseFilter applies to each
-# character on its own: 'İ', which str.lower() turns into 'i' and a combining
-# dot above, and 'Σ', which str.lower() turns into 'ς' at the end of a word.
-# Every other character is lower-cased alike.
-_LUCENE_LOWER = {"\u0130": "i", "\u03a3": "\u03c3"}
 
 # Policies for a value matching several concepts, which an execution chooses
 # with the ambiguity parameter, and the 'ambiguity' option of a resource sets
@@ -95,23 +89,13 @@ def parse_ambiguity(value) -> str | None:
     return ambiguity if ambiguity in VALID_AMBIGUITIES else None
 
 
-def lowercase(value: str) -> str:
-    """
-    Lower-case *value* as Lucene's LowerCaseFilter does: each character on its
-    own, by its simple Unicode mapping, which is what str.lower() does but for
-    'İ' and a final 'Σ'. No whitespace is trimmed or collapsed, and no Unicode
-    normalization is applied.
-    """
-    if not any(character in value for character in _LUCENE_LOWER):
-        return value.lower()
-    return "".join(_LUCENE_LOWER.get(character) or character.lower() for character in value)
-
-
 def normalize(value, matching: str) -> str:
     """Normalize a value to the key it is indexed and looked up under."""
     value = str(value)
     if matching == LOWERCASE_MATCHING:
-        value = lowercase(value)
+        # Nothing but lower-casing: no whitespace trimmed or collapsed, and no
+        # Unicode normalization.
+        value = value.lower()
     elif matching == CASE_INSENSITIVE_MATCHING:
         # NFKC keeps compatibility characters from missing an obvious match.
         value = unicodedata.normalize("NFKC", value)
