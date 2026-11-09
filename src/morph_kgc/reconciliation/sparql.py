@@ -50,9 +50,10 @@ the same memory. An answer in JSON is only read as a stream when it gives its
 head first, as most stores write it, and when every term in it is well formed;
 otherwise it is read whole into memory, with a warning. Whether its patterns
 read the named graphs of the endpoint is up to the query, since stores differ on
-whether their default graph includes them. Values are matched exactly; a query
-may normalize the values it returns (``LCASE``), and the mapping the values it
-reconciles, to match otherwise.
+whether their default graph includes them. Values are matched as the
+execution says, exactly by default (see ``morph-fn:matching``): the answer is
+indexed once for every way of matching values of the executions sending the
+query, which is sent once.
 
 How the endpoint is accessed is declared in the configuration file, only when
 its URL is not enough: a ``[RESOURCE:<name>]`` section whose ``url`` (or
@@ -79,7 +80,7 @@ import pyoxigraph
 from .._version import __version__
 from ..constants import GREL_VALUE_PARAM, LOGGING_NAMESPACE
 from ..http import Download, download
-from .index import ConceptIndex, ConceptIndexBuilder
+from .index import EXACT_MATCHING, ConceptIndex, ConceptIndexBuilder
 
 LOGGER = logging.getLogger(LOGGING_NAMESPACE)
 
@@ -442,10 +443,15 @@ _BIND_VALUES = (
 )
 
 
-def _index_solutions(solutions, state_dir: str, memory_limit: str, arity: int = 1):
-    """The index of *solutions*, and how many bound ?entity_iri to no IRI."""
+def _index_solutions(
+    solutions, state_dir: str, memory_limit: str, arity: int = 1, matchings=(EXACT_MATCHING,),
+):
+    """
+    The index of *solutions* for each of *matchings*, by matching, and how many
+    bound ?entity_iri to no IRI.
+    """
     not_iris = 0
-    with ConceptIndexBuilder(state_dir, memory_limit, arity=arity) as builder:
+    with ConceptIndexBuilder(state_dir, memory_limit, *matchings, arity=arity) as builder:
         for entity, values in solutions:
             # Unbound in this solution, e.g. by an OPTIONAL pattern: an entity
             # is only matched by all its values.
@@ -458,16 +464,24 @@ def _index_solutions(solutions, state_dir: str, memory_limit: str, arity: int = 
             # The answer says nothing of attributes: the values are indexed
             # under a single, unnamed one.
             matched = values[0][1] if arity == 1 else tuple(value[1] for value in values)
-            builder.add("", matched, entity[1])
-        return builder.build(), not_iris
+            for matching in matchings:
+                builder.add("", matched, entity[1], matching)
+        return {matching: builder.build(matching=matching) for matching in matchings}, not_iris
 
 
 def build_index(
-    resource, query: str, *, state_dir: str, memory_limit: str, arity: int = 1,
-) -> ConceptIndex:
+    resource,
+    query: str,
+    *,
+    state_dir: str,
+    memory_limit: str,
+    arity: int = 1,
+    matchings=(EXACT_MATCHING,),
+) -> dict[str, ConceptIndex]:
     """
     Build the index of *query* sent to the endpoint of *resource*, in
-    *state_dir*, matching entities by the *arity* values the mapping binds.
+    *state_dir*, for each of *matchings*, by matching, matching entities by the
+    *arity* values the mapping binds. The query is sent once for all of them.
     """
     endpoint = resource.get_url()
     answer = run_query(resource, query, state_dir)
@@ -477,11 +491,15 @@ def build_index(
             check_variables(endpoint, variables, arity)
 
         try:
-            index, not_iris = _index_solutions(solutions, state_dir, memory_limit, arity)
+            indexes, not_iris = _index_solutions(
+                solutions, state_dir, memory_limit, arity, matchings,
+            )
         except _StreamingError as exc:
             # Indexed anew from the start, by a new builder.
             _, solutions = _read_json_solutions(endpoint, answer, exc, arity)
-            index, not_iris = _index_solutions(solutions, state_dir, memory_limit, arity)
+            indexes, not_iris = _index_solutions(
+                solutions, state_dir, memory_limit, arity, matchings,
+            )
     finally:
         answer.remove()
 
@@ -492,12 +510,13 @@ def build_index(
             "left out."
         )
 
-    if index.concept_count:
-        by = "value(s)" if arity == 1 else f"tuple(s) of {arity} values"
-        LOGGER.info(
-            f"SPARQL endpoint '{endpoint}': indexed {index.concept_count} "
-            f"entity(ies) by {len(index)} {by}."
-        )
+    by = "value(s)" if arity == 1 else f"tuple(s) of {arity} values"
+    if any(index.concept_count for index in indexes.values()):
+        for matching, index in indexes.items():
+            LOGGER.info(
+                f"SPARQL endpoint '{endpoint}': indexed {index.concept_count} "
+                f"entity(ies) by {len(index)} {by}, for {matching.lower()} matching."
+            )
     else:
         hint = ""
         if "GRAPH" not in query.upper():
@@ -511,4 +530,4 @@ def build_index(
             f"value will be reconciled against it.{hint}"
         )
 
-    return index
+    return indexes

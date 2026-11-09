@@ -68,9 +68,13 @@ To match a value against several properties, bind all of them to
 `?g`, are ignored. A query that does not project both `?entity_iri` and
 `?matching_value_1` fails instead of reconciling nothing.
 
-Values are matched exactly. To match them whatever their case, normalize both
-sides in the mapping: `BIND(LCASE(STR(?identifier)) AS ?matching_value_1)` in
-the query, and a nested `grel:toLowerCase` execution as `grel:valueParam`.
+Values are matched exactly, unless the execution binds `morph-fn:matching` to
+another way of matching them, as against a vocabulary: `LOWERCASE` (lower-cased,
+and nothing else, as a Lucene index of keywords) or `CASE-INSENSITIVE`
+(normalized, with their whitespace collapsed, and case-folded), described in
+[`../reconciliation`](../reconciliation/README.md#ways-of-matching-values).
+Executions matching the answer to the same query differently share it: the
+query is sent once.
 
 Declare the prefixes the query uses: an endpoint is not bound to know `schema:`
 or any other prefix.
@@ -122,10 +126,10 @@ on (`grel:valueParameter1`, `grel:valueParameter2`... are accepted as well):
 ```
 
 A row is reconciled with the entities matched by all its values. They are
-compared one by one, exactly, as each is indexed in a column of its own: never
-joined into a string, so values holding `,`, `|` or whitespace match as they
-are, and the code `A|1` of `ICD-10` is not mistaken for the code `A` of
-`1|ICD-10`. A value may be a constant, such as the coding system of every row.
+compared one by one, each as `morph-fn:matching` says (exactly, by default), as
+each is indexed in a column of its own: never joined into a string, so values
+holding `,` or `|` are not split, and the code `A|1` of `ICD-10` is not
+mistaken for the code `A` of `1|ICD-10`. A value may be a constant, such as the coding system of every row.
 An entity a solution leaves a value unbound for is matched by no row.
 
 The query must project as many `?matching_value_<i>` as the execution binds
@@ -191,6 +195,7 @@ all.
 | `grel:valueParam2`, ... | the other values to reconcile, matched against `?matching_value_2`, ... See [Entities matched by several values](#entities-matched-by-several-values). |
 | `morph-fn:sparqlEndpointUrl` | the URL of the SPARQL endpoint the query is sent to. |
 | `morph-fn:sparqlQuery` | the SELECT query returning `?entity_iri` and `?matching_value_1` (and `?matching_value_2`, ...). |
+| `morph-fn:matching` | how the value is matched: `EXACT` (default), `LOWERCASE` or `CASE-INSENSITIVE`. A constant. |
 | `morph-fn:ambiguity` | what a value matching several entities is reconciled to: `ALL` (default), `NONE` or `FAIL`. A constant, overriding the `ambiguity` option of the resource declaring the endpoint. |
 
 The endpoint and the query are constants of the mapping, since they are sent

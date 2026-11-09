@@ -38,8 +38,9 @@ MORPH_FN_VOCABULARY_IRI = f"{MORPH_FUNCTION_NAMESPACE}vocabularyIRI"
 # Vocabulary property (or properties) the value is matched against.
 MORPH_FN_ATTRIBUTE_IRI  = f"{MORPH_FUNCTION_NAMESPACE}attributeIRI"
 GREL_ATTRIBUTE_IRI      = f"{GREL_NAMESPACE}attributeIRI"
-# How the value is matched against the vocabulary: EXACT (the default) or
-# CASE-INSENSITIVE. A constant: the vocabulary is indexed before any data is read.
+# How the value is matched against the vocabulary or the answer to a SPARQL
+# query: EXACT (the default), LOWERCASE or CASE-INSENSITIVE. A constant: what
+# the value is matched against is indexed before any data is read.
 MORPH_FN_MATCHING       = f"{MORPH_FUNCTION_NAMESPACE}matching"
 # What a value matching several entities is reconciled to: ALL of them (the
 # default), NONE, or FAIL to abort the run. A constant; the 'ambiguity' option

@@ -29,6 +29,7 @@ The other endpoints answer in JSON with the head first, as most stores do.
 says it does but does not, ``/vocabulary.multi-gz`` serves it gzipped in two
 members, as concatenated gzip files are, and ``/vocabulary.cut`` closes the
 connection halfway through it. ``/export|vocabulary`` has a URL that is no IRI.
+``/matching-vocabulary`` serves ``matching_vocabulary.ttl``.
 """
 
 import gzip
@@ -57,6 +58,7 @@ VOCABULARY_FILES = {
     '/vocabulary.multi-gz': ('disease_vocabulary.ttl', 'text/turtle'),
     '/vocabulary.cut': ('disease_vocabulary.ttl', 'text/turtle'),
     '/export|vocabulary': ('disease_vocabulary.ttl', 'text/turtle'),
+    '/matching-vocabulary': ('matching_vocabulary.ttl', 'text/turtle'),
 }
 
 
