@@ -1526,12 +1526,15 @@ def test_reconcile_entity_over_sparql_from_yarrrml():
         r'but the mapping reconciles 1 value\(s\) with it\.',
     ),
 ])
-def test_query_projecting_other_variables(tmp_path, query, error):
+# The reader of an answer in XML holds it open, which is closed before the
+# answer is removed, as Windows requires.
+@pytest.mark.parametrize('path', ['/public/sparql', '/public/sparql/xml'])
+def test_query_projecting_other_variables(tmp_path, query, error, path):
     """A query not following the variable convention fails instead of matching nothing."""
     with VocabularyServer() as server:
         mapping = sparql_mapping(
             tmp_path,
-            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (MAPPING_ENDPOINT, f'{server.url}{path}'),
             (STUDIES_QUERY, query),
         )
         with pytest.raises(ValueError, match=error):
@@ -1613,15 +1616,16 @@ def test_endpoint_rejecting_the_query(tmp_path):
             morph_kgc.materialize(sparql_config(mapping=mapping))
 
 
-def test_query_that_is_not_a_select_query(tmp_path):
+@pytest.mark.parametrize('path', ['/public/sparql', '/public/sparql/xml'])
+def test_query_that_is_not_a_select_query(tmp_path, path):
     """The answer to a query other than a SELECT query is not taken for one."""
     with VocabularyServer() as server:
         mapping = sparql_mapping(
             tmp_path,
-            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (MAPPING_ENDPOINT, f'{server.url}{path}'),
             (STUDIES_QUERY, 'ASK { GRAPH ?g { ?s ?p ?o } }'),
         )
-        with pytest.raises(ValueError, match='must be a SELECT query'):
+        with pytest.raises(ValueError, match='ASK query.*must be a SELECT query'):
             morph_kgc.materialize(sparql_config(mapping=mapping))
 
 
@@ -1669,6 +1673,73 @@ def test_answers_in_other_shapes(tmp_path, caplog, variant, warning):
         assert warning in caplog.text
     else:
         assert 'memory' not in caplog.text
+
+
+# An answer in XML binding ?matching_value_1 to {term}, as stores write them.
+XML_ANSWER = (
+    '<?xml version="1.0" encoding="utf-8"?>\n'
+    '<sparql xmlns="http://www.w3.org/2005/sparql-results#">\n'
+    '  <head>\n'
+    '    <variable name="entity_iri"/>\n'
+    '    <variable name="matching_value_1"/>\n'
+    '  </head>\n'
+    '  <results>\n'
+    '    <result>\n'
+    '      <binding name="entity_iri"><uri>https://data.com/id/10</uri></binding>\n'
+    '      <binding name="matching_value_1">{term}</binding>\n'
+    '    </result>\n'
+    '  </results>\n'
+    '</sparql>\n'
+)
+
+
+def read_xml_answer(tmp_path, answer):
+    """The variables and the solutions read from *answer*, served as XML."""
+    from morph_kgc.http import Download
+    from morph_kgc.reconciliation.sparql import read_solutions
+
+    path = tmp_path / 'answer.xml'
+    path.write_text(answer, encoding='utf-8')
+    variables, solutions = read_solutions(
+        'https://example.org/sparql', Download(str(path), 'application/sparql-results+xml'),
+    )
+    return variables, list(solutions)
+
+
+@pytest.mark.parametrize('term, expected', [
+    ('<literal> C,SNOMED CT</literal>', ('literal', ' C,SNOMED CT')),
+    ('<literal>SNOMED CT </literal>', ('literal', 'SNOMED CT ')),
+    ('<literal xml:lang="en">\n\tSNOMED CT\n</literal>', ('literal', '\n\tSNOMED CT\n')),
+    ('<literal>  </literal>', ('literal', '  ')),
+    ('<literal/>', ('literal', '')),
+    ('<literal>&#32;B &amp; C</literal>', ('literal', ' B & C')),
+    ('<literal><![CDATA[ B & C ]]></literal>', ('literal', ' B & C ')),
+    # An IRI cannot hold whitespace, which only its serialization puts around it.
+    ('<uri>\n  https://data.com/id/10\n</uri>', ('uri', 'https://data.com/id/10')),
+    ('', None),
+])
+def test_values_of_answers_in_xml(tmp_path, term, expected):
+    """
+    The text of a literal in an answer in XML is read exactly as written, with
+    the whitespace it starts or ends with, which stores write as is.
+    """
+    variables, solutions = read_xml_answer(tmp_path, XML_ANSWER.format(term=term))
+
+    assert variables == ['entity_iri', 'matching_value_1']
+    assert solutions == [(('uri', 'https://data.com/id/10'), (expected,))]
+
+
+@pytest.mark.parametrize('answer, detail', [
+    ('<html><body>Not Found</body></html>', 'its root element is <html>, not <sparql>'),
+    # Cut short.
+    (XML_ANSWER.format(term='<literal>B</literal>')[:-40], 'unclosed token'),
+    (XML_ANSWER.format(term='<literal>B<b>C</b></literal>'), '<literal> holds the element <b>'),
+    (XML_ANSWER.replace('utf-8', 'x-unknown'), 'unknown encoding'),
+])
+def test_answers_in_xml_that_are_not_sparql_results(tmp_path, answer, detail):
+    """An answer in XML that is not SPARQL results says why."""
+    with pytest.raises(ValueError, match=f'did not answer with SPARQL results.*{re.escape(detail)}'):
+        read_xml_answer(tmp_path, answer)
 
 
 def test_query_too_long_for_a_url(tmp_path):
@@ -2458,23 +2529,22 @@ def test_reconcile_entities_by_two_values():
     assert_isomorphic(expected_sparql_graph('output_sparql_codes.nq'), g_morph)
 
 
-@pytest.mark.parametrize('path, expected', [
-    ('/public/sparql/no-head', DIAGNOSES),
-    ('/public/sparql/results-first', DIAGNOSES),
-    ('/public/sparql/gzip', DIAGNOSES),
-    # The parser of answers in XML trims the whitespace a literal starts with,
-    # unless the endpoint escapes it ('&#32;'), which rdflib does not: the
-    # coding system ' C,SNOMED CT' then reads 'C,SNOMED CT'.
-    ('/public/sparql/xml', DIAGNOSES - {('urn:id:p5', 'https://data.com/id/10')}),
+@pytest.mark.parametrize('path', [
+    '/public/sparql/no-head',
+    '/public/sparql/results-first',
+    '/public/sparql/gzip',
+    # rdflib writes the whitespace the coding system ' C,SNOMED CT' starts with
+    # as is, rather than escaped ('&#32;'), and it is kept.
+    '/public/sparql/xml',
 ])
-def test_reconcile_entities_by_two_values_from_answers_in_other_shapes(tmp_path, path, expected):
+def test_reconcile_entities_by_two_values_from_answers_in_other_shapes(tmp_path, path):
     """Every way of reading an answer reads all the values of its solutions."""
     with VocabularyServer() as server:
         g_morph = morph_kgc.materialize(sparql_config(
             mapping=codes_mapping(tmp_path, server, path=path),
         ))
 
-    assert diagnoses(g_morph) == expected
+    assert diagnoses(g_morph) == DIAGNOSES
 
 
 def test_reconcile_entities_by_two_values_with_multiple_processes():

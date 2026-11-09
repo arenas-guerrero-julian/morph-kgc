@@ -48,7 +48,9 @@ written. Its answer is downloaded to the state directory of the run and read as
 a stream into the index on disk, so that an answer of any size is indexed with
 the same memory. An answer in JSON is only read as a stream when it gives its
 head first, as most stores write it, and when every term in it is well formed;
-otherwise it is read whole into memory, with a warning. Whether its patterns
+otherwise it is read whole into memory, with a warning. An answer in XML, which
+some endpoints send whatever is asked for, is read as a stream too, keeping the
+text of its literals exactly as written, whitespace around it included. Whether its patterns
 read the named graphs of the endpoint is up to the query, since stores differ on
 whether their default graph includes them. Values are matched exactly; a query
 may normalize the values it returns (``LCASE``), and the mapping the values it
@@ -73,6 +75,7 @@ import re
 from http.client import HTTPException
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
+from xml.etree.ElementTree import iterparse
 
 import pyoxigraph
 
@@ -87,6 +90,9 @@ SPARQL_RESULTS_JSON = "application/sparql-results+json"
 
 # The serializations of SPARQL results read as a stream, by content type. JSON
 # is the one asked for; the others are read too, should an endpoint send them.
+# XML is read by the parser of the standard library rather than by pyoxigraph,
+# which trims the whitespace a literal starts or ends with unless the endpoint
+# escapes it ('&#32;'), as rdflib and most stores do not.
 RESULTS_FORMATS = {
     SPARQL_RESULTS_JSON:               pyoxigraph.QueryResultsFormat.JSON,
     "application/json":                pyoxigraph.QueryResultsFormat.JSON,
@@ -225,6 +231,8 @@ def read_solutions(endpoint: str, answer: Download, arity: int = 1):
     """
     json_format = pyoxigraph.QueryResultsFormat.JSON
     results_format = RESULTS_FORMATS.get(answer.content_type, json_format)
+    if results_format == pyoxigraph.QueryResultsFormat.XML:
+        return _read_xml_solutions(endpoint, answer, arity)
     try:
         results = pyoxigraph.parse_query_results(path=answer.path, format=results_format)
     except SyntaxError as exc:
@@ -327,6 +335,110 @@ def _read_json_solutions(endpoint: str, answer: Download, reason, arity: int = 1
     return variables, solutions()
 
 
+def _read_xml_solutions(endpoint: str, answer: Download, arity: int = 1):
+    """
+    The variables the answer in XML of *endpoint* projects, None if it has no
+    head, and a generator of its solutions, which holds the answer open until
+    it is exhausted or closed.
+    """
+    solutions = _parse_xml_solutions(endpoint, answer, arity)
+    # Read up to the results, which the answer to an ASK query does not have.
+    variables = next(solutions)
+    return variables, solutions
+
+
+def _parse_xml_solutions(endpoint: str, answer: Download, arity: int):
+    """
+    Read the answer in XML of *endpoint* as a stream: yield the variables it
+    projects, as soon as its results start, and then each of its solutions,
+    whose elements are forgotten once read so that memory stays flat. Elements
+    are known by their local name, whatever their namespace.
+    """
+    matched = matching_variables(arity)
+    variables = None
+    started = False
+    try:
+        with open(answer.path, "rb") as answer_file:
+            # The depth of the element an event is about, the root being 1, and
+            # the element of the results, while they are read.
+            depth = 0
+            results = None
+            for event, element in iterparse(answer_file, events=("start", "end")):
+                if event == "start":
+                    depth += 1
+                    if depth > 2:
+                        continue
+                    name = _local_name(element.tag)
+                    if depth == 1 and name != "sparql":
+                        raise SyntaxError(f"its root element is <{name}>, not <sparql>")
+                    if depth == 2 and name == "results":
+                        results = element
+                        if not started:
+                            started = True
+                            yield variables
+                    continue
+
+                depth -= 1
+                if depth == 2 and results is not None:
+                    if _local_name(element.tag) == "result":
+                        bindings = {
+                            binding.get("name"): binding
+                            for binding in element
+                            if _local_name(binding.tag) == "binding"
+                        }
+                        yield (
+                            _xml_term(bindings.get(ENTITY_VARIABLE)),
+                            tuple(_xml_term(bindings.get(variable)) for variable in matched),
+                        )
+                    results.remove(element)
+                elif depth == 1:
+                    name = _local_name(element.tag)
+                    if name == "head":
+                        variables = [
+                            variable.get("name")
+                            for variable in element
+                            if _local_name(variable.tag) == "variable"
+                            and variable.get("name") is not None
+                        ]
+                    elif name == "boolean":
+                        raise SyntaxError("it is the answer to an ASK query")
+                    elif name == "results":
+                        results = None
+    except (SyntaxError, ValueError, LookupError) as exc:
+        # Also xml.etree.ElementTree.ParseError, for XML that is not well formed,
+        # and the errors of an encoding the parser cannot decode.
+        raise _not_results(endpoint, answer, exc) from exc
+
+    if not started:
+        # Neither results nor a boolean: no solution.
+        yield variables
+
+
+def _local_name(tag: str) -> str:
+    """The name of an element without its namespace."""
+    return tag.rpartition("}")[2]
+
+
+def _xml_term(binding) -> tuple[str, str | None] | None:
+    """
+    The kind and value of the term a <binding> element binds, None when it
+    binds none. The text of a literal is kept exactly; that of an IRI or a blank
+    node, which cannot hold whitespace, is stripped of any around it.
+    """
+    if binding is None:
+        return None
+    for term in binding:
+        kind = _local_name(term.tag)
+        if kind == "triple":
+            # A triple term has no value of its own to match.
+            return kind, None
+        if len(term):
+            raise SyntaxError(f"<{kind}> holds the element <{_local_name(term[0].tag)}>, not text")
+        value = term.text or ""
+        return kind, value if kind == "literal" else value.strip()
+    return None
+
+
 def _not_results(endpoint: str, answer: Download, detail) -> ValueError:
     return ValueError(
         f"The SPARQL endpoint '{endpoint}' did not answer with SPARQL results "
@@ -425,6 +537,7 @@ def build_index(
     """
     endpoint = resource.get_url()
     answer = run_query(resource, query, state_dir)
+    solutions = None
     try:
         variables, solutions = read_solutions(endpoint, answer, arity)
         if variables is not None:
@@ -437,6 +550,10 @@ def build_index(
             _, solutions = _read_json_solutions(endpoint, answer, exc, arity)
             index, not_iris = _index_solutions(solutions, state_dir, memory_limit, arity)
     finally:
+        # A reader holding the answer open, as that of answers in XML does until
+        # it is exhausted, would keep Windows from removing it.
+        if hasattr(solutions, "close"):
+            solutions.close()
         answer.remove()
 
     if not_iris:
