@@ -68,6 +68,20 @@ To match a value against several properties, bind all of them to
 `?g`, are ignored. A query that does not project both `?entity_iri` and
 `?matching_value_1` fails instead of reconciling nothing.
 
+Values are matched exactly. To match them whatever their case, normalize both
+sides in the mapping: `BIND(LCASE(STR(?identifier)) AS ?matching_value_1)` in
+the query, and a nested `grel:toLowerCase` execution as `grel:valueParam`.
+
+Declare the prefixes the query uses: an endpoint is not bound to know `schema:`
+or any other prefix.
+
+Since each reconciliation brings its own query, a mapping reconciles as many
+kinds of entities, against as many endpoints, as it needs: one execution per
+query, and the same query sent to the same endpoint by several executions is
+sent once. When the reconciled entity is the object of a triple, give its object
+map `rml:termType rml:IRI`, since an object map whose
+value is the result of a function generates literals by default.
+
 ### Entities matched by several values
 
 An entity that only several values identify together, such as a code within a
@@ -117,21 +131,10 @@ An entity a solution leaves a value unbound for is matched by no row.
 The query must project as many `?matching_value_<i>` as the execution binds
 values, numbered from 1 without gaps, and the execution must bind each value
 once. Otherwise the run fails: before the query is sent when the execution is
-at fault, and as soon as it is answered when the query is.
-
-Values are matched exactly. To match them whatever their case, normalize both
-sides in the mapping: `BIND(LCASE(STR(?identifier)) AS ?matching_value_1)` in
-the query, and a nested `grel:toLowerCase` execution as `grel:valueParam`.
-
-Declare the prefixes the query uses: an endpoint is not bound to know `schema:`
-or any other prefix.
-
-Since each reconciliation brings its own query, a mapping reconciles as many
-kinds of entities, against as many endpoints, as it needs: one execution per
-query, and the same query sent to the same endpoint by several executions is
-sent once. When the reconciled entity is the object of a triple, give its object
-map `rml:termType rml:IRI`, since an object map whose
-value is the result of a function generates literals by default.
+at fault, and as soon as it is answered when the query is. An endpoint that
+leaves the head out of its answer does not say which variables the query
+projects: a value its solutions never bind then matches nothing, and the query
+is reported as returning no entity.
 
 ### Named graphs
 

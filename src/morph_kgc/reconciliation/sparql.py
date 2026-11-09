@@ -102,6 +102,8 @@ ENTITY_VARIABLE   = "entity_iri"
 MATCHING_VARIABLE_PREFIX = "matching_value_"
 MATCHING_VARIABLE = f"{MATCHING_VARIABLE_PREFIX}1"
 MATCHING_VARIABLES = re.compile(rf"{MATCHING_VARIABLE_PREFIX}(\d+)")
+# Those numbered as positions are: from 1, without leading zeros.
+POSITIONED_VARIABLES = re.compile(rf"{MATCHING_VARIABLE_PREFIX}([1-9][0-9]*)")
 
 VALID_METHODS = {"GET", "POST"}
 
@@ -317,6 +319,25 @@ def _read_json_solutions(endpoint: str, answer: Download, reason, arity: int = 1
 
     matched = matching_variables(arity)
 
+    if variables is None:
+        # Without a head, the bindings speak for the projection: a value the
+        # query matches entities by, but the mapping does not reconcile any
+        # value with, would otherwise be left out unnoticed, matching rows by
+        # some of the values of entities only.
+        unmatched = sorted(
+            variable
+            for variable in {key for binding in bindings if isinstance(binding, dict) for key in binding}
+            if MATCHING_VARIABLES.fullmatch(variable) and variable not in matched
+        )
+        if unmatched:
+            raise ValueError(
+                f"The answer of the SPARQL endpoint '{endpoint}' binds "
+                f"{' '.join(f'?{variable}' for variable in unmatched)}, so its query "
+                f"matches entities by values the mapping does not reconcile: it "
+                f"reconciles {arity} value(s) with it, "
+                f"{' '.join(f'?{variable}' for variable in matched)}. {_BIND_VALUES}"
+            )
+
     def solutions():
         for binding in bindings:
             yield (
@@ -371,29 +392,54 @@ def check_variables(endpoint: str, variables, arity: int = 1) -> None:
     numbered = [
         variable for variable in variables if MATCHING_VARIABLES.fullmatch(variable)
     ]
-    expected = matching_variables(len(numbered))
-    if sorted(numbered) != sorted(expected):
-        unexpected = [variable for variable in numbered if variable not in expected]
+    misnumbered = [
+        variable for variable in numbered if not POSITIONED_VARIABLES.fullmatch(variable)
+    ]
+    if misnumbered:
         raise ValueError(
             f"The SPARQL query sent to '{endpoint}' projects "
-            f"{' '.join(f'?{variable}' for variable in unexpected)}, but the "
-            f"values an entity is matched by are projected as "
+            f"{' '.join(f'?{variable}' for variable in misnumbered)}, which is not "
+            "numbered as the values an entity is matched by are: "
             f"{', '.join(f'?{variable}' for variable in matching_variables(3))}... "
-            "numbered from 1, without gaps or leading zeros. It projects: "
-            f"{projected}."
+            f"from 1, without leading zeros. It projects: {projected}."
+        )
+
+    positions = sorted(
+        int(POSITIONED_VARIABLES.fullmatch(variable).group(1)) for variable in numbered
+    )
+    gap = next(
+        (number for number, position in enumerate(positions, 1) if number != position), None,
+    )
+    if gap is not None:
+        raise ValueError(
+            f"The SPARQL query sent to '{endpoint}' projects "
+            f"?{MATCHING_VARIABLE_PREFIX}{positions[-1]} but not "
+            f"?{MATCHING_VARIABLE_PREFIX}{gap}: the values an entity is matched by "
+            f"are numbered from 1, without gaps. It projects: {projected}."
         )
 
     if len(numbered) != arity:
+        alternatives = ""
+        if arity == 1:
+            alternatives = (
+                " To match a value against any of several properties instead, bind "
+                f"them all to ?{MATCHING_VARIABLE}, e.g. with a UNION."
+            )
         raise ValueError(
             f"The SPARQL query sent to '{endpoint}' matches entities by "
             f"{len(numbered)} value(s), "
-            f"{' '.join(f'?{variable}' for variable in expected)}, but the "
-            f"mapping reconciles {arity} value(s) with it. Bind one value to "
-            "reconcile per variable, matched by position: "
-            f"'{GREL_VALUE_PARAM}1' (or '{GREL_VALUE_PARAM}') to "
-            f"?{MATCHING_VARIABLE}, '{GREL_VALUE_PARAM}2' to "
-            f"?{MATCHING_VARIABLE_PREFIX}2, and so on."
+            f"{' '.join(f'?{variable}' for variable in matching_variables(len(numbered)))}, "
+            f"but the mapping reconciles {arity} value(s) with it. "
+            f"{_BIND_VALUES}{alternatives}"
         )
+
+
+# How the values to reconcile are bound to the variables of the query.
+_BIND_VALUES = (
+    "Bind one value to reconcile per variable, matched by position: "
+    f"'{GREL_VALUE_PARAM}1' (or '{GREL_VALUE_PARAM}') to ?{MATCHING_VARIABLE}, "
+    f"'{GREL_VALUE_PARAM}2' to ?{MATCHING_VARIABLE_PREFIX}2, and so on."
+)
 
 
 def _index_solutions(solutions, state_dir: str, memory_limit: str, arity: int = 1):

@@ -76,16 +76,16 @@ matched by::
             rml:inputValueMap [ rml:reference "clinical_trial_id" ]
         ] .
 
+Its configuration file only declares the endpoints that need credentials or
+other access options, in a ``[RESOURCE:<name>]`` section whose ``url`` is the
+endpoint.
+
 An entity only several values identify together, such as a code within a
 coding system, is matched by all of them: the query projects
 ``?matching_value_2`` and so on, and the execution binds as many values,
 matched to the variables by position: ``grel:valueParam1`` (or
 ``grel:valueParam``), ``grel:valueParam2``... The values are compared one by
 one, never joined into a string.
-
-Its configuration file only declares the endpoints that need credentials or
-other access options, in a ``[RESOURCE:<name>]`` section whose ``url`` is the
-endpoint.
 
 A function returns the IRI of the matched entity, and ``None`` when the value
 matches none (the triple is then not generated). A value matching several
@@ -309,19 +309,19 @@ def _value_count(initialization, execution) -> int:
             raise ValueError(
                 f"{execution_name} binds value {position} to reconcile "
                 f"{len(parameter_iris)} times, to "
-                f"{', '.join(sorted(set(parameter_iris)))}. Bind it once: the "
+                f"{', '.join(repr(iri) for iri in sorted(set(parameter_iris)))}. Bind it once: the "
                 "values to reconcile are told apart by their position, as RDF "
                 "puts no order on the inputs of an execution."
             )
 
     count = max(positions)
-    missing = [position for position in range(1, count + 1) if position not in positions]
-    if missing:
+    if len(positions) != count:
+        gap = next(position for position in range(1, count + 1) if position not in positions)
         raise ValueError(
-            f"{execution_name} binds value(s) {', '.join(map(str, sorted(positions)))} "
-            f"to reconcile but not {', '.join(map(str, missing))}. The values are "
-            f"numbered from 1, without gaps: '{GREL_VALUE_PARAM}1' (or "
-            f"'{GREL_VALUE_PARAM}'), '{GREL_VALUE_PARAM}2', and so on."
+            f"{execution_name} binds value {count} to reconcile but not value "
+            f"{gap}. The values are numbered from 1, without gaps: "
+            f"'{GREL_VALUE_PARAM}1' (or '{GREL_VALUE_PARAM}'), '{GREL_VALUE_PARAM}2', "
+            "and so on."
         )
     return count
 

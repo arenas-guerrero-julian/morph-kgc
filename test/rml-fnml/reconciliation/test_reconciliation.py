@@ -371,6 +371,40 @@ def test_index_looks_values_up_alike_one_by_one_or_together(tmp_path):
     assert (len(index), index.concept_count, index.row_groups) == (3, 3, 1)
 
 
+def test_index_looks_tuples_of_values_up_alike_one_by_one_or_together(tmp_path):
+    """
+    An index matching entities by two values looks the tuples up by both, as
+    they are: tuples that would look alike joined by '|', ',' or a space are
+    told apart, one by one and together.
+    """
+    from dataclasses import replace
+    from morph_kgc.functions.tables import close_connections
+    from morph_kgc.reconciliation.index import ConceptIndexBuilder
+
+    with ConceptIndexBuilder(str(tmp_path), '512MB', arity=2) as builder:
+        for code, system, concept in [
+            ('A|1', 'ICD-10', 'c6'), ('A|1', 'ICD 10', 'c7'), ('A', '1|ICD-10', 'c8'),
+            ('B, C', 'X', 'c9'), ('B', ' C,X', 'c10'), ('A B', 'C', 'e1'), ('A', 'B C', 'e2'),
+        ]:
+            builder.add('', (code, system), concept)
+        index = builder.build()
+
+    values = [
+        ('A|1', 'ICD-10'), ('A', '1|ICD-10'), ('A|1', 'ICD-11'), ('ICD-10', 'A|1'),
+        ('B, C', 'X'), ('B', ' C,X'), ('A B', 'C'), ('A', 'B C'), ('A|1', None),
+    ]
+    try:
+        together = index.lookup_many(values)
+        one_by_one = replace(index, row_groups=100).lookup_many(values)
+    finally:
+        close_connections(str(tmp_path))
+
+    assert together == one_by_one == [
+        ['c6'], ['c8'], [], [], ['c9'], ['c10'], ['e1'], ['e2'], [],
+    ]
+    assert (len(index), index.concept_count, index.arity) == (7, 7, 2)
+
+
 def test_reconcile_vocabulary_with_multiple_processes():
     """Worker processes read the shared context back from the state directory."""
     g_morph = morph_kgc.materialize(config(
@@ -2462,6 +2496,9 @@ def test_reconcile_entities_by_two_values():
     ('/public/sparql/no-head', DIAGNOSES),
     ('/public/sparql/results-first', DIAGNOSES),
     ('/public/sparql/gzip', DIAGNOSES),
+    # Read in memory, as the streaming parser rejects a solution, which binds
+    # a single value and is left out.
+    ('/public/sparql/bad-term', DIAGNOSES),
     # The parser of answers in XML trims the whitespace a literal starts with,
     # unless the endpoint escapes it ('&#32;'), which rdflib does not: the
     # coding system ' C,SNOMED CT' then reads 'C,SNOMED CT'.
@@ -2562,6 +2599,52 @@ def test_reconcile_entities_by_three_values(tmp_path, third_value, expected):
     assert diagnoses(g_morph) == expected
 
 
+def test_reconcile_entities_by_ten_values(tmp_path):
+    """Values are told apart by the number of their position, 10 coming after 9."""
+    query = CODES_QUERY.replace(
+        '?matching_value_2 WHERE {',
+        '?matching_value_2 '
+        + ' '.join(f'?matching_value_{position}' for position in range(3, 11)) + ' WHERE {',
+    ).replace(
+        'schema:codingSystem ?matching_value_2 .\n                }',
+        'schema:codingSystem ?matching_value_2 .\n                }\n'
+        + ''.join(
+            f'                BIND("v{position}" AS ?matching_value_{position})\n'
+            for position in range(3, 11)
+        ),
+    )
+    inputs = ''.join(
+        f' ;\n    rml:input [ rml:parameter grel:valueParam{position} ; '
+        f'rml:inputValue "v{position}" ]'
+        for position in range(3, 11)
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query), (SCHEME_INPUT, SCHEME_INPUT + inputs)),
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES
+
+
+def test_reconcile_by_one_value_and_by_two_in_one_mapping():
+    """Each query matches entities by the number of values its executions reconcile."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql'), mapping=f'{SPARQL_MAPPING},{CODES_MAPPING}',
+        ))
+
+        assert sorted(server.requests) == sorted([('/sparql', STUDIES_QUERY), ('/sparql', CODES_QUERY)])
+
+    # Parsed at once: each parse of a Dataset puts its triples in a graph of its own.
+    data = ''
+    for file_name in ('output_sparql.nq', 'output_sparql_codes.nq'):
+        with open(os.path.join(TEST_DIR, file_name), encoding='utf-8') as f:
+            data += f.read()
+    expected = Dataset()
+    expected.parse(data=data, format='nquads')
+    assert_isomorphic(expected, g_morph)
+
+
 def test_reconcile_entities_by_two_values_from_yarrrml(tmp_path):
     """The values are numbered parameters in YARRRML as well."""
     mapping = tmp_path / 'mapping.yarrrml'
@@ -2636,6 +2719,25 @@ def test_ambiguous_tuple_of_values(tmp_path, caplog):
     ]
 
 
+@pytest.mark.parametrize('path', ['/public/sparql', '/public/sparql/no-head'])
+def test_query_matching_by_more_values_than_the_mapping(tmp_path, path):
+    """
+    A query matching entities by a value the mapping does not reconcile fails,
+    even when its answer leaves its head out, instead of matching rows by some
+    of the values of entities only.
+    """
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            r'(matches entities by 2 value\(s\), \?matching_value_1 \?matching_value_2, but '
+            r'the mapping reconciles 1 value\(s\) with it|binds \?matching_value_2, so its '
+            r'query matches entities by values the mapping does not reconcile: it reconciles '
+            r'1 value\(s\) with it, \?matching_value_1)\. Bind one value to reconcile per variable'
+        )):
+            morph_kgc.materialize(sparql_config(
+                mapping=codes_mapping(tmp_path, server, (f' ;\n{SCHEME_INPUT}', ''), path=path),
+            ))
+
+
 def test_query_matching_by_fewer_values_than_the_mapping(tmp_path):
     """A query projecting fewer values than the mapping binds fails, saying how many."""
     query = CODES_QUERY.replace(' ?matching_value_2 WHERE', ' WHERE').replace(
@@ -2651,16 +2753,20 @@ def test_query_matching_by_fewer_values_than_the_mapping(tmp_path):
             ))
 
 
-@pytest.mark.parametrize('variable', ['matching_value_3', 'matching_value_02', 'matching_value_0'])
-def test_query_projecting_values_not_numbered_from_1(tmp_path, variable):
+@pytest.mark.parametrize('variable, error', [
+    ('matching_value_3', r'projects \?matching_value_3 but not \?matching_value_2: the values '
+                         r'an entity is matched by are numbered from 1, without gaps\.'),
+    ('matching_value_02', r'projects \?matching_value_02, which is not numbered as the values '
+                          r'an entity is matched by are: \?matching_value_1, '
+                          r'\?matching_value_2, \?matching_value_3\.\.\. from 1, without '
+                          r'leading zeros\.'),
+    ('matching_value_0', r'projects \?matching_value_0, which is not numbered'),
+])
+def test_query_projecting_values_not_numbered_from_1(tmp_path, variable, error):
     """The variables of the values are numbered from 1, without gaps or leading zeros."""
     query = CODES_QUERY.replace('?matching_value_2', f'?{variable}')
     with VocabularyServer() as server:
-        with pytest.raises(ValueError, match=(
-            rf'projects \?{variable}, but the values an entity is matched by are '
-            r'projected as \?matching_value_1, \?matching_value_2, \?matching_value_3\.\.\. '
-            r'numbered from 1, without gaps or leading zeros\.'
-        )):
+        with pytest.raises(ValueError, match=error):
             morph_kgc.materialize(sparql_config(
                 mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query)),
             ))
@@ -2674,13 +2780,16 @@ def test_query_projecting_values_not_numbered_from_1(tmp_path, variable):
      r"'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam'\."),
     # A gap.
     ((('grel:valueParam2', 'grel:valueParam3'),),
-     r'binds value\(s\) 1, 3 to reconcile but not 2\. The values are numbered from 1'),
+     r'binds value 3 to reconcile but not value 2\. The values are numbered from 1'),
+    # A number with a leading zero numbers no value.
+    ((('grel:valueParam1 ;', 'grel:valueParam01 ;'),),
+     r'binds value 2 to reconcile but not value 1\.'),
     # The first value twice, numbered and not.
     (((SCHEME_INPUT, SCHEME_INPUT + ' ;\n'
        '    rml:input [ rml:parameter grel:valueParam ; rml:inputValue "A|1" ]'),),
-     r'binds value 1 to reconcile 2 times, to '
-     r'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam, '
-     r'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam1\. Bind it once'),
+     r"binds value 1 to reconcile 2 times, to "
+     r"'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam', "
+     r"'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam1'\. Bind it once"),
     # The second value twice, under the same parameter.
     ((('rml:inputValueMap [ rml:reference "scheme" ]',
        'rml:inputValueMap [ rml:reference "scheme" ], [ rml:reference "code" ]'),),
