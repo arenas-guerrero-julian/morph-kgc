@@ -1714,6 +1714,11 @@ def read_xml_answer(tmp_path, answer):
     ('<literal/>', ('literal', '')),
     ('<literal>&#32;B &amp; C</literal>', ('literal', ' B & C')),
     ('<literal><![CDATA[ B & C ]]></literal>', ('literal', ' B & C ')),
+    # Control characters XML does not allow, which rdflib and Oxigraph write raw.
+    ('<literal> B\x0bC\x01</literal>', ('literal', ' B\x0bC\x01')),
+    ('<literal><![CDATA[\x0cB & C]]></literal>', ('literal', '\x0cB & C')),
+    # A noncharacter the reader reads them as, kept as it is.
+    ('<literal>\ufddb</literal>', ('literal', '\ufddb')),
     # An IRI cannot hold whitespace, which only its serialization puts around it.
     ('<uri>\n  https://data.com/id/10\n</uri>', ('uri', 'https://data.com/id/10')),
     ('', None),
@@ -1727,6 +1732,15 @@ def test_values_of_answers_in_xml(tmp_path, term, expected):
 
     assert variables == ['entity_iri', 'matching_value_1']
     assert solutions == [(('uri', 'https://data.com/id/10'), (expected,))]
+
+
+def test_unbound_values_of_answers_in_xml(tmp_path):
+    """A value left unbound, whose binding stores leave out, is read as unbound."""
+    answer = XML_ANSWER.replace('      <binding name="matching_value_1">{term}</binding>\n', '')
+
+    assert read_xml_answer(tmp_path, answer) == (
+        ['entity_iri', 'matching_value_1'], [(('uri', 'https://data.com/id/10'), (None,))],
+    )
 
 
 @pytest.mark.parametrize('answer, detail', [
@@ -2667,7 +2681,8 @@ def test_reconcile_entities_by_two_values_from_yarrrml(tmp_path):
     assert diagnoses(g_morph) == DIAGNOSES
 
 
-def test_entity_missing_a_value_is_not_matched(tmp_path):
+@pytest.mark.parametrize('path', ['/public/sparql', '/public/sparql/xml'])
+def test_entity_missing_a_value_is_not_matched(tmp_path, path):
     """An entity a solution binds no coding system to is matched by no row."""
     query = CODES_QUERY.replace(
         'schema:codingSystem ?matching_value_2 .',
@@ -2676,7 +2691,7 @@ def test_entity_missing_a_value_is_not_matched(tmp_path):
     ).replace('schema:codeValue ?matching_value_1 ;', 'schema:codeValue ?matching_value_1')
     with VocabularyServer() as server:
         g_morph = morph_kgc.materialize(sparql_config(
-            mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query)),
+            mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query), path=path),
         ))
 
     assert diagnoses(g_morph) == DIAGNOSES - {('urn:id:p2', 'https://data.com/id/7')}

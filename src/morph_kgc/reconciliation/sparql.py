@@ -50,8 +50,8 @@ the same memory. An answer in JSON is only read as a stream when it gives its
 head first, as most stores write it, and when every term in it is well formed;
 otherwise it is read whole into memory, with a warning. An answer in XML, which
 some endpoints send whatever is asked for, is read as a stream too, keeping the
-text of its literals exactly as written, whitespace around it included. Whether its patterns
-read the named graphs of the endpoint is up to the query, since stores differ on
+text of its literals as written, whitespace around it included. Whether the
+query reads the named graphs of the endpoint is up to it, since stores differ on
 whether their default graph includes them. Values are matched exactly; a query
 may normalize the values it returns (``LCASE``), and the mapping the values it
 reconciles, to match otherwise.
@@ -100,6 +100,19 @@ RESULTS_FORMATS = {
     "application/xml":                 pyoxigraph.QueryResultsFormat.XML,
     "text/xml":                        pyoxigraph.QueryResultsFormat.XML,
     "text/tab-separated-values":       pyoxigraph.QueryResultsFormat.TSV,
+}
+
+# The characters XML 1.0 allows nowhere, not even escaped, which some stores
+# (rdflib, Oxigraph) still write raw in the literals of an answer in XML: the C0
+# control characters but tab, line feed and carriage return. In UTF-8, where their
+# bytes are never part of another character, each is read as one of the 32
+# noncharacters U+FDD0 to U+FDEF, which Unicode keeps for such internal use and
+# data does not hold, and given back in the text of the term.
+XML_DISALLOWED_BYTES = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+XML_STAND_IN = 0xFDD0
+XML_RESTORED_CHARACTERS = {
+    XML_STAND_IN + byte: byte
+    for byte in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20))
 }
 
 # The variables the query projects: the entity, and the values it is matched by,
@@ -359,39 +372,42 @@ def _parse_xml_solutions(endpoint: str, answer: Download, arity: int):
     started = False
     try:
         with open(answer.path, "rb") as answer_file:
+            reader = _XmlReader(answer_file)
             # The depth of the element an event is about, the root being 1, and
             # the element of the results, while they are read.
             depth = 0
             results = None
-            for event, element in iterparse(answer_file, events=("start", "end")):
+            for event, element in iterparse(reader, events=("start", "end")):
                 if event == "start":
                     depth += 1
-                    if depth > 2:
-                        continue
-                    name = _local_name(element.tag)
-                    if depth == 1 and name != "sparql":
-                        raise SyntaxError(f"its root element is <{name}>, not <sparql>")
-                    if depth == 2 and name == "results":
-                        results = element
-                        if not started:
-                            started = True
-                            yield variables
+                    if depth <= 2:
+                        name = _local_name(element.tag)
+                        if depth == 1 and name != "sparql":
+                            raise SyntaxError(f"its root element is <{name}>, not <sparql>")
+                        if depth == 2 and name == "results":
+                            results = element
+                            if not started:
+                                started = True
+                                yield variables
                     continue
 
-                depth -= 1
-                if depth == 2 and results is not None:
+                if depth == 3 and results is not None:
                     if _local_name(element.tag) == "result":
                         bindings = {
                             binding.get("name"): binding
                             for binding in element
                             if _local_name(binding.tag) == "binding"
                         }
+                        restore = reader.replaced
                         yield (
-                            _xml_term(bindings.get(ENTITY_VARIABLE)),
-                            tuple(_xml_term(bindings.get(variable)) for variable in matched),
+                            _xml_term(bindings.get(ENTITY_VARIABLE), restore),
+                            tuple(
+                                _xml_term(bindings.get(variable), restore)
+                                for variable in matched
+                            ),
                         )
                     results.remove(element)
-                elif depth == 1:
+                elif depth == 2:
                     name = _local_name(element.tag)
                     if name == "head":
                         variables = [
@@ -404,6 +420,7 @@ def _parse_xml_solutions(endpoint: str, answer: Download, arity: int):
                         raise SyntaxError("it is the answer to an ASK query")
                     elif name == "results":
                         results = None
+                depth -= 1
     except (SyntaxError, ValueError, LookupError) as exc:
         # Also xml.etree.ElementTree.ParseError, for XML that is not well formed,
         # and the errors of an encoding the parser cannot decode.
@@ -414,16 +431,52 @@ def _parse_xml_solutions(endpoint: str, answer: Download, arity: int):
         yield variables
 
 
+class _XmlReader:
+    """
+    An answer in XML read for the parser, with the control characters XML does
+    not allow read as noncharacters when it is in UTF-8, as it is by default.
+    *replaced* says whether any was.
+    """
+
+    def __init__(self, answer_file):
+        self._file = answer_file
+        self._utf8 = None
+        self.replaced = False
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._file.read(size)
+        if self._utf8 is None:
+            self._utf8 = _is_utf8(chunk)
+        if self._utf8 and XML_DISALLOWED_BYTES.search(chunk):
+            self.replaced = True
+            chunk = XML_DISALLOWED_BYTES.sub(
+                lambda match: chr(XML_STAND_IN + match[0][0]).encode("utf-8"), chunk,
+            )
+        return chunk
+
+
+def _is_utf8(start: bytes) -> bool:
+    """Whether the XML document starting with *start* is in UTF-8."""
+    # A byte order mark or a zero byte in the first characters: UTF-16 or UTF-32.
+    if start[:2] in (b"\xfe\xff", b"\xff\xfe") or b"\x00" in start[:4]:
+        return False
+    declaration = re.match(
+        rb"(?:\xef\xbb\xbf)?<\?xml[^>]*?\sencoding\s*=\s*[\"']([^\"']*)", start,
+    )
+    return declaration is None or declaration[1].lower() in (b"utf-8", b"utf8")
+
+
 def _local_name(tag: str) -> str:
     """The name of an element without its namespace."""
     return tag.rpartition("}")[2]
 
 
-def _xml_term(binding) -> tuple[str, str | None] | None:
+def _xml_term(binding, restore: bool = False) -> tuple[str, str | None] | None:
     """
     The kind and value of the term a <binding> element binds, None when it
     binds none. The text of a literal is kept exactly; that of an IRI or a blank
-    node, which cannot hold whitespace, is stripped of any around it.
+    node, which cannot hold whitespace, is stripped of any around it. *restore*
+    gives back the control characters the reader read as noncharacters.
     """
     if binding is None:
         return None
@@ -435,6 +488,8 @@ def _xml_term(binding) -> tuple[str, str | None] | None:
         if len(term):
             raise SyntaxError(f"<{kind}> holds the element <{_local_name(term[0].tag)}>, not text")
         value = term.text or ""
+        if restore:
+            value = value.translate(XML_RESTORED_CHARACTERS)
         return kind, value if kind == "literal" else value.strip()
     return None
 
@@ -442,8 +497,8 @@ def _xml_term(binding) -> tuple[str, str | None] | None:
 def _not_results(endpoint: str, answer: Download, detail) -> ValueError:
     return ValueError(
         f"The SPARQL endpoint '{endpoint}' did not answer with SPARQL results "
-        f"in JSON ({answer.content_type or 'no content type'}): {detail}. The "
-        "query must be a SELECT query."
+        f"({answer.content_type or 'no content type'}): {detail}. The query "
+        "must be a SELECT query."
     )
 
 
