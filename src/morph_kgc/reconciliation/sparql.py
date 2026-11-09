@@ -56,7 +56,9 @@ normalization as against a vocabulary file, applied here to the values of the
 answer, which the query returns as they are: the answer is indexed once for
 every way of matching values of the executions sending the query, which is sent
 once. Answers in XML are read by the standard library, which keeps the
-whitespace a literal starts or ends with, which pyoxigraph's parser trims.
+whitespace a literal starts or ends with, which pyoxigraph's parser trims, and
+reads the carriage returns and the control characters stores write as they are
+as such (see ``_XmlLiteralFile``).
 
 How the endpoint is accessed is declared in the configuration file, only when
 its URL is not enough: a ``[RESOURCE:<name>]`` section whose ``url`` (or
@@ -71,6 +73,7 @@ its URL is not enough: a ``[RESOURCE:<name>]`` section whose ``url`` (or
 """
 
 import gzip
+import io
 import json
 import logging
 import re
@@ -244,6 +247,16 @@ def read_solutions(endpoint: str, answer: Download, arity: int = 1):
     results_format = RESULTS_FORMATS.get(answer.content_type, json_format)
     if results_format == pyoxigraph.QueryResultsFormat.XML:
         return _read_xml_solutions(endpoint, answer, arity)
+    return _read_parsed_solutions(endpoint, answer, arity, results_format)
+
+
+def _read_parsed_solutions(endpoint: str, answer: Download, arity: int, results_format):
+    """
+    The variables the answer of *endpoint* in the file *answer*, serialized in
+    *results_format*, projects and its solutions, as :func:`read_solutions`
+    gives them, read as a stream by pyoxigraph.
+    """
+    json_format = pyoxigraph.QueryResultsFormat.JSON
     try:
         results = pyoxigraph.parse_query_results(path=answer.path, format=results_format)
     except SyntaxError as exc:
@@ -291,7 +304,37 @@ def read_solutions(endpoint: str, answer: Download, arity: int = 1):
 
 
 class _StreamingError(Exception):
-    """The streaming parser rejects a solution of an answer in JSON."""
+    """
+    The streaming parser rejects a solution of an answer in JSON or in XML,
+    which is then read anew another way (see :func:`_read_anew`).
+    """
+
+
+def _read_anew(endpoint: str, answer: Download, reason, arity: int = 1):
+    """
+    The variables and the solutions of an answer the streaming parser of its
+    serialization rejected partway through, for *reason*, read another way: an
+    answer in JSON whole into memory, and one in XML by pyoxigraph.
+    """
+    if RESULTS_FORMATS.get(answer.content_type) == pyoxigraph.QueryResultsFormat.XML:
+        return _read_lenient_xml_solutions(endpoint, answer, reason, arity)
+    return _read_json_solutions(endpoint, answer, reason, arity)
+
+
+def _read_lenient_xml_solutions(endpoint: str, answer: Download, reason, arity: int = 1):
+    """
+    The variables and the solutions of an answer in XML that is not well-formed,
+    for *reason*, read by pyoxigraph, which reads characters XML has no room for,
+    but trims the whitespace a literal starts or ends with.
+    """
+    LOGGER.warning(
+        f"The answer in XML of the SPARQL endpoint '{endpoint}' is not well-formed "
+        f"({reason}), so it is read by a lenient parser, which trims the whitespace "
+        "a literal starts or ends with: values matched as they are, or lower-cased, "
+        "may then be matched otherwise than against a vocabulary file. Answers in "
+        "JSON keep it."
+    )
+    return _read_parsed_solutions(endpoint, answer, arity, pyoxigraph.QueryResultsFormat.XML)
 
 
 def _starts_with_head(path: str) -> bool:
@@ -321,12 +364,15 @@ def _read_xml_solutions(endpoint: str, answer: Download, arity: int = 1):
     :func:`read_solutions` gives them, read as a stream by the standard
     library, which keeps the text of every literal as it is: the parser of
     pyoxigraph trims the whitespace a literal starts or ends with, which a
-    value is matched by as well. The answer is read twice, its head first, so
-    that its file is only open while its solutions are read.
+    value is matched by as well. The characters of literals XML cannot read as
+    they are written (see :class:`_XmlLiteralFile`) are read as written too. The
+    answer is read twice, its head first, so that its file is only open while
+    its solutions are read. An answer holding a character the standard library
+    still rejects is read by pyoxigraph, as it was before.
     """
     variables = None
     try:
-        with open(answer.path, "rb") as answer_file:
+        with _XmlLiteralFile(answer.path) as answer_file:
             # The head, and whether results or a boolean, the answer to an ASK
             # query, come after it.
             for event, element in ElementTree.iterparse(answer_file, events=("start", "end")):
@@ -342,6 +388,8 @@ def _read_xml_solutions(endpoint: str, answer: Download, arity: int = 1):
                 elif event == "start" and tag == "results":
                     break
     except ElementTree.ParseError as exc:
+        if exc.code in _XML_CHARACTER_ERRORS:
+            return _read_lenient_xml_solutions(endpoint, answer, exc, arity)
         raise _not_results(endpoint, answer, exc) from exc
     if variables is None:
         raise _not_results(endpoint, answer, "it has no head before its results")
@@ -353,7 +401,7 @@ def _read_xml_solutions(endpoint: str, answer: Download, arity: int = 1):
 
     def solutions():
         try:
-            with open(answer.path, "rb") as answer_file:
+            with _XmlLiteralFile(answer.path) as answer_file:
                 results = None
                 for event, element in ElementTree.iterparse(answer_file, events=("start", "end")):
                     tag = _xml_tag(element)
@@ -374,9 +422,133 @@ def _read_xml_solutions(endpoint: str, answer: Download, arity: int = 1):
                             tuple(bound.get(variable) for variable in matched),
                         )
         except ElementTree.ParseError as exc:
+            if exc.code in _XML_CHARACTER_ERRORS:
+                # Read anew by pyoxigraph, from the start (see build_index).
+                raise _StreamingError(exc) from exc
             raise _not_results(endpoint, answer, exc) from exc
 
     return variables, solutions()
+
+
+# The characters of a literal that an answer in XML may hold, as it is written
+# by stores such as Oxigraph and rdflib, but XML parsers cannot read as they
+# are written: carriage returns, which XML reads as line feeds, and the
+# characters XML 1.0 has no room for (control characters, U+FFFE and U+FFFF),
+# written as they are or as character references.
+_XML_UNREADABLE_CODES = (
+    set(range(0x00, 0x09)) | {0x0B, 0x0C, 0x0D} | set(range(0x0E, 0x20)) | {0xFFFE, 0xFFFF}
+)
+_XML_UNREADABLE = re.compile(
+    rb"[\x00-\x08\x0b-\x1f]|\xef\xbf[\xbe\xbf]|&#(?:x([0-9a-fA-F]{1,6})|([0-9]{1,7}));"
+)
+# The errors of an XML parser rejecting a character, which pyoxigraph reads:
+# not well-formed (invalid token), and reference to invalid character number.
+# The answer is then read by pyoxigraph; any other error, such as an answer cut
+# short, which pyoxigraph may read in part without saying so, fails.
+_XML_CHARACTER_ERRORS = {4, 14}
+# The private-use characters standing in for them while the answer is read, in
+# the last plane of Unicode, which no value is expected to hold.
+_XML_PLACEHOLDER_BASE = 0x10FF00
+_XML_FROM_PLACEHOLDERS = {
+    _XML_PLACEHOLDER_BASE + (code & 0xFF): code for code in _XML_UNREADABLE_CODES
+}
+# The start of the start tag of a literal, whatever the prefix of its namespace.
+_XML_LITERAL_START = re.compile(rb"<(?:[A-Za-z_][\w.\-]*:)?literal(?=[\s/>])")
+# Bytes held back at the end of what has been read, which may be the start of
+# a start tag of a literal, of a character reference or of a character.
+_XML_LITERAL_START_LENGTH = 64
+_XML_REFERENCE_LENGTH = 12
+
+
+def _xml_placeholder(match) -> bytes:
+    """The placeholder of the character *match* is, or itself when XML reads it."""
+    hexadecimal, decimal = match.group(1), match.group(2)
+    if hexadecimal is not None or decimal is not None:
+        code = int(hexadecimal, 16) if hexadecimal is not None else int(decimal)
+        if code not in _XML_UNREADABLE_CODES or code == 0x0D:
+            # A carriage return written as a reference is read as it is.
+            return match.group(0)
+    elif match.group(0).startswith(b"\xef"):
+        code = 0xFFFE if match.group(0) == b"\xef\xbf\xbe" else 0xFFFF
+    else:
+        code = match.group(0)[0]
+    return chr(_XML_PLACEHOLDER_BASE + (code & 0xFF)).encode("utf-8")
+
+
+class _XmlLiteralFile(io.RawIOBase):
+    """
+    The file of an answer in XML, encoded in UTF-8, read with the characters of
+    its literals XML parsers cannot read as they are written (see
+    _XML_UNREADABLE) replaced with private-use placeholders, which
+    :func:`_xml_term` turns back: a literal holding them is then read as it is
+    written, as from an answer in JSON, rather than failing the whole answer or
+    turning its carriage returns into line feeds. Nothing outside the content
+    of literals is changed. It is read as a stream, as the answer is.
+    """
+
+    def __init__(self, path: str, chunk_size: int = 1 << 16) -> None:
+        super().__init__()
+        self._file = open(path, "rb")
+        self._chunk_size = chunk_size
+        self._pending = b""
+        self._output = bytearray()
+        self._in_literal = False
+        self._end = False
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        while not self._output and not (self._end and not self._pending):
+            self._fill()
+        size = min(len(buffer), len(self._output))
+        buffer[:size] = self._output[:size]
+        del self._output[:size]
+        return size
+
+    def close(self) -> None:
+        if not self.closed:
+            self._file.close()
+        super().close()
+
+    def _fill(self) -> None:
+        chunk = self._file.read(self._chunk_size)
+        self._end = not chunk
+        data = self._pending + chunk
+        position = 0
+        while position < len(data):
+            if not self._in_literal:
+                match = _XML_LITERAL_START.search(data, position)
+                end = data.find(b">", match.end()) if match else -1
+                if match is None or end == -1:
+                    # What is left may be the start of a start tag of a literal.
+                    keep = len(data) if self._end else (
+                        match.start() if match else max(position, len(data) - _XML_LITERAL_START_LENGTH)
+                    )
+                    self._output += data[position:keep]
+                    position = keep
+                    break
+                self._output += data[position:end + 1]
+                position = end + 1
+                # An empty literal, written '<literal/>', has no content.
+                self._in_literal = data[end - 1:end] != b"/"
+            else:
+                # The content of a literal holds no markup, but its end tag.
+                close = data.find(b"</", position)
+                stop = len(data) if close == -1 else close
+                if close == -1 and not self._end:
+                    # What is left may be the start of the end tag, of a
+                    # character reference or of a character.
+                    held = max(position, len(data) - _XML_REFERENCE_LENGTH)
+                    for start in (data.rfind(b"&", held), data.rfind(b"<", held), data.rfind(b"\xef", held)):
+                        if start != -1:
+                            stop = min(stop, start)
+                self._output += _XML_UNREADABLE.sub(_xml_placeholder, data[position:stop])
+                position = stop
+                if close == -1:
+                    break
+                self._in_literal = False
+        self._pending = data[position:]
 
 
 def _xml_tag(element) -> str:
@@ -389,8 +561,8 @@ def _xml_term(binding) -> tuple[str, str | None] | None:
     for term in binding:
         kind = _xml_tag(term)
         if kind == "literal":
-            # Exactly as written, whitespace included.
-            return "literal", term.text or ""
+            # Exactly as written, whitespace included (see _XmlLiteralFile).
+            return "literal", (term.text or "").translate(_XML_FROM_PLACEHOLDERS)
         if kind in ("uri", "bnode"):
             return kind, (term.text or "").strip()
         # A triple term has no value of its own to match.
@@ -603,7 +775,7 @@ def build_index(
             )
         except _StreamingError as exc:
             # Indexed anew from the start, by a new builder.
-            _, solutions = _read_json_solutions(endpoint, answer, exc, arity)
+            _, solutions = _read_anew(endpoint, answer, exc, arity)
             indexes, not_iris = _index_solutions(
                 solutions, state_dir, memory_limit, arity, matchings,
             )

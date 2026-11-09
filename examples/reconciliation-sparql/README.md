@@ -86,7 +86,12 @@ values the file is matched against: the labels of its concepts (e.g.
 `skos:prefLabel|skos:altLabel`), and no concept scheme or collection, which a
 vocabulary file never matches. An IRI or a literal is a value, a blank node is
 not, as in a vocabulary file. Answers in JSON, XML and TSV are all read with
-their values as they are, whitespace included.
+their values as they are, whitespace, carriage returns and control characters
+included. An answer in XML holding a character no XML parser reads is read by a
+lenient one, which trims the whitespace a value starts or ends with, and says
+so in a warning. Labels are best matched as strings: a store may rewrite a
+typed literal such as `"01"^^xsd:integer` as `1`, while a vocabulary file keeps
+it as written.
 
 Declare the prefixes the query uses: an endpoint is not bound to know `schema:`
 or any other prefix.

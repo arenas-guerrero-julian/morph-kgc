@@ -15,7 +15,7 @@ python -m morph_kgc.bootstrapping config.ini   # direct-mapping YARRRML generato
 ```
 
 - Use `python -m pytest`, not a bare `pytest`, so the tests run with the interpreter that has `morph_kgc` installed.
-- The full suite gives about 641 passed and 1 skipped (issue_350, needs pyjelly) in about 4 minutes on 4 CPUs. No test takes more than about 2 s.
+- The full suite gives about 790 passed and 1 skipped (issue_350, needs pyjelly) in about 6 minutes on 4 CPUs. No test takes more than about 3 s (the file/SPARQL parity tests of `rml-fnml/reconciliation`).
 - No test needs the real network or a database server. Relational tests use bundled SQLite `.db` files, and the HTTP tests start local servers.
 - A full run prints about 9k DeprecationWarnings from rdflib, jsonpath and fork. They are expected; add `-p no:warnings` for readable output.
 - pytest-xdist and pytest-timeout are not installed, so `-n` and `--timeout` fail.

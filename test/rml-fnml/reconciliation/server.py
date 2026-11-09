@@ -27,7 +27,8 @@ The other endpoints answer in JSON with the head first, as most stores do.
 
 The same endpoints under ``/public/vocabulary`` (``/public/vocabulary/sparql``,
 ``/public/vocabulary/sparql/xml``...) evaluate queries over the SKOS vocabulary
-of ``parity_vocabulary.ttl`` instead, as its default graph, so that the
+of ``parity_vocabulary.ttl`` instead (or of the file the server is given), as
+its default graph, so that the
 reconciliation against a vocabulary file and against an endpoint holding the
 same data can be compared.
 
@@ -110,6 +111,8 @@ class _Handler(BaseHTTPRequestHandler):
     # fetched (and each query sent) exactly once, and the HTTP methods they used.
     requests = []
     methods = []
+    # The vocabulary the endpoints under VOCABULARY_ENDPOINTS_PREFIX hold.
+    vocabulary = VOCABULARY_ENDPOINTS_FILE
 
     def do_GET(self):
         path = urlsplit(self.path).path
@@ -160,7 +163,7 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 if path.startswith(VOCABULARY_ENDPOINTS_PREFIX):
                     # A vocabulary serialized as triples is its default graph.
-                    knowledge_graph = _knowledge_graph(True, VOCABULARY_ENDPOINTS_FILE)
+                    knowledge_graph = _knowledge_graph(True, type(self).vocabulary)
                 else:
                     knowledge_graph = _knowledge_graph(SPARQL_ENDPOINTS[path])
                 results = knowledge_graph.query(query)
@@ -213,15 +216,20 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class VocabularyServer:
-    """Context manager starting the server on an ephemeral port."""
+    """
+    Context manager starting the server on an ephemeral port, its endpoints
+    under VOCABULARY_ENDPOINTS_PREFIX holding *vocabulary* (a path).
+    """
 
-    def __init__(self):
+    def __init__(self, vocabulary=VOCABULARY_ENDPOINTS_FILE):
         self._server = None
         self._thread = None
+        self._vocabulary = vocabulary
 
     def __enter__(self):
         _Handler.requests = []
         _Handler.methods = []
+        _Handler.vocabulary = self._vocabulary
         self._server = HTTPServer(('127.0.0.1', 0), _Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()

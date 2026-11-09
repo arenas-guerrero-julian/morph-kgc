@@ -3374,6 +3374,26 @@ def test_values_neither_iris_nor_literals_are_not_indexed(tmp_path):
         close_connections(str(tmp_path))
 
 
+def test_typed_literals_of_sparql_1_0_are_values(monkeypatch, tmp_path):
+    """
+    A literal an endpoint answers as a 'typed-literal', as in the JSON results
+    of SPARQL 1.0 (Virtuoso), is a value, read in memory as well.
+    """
+    import json
+
+    body = json.dumps({'results': {'bindings': [
+        {'entity_iri': {'type': 'uri', 'value': 'https://e/1'},
+         'matching_value_1': {'type': 'typed-literal', 'value': 'Enamel agenesis',
+                              'datatype': 'http://www.w3.org/2001/XMLSchema#string'}},
+        # A blank node as Virtuoso writes it, which the streaming parser rejects.
+        {'entity_iri': {'type': 'bnode', 'value': 'nodeID://b10001'},
+         'matching_value_1': {'type': 'literal', 'value': 'Unmatched'}},
+    ]}})
+    indexes = index_answer(monkeypatch, tmp_path, body, 'application/sparql-results+json')
+
+    assert lookups(tmp_path, indexes['EXACT'], 'Enamel agenesis') == [['https://e/1']]
+
+
 @pytest.mark.parametrize('body, error', [
     ('<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#">'
      '<head/><boolean>true</boolean></sparql>', 'it is the answer to an ASK query'),
@@ -3389,7 +3409,264 @@ def test_answer_in_xml_that_is_not_select_results(tmp_path, body, error):
         read_answer(tmp_path, body)
 
 
-def test_answer_in_xml_cut_short(tmp_path):
-    """An answer in XML cut short fails while its solutions are read."""
+def index_answer(monkeypatch, tmp_path, body, content_type='application/sparql-results+xml',
+                 download=None, **options):
+    """The indexes sparql.build_index builds from the answer *body*, as if the endpoint answered it."""
+    from morph_kgc.http import Download
+    from morph_kgc.reconciliation import sparql
+
+    path = tmp_path / 'answer'
+    path.write_bytes(body.encode('utf-8') if isinstance(body, str) else body)
+    answer = (download or Download)(str(path), content_type, temporary=True)
+    monkeypatch.setattr(sparql, 'run_query', lambda resource, query, state_dir: answer)
+    resource = ResourceConfig(name='E', resource_type='SPARQL_ENDPOINT', url='https://e/sparql')
+    return sparql.build_index(
+        resource, 'SELECT', state_dir=str(tmp_path), memory_limit='512MB', **options,
+    )
+
+
+def lookups(tmp_path, index, *values):
+    from morph_kgc.functions.tables import close_connections
+    try:
+        return [index.lookup(value) for value in values]
+    finally:
+        close_connections(str(tmp_path))
+
+
+@pytest.mark.parametrize('end', [
+    '<binding name="entity_iri"><uri>https://e/3',
+    '<uri>https://e/3',
+])
+def test_answer_in_xml_cut_short(monkeypatch, tmp_path, caplog, end):
+    """
+    An answer in XML cut short fails while its solutions are read, rather than
+    being read in part by the lenient parser.
+    """
+    body = XML_ANSWER[:XML_ANSWER.index(end)]
     with pytest.raises(ValueError, match='did not answer with SPARQL results'):
-        read_answer(tmp_path, XML_ANSWER[:XML_ANSWER.index('<binding name="entity_iri"><uri>https://e/3')])
+        index_answer(monkeypatch, tmp_path, body)
+
+    assert 'lenient parser' not in caplog.text
+
+
+# Labels holding characters an answer in XML holds as they are written, but
+# XML parsers cannot read as they are written.
+LABELS_XML_CANNOT_READ = [
+    'Agenesis\u000bof enamel', 'Two\r\nlines', 'Carriage\rreturn', ' padded\t',
+    'a\x01b', 'x\ufffey', 'x\uffffy', 'form\x0cfeed',
+]
+
+
+def vocabulary_answer(writer, labels):
+    """The answer in XML, written by *writer*, to a query returning *labels*."""
+    import pyoxigraph
+    from rdflib import Graph, Literal
+
+    query = (
+        'SELECT ?entity_iri ?matching_value_1 WHERE { '
+        '?entity_iri <http://www.w3.org/2004/02/skos/core#prefLabel> ?matching_value_1 }'
+    )
+    if writer == 'rdflib':
+        graph = Graph()
+        for number, label in enumerate(labels):
+            graph.add((URIRef(f'https://e/{number}'), URIRef(f'{SKOS}prefLabel'), Literal(label)))
+        return graph.query(query).serialize(format='xml')
+    store = pyoxigraph.Store()
+    for number, label in enumerate(labels):
+        store.add(pyoxigraph.Quad(
+            pyoxigraph.NamedNode(f'https://e/{number}'),
+            pyoxigraph.NamedNode(f'{SKOS}prefLabel'),
+            pyoxigraph.Literal(label),
+        ))
+    return store.query(query).serialize(format=pyoxigraph.QueryResultsFormat.XML)
+
+
+@pytest.mark.parametrize('writer', ['rdflib', 'oxigraph'])
+def test_answer_in_xml_holding_characters_xml_cannot_read_as_written(tmp_path, writer):
+    """
+    Carriage returns, control characters, U+FFFE and U+FFFF, which stores
+    write in XML as they are although XML parsers cannot read them so, are read
+    as written, as from an answer in JSON: neither failing the answer nor
+    turning a carriage return into a line feed.
+    """
+    path = tmp_path / 'answer'
+    path.write_bytes(vocabulary_answer(writer, LABELS_XML_CANNOT_READ))
+    from morph_kgc.http import Download
+    from morph_kgc.reconciliation import sparql
+
+    _, solutions = sparql.read_solutions('E', Download(str(path), 'application/sparql-results+xml'))
+
+    assert sorted(value for _, ((_, value),) in solutions) == sorted(LABELS_XML_CANNOT_READ)
+
+
+@pytest.mark.parametrize('chunk_size', [1, 2, 3, 5, 8, 13])
+def test_answer_in_xml_read_in_any_chunks(tmp_path, monkeypatch, chunk_size):
+    """
+    The characters XML cannot read as written are read alike whatever the
+    chunks the answer is read in, which may cut a tag, a reference or a
+    character.
+    """
+    from morph_kgc.reconciliation import sparql
+
+    body = vocabulary_answer('rdflib', LABELS_XML_CANNOT_READ).replace(
+        b'a\x01b', b'a&#x1;b',
+    ).replace(b'<literal>', b'<literal xml:lang="en">', 2)
+    original = sparql._XmlLiteralFile.__init__
+
+    def init(self, path, chunk_size_=chunk_size):
+        original(self, path, chunk_size_)
+
+    monkeypatch.setattr(sparql._XmlLiteralFile, '__init__', init)
+    _, solutions = read_answer(tmp_path, body.decode('utf-8'))
+
+    assert sorted(value for _, ((_, value),) in solutions) == sorted(LABELS_XML_CANNOT_READ)
+
+
+@pytest.mark.parametrize('cut', ['head', 'results'])
+def test_answer_in_xml_not_well_formed_read_by_a_lenient_parser(monkeypatch, tmp_path, caplog, cut):
+    """
+    An answer in XML the standard library rejects, in its head or partway
+    through its results, is read by pyoxigraph, as it was before, saying that
+    it trims the whitespace a literal starts or ends with.
+    """
+    from morph_kgc.reconciliation import sparql
+
+    # Without the replacement of the characters XML cannot read as written.
+    monkeypatch.setattr(sparql, '_XmlLiteralFile', lambda path: open(path, 'rb'))
+    body = vocabulary_answer('rdflib', ['Agenesis\u000bof enamel', ' padded '])
+    if cut == 'head':
+        body = body.replace(b'<head>', b'<head><!-- \x0b -->')
+
+    indexes = index_answer(monkeypatch, tmp_path, body)
+
+    assert lookups(tmp_path, indexes['EXACT'], 'Agenesis\u000bof enamel', 'padded') == [
+        ['https://e/0'], ['https://e/1'],
+    ]
+    assert 'is read by a lenient parser, which trims the whitespace' in caplog.text
+
+
+def test_answer_closed_before_it_is_removed(monkeypatch, tmp_path):
+    """
+    An answer in XML read partway through, when indexing fails, is closed
+    before it is removed, which Windows cannot do while it is open.
+    """
+    from morph_kgc.http import Download
+    from morph_kgc.reconciliation import sparql
+
+    opened = []
+    reader = sparql._XmlLiteralFile
+
+    class TrackedFile(reader):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+    class WindowsDownload(Download):
+        def remove(self):
+            if any(not answer_file.closed for answer_file in opened):
+                raise PermissionError('The process cannot access the file: it is open.')
+            super().remove()
+
+    added = []
+    add = sparql.ConceptIndexBuilder.add
+
+    def add_until_the_disk_is_full(self, *args, **kwargs):
+        added.append(args)
+        if len(added) == 2:
+            raise OSError('No space left on device')
+        return add(self, *args, **kwargs)
+
+    monkeypatch.setattr(sparql, '_XmlLiteralFile', TrackedFile)
+    monkeypatch.setattr(sparql.ConceptIndexBuilder, 'add', add_until_the_disk_is_full)
+    with pytest.raises(OSError, match='No space left on device'):
+        index_answer(monkeypatch, tmp_path, XML_ANSWER, download=WindowsDownload)
+
+    assert opened and not (tmp_path / 'answer').exists()
+
+
+def test_answer_in_xml_read_with_the_same_memory(tmp_path):
+    """An answer in XML is read as a stream: its solutions read are dropped."""
+    import tracemalloc
+
+    head, _, tail = XML_ANSWER.partition('<results>')
+    results = ''.join(
+        f'<result><binding name="entity_iri"><uri>https://e/{number}</uri></binding>'
+        f'<binding name="matching_value_1"><literal>Label {number}</literal></binding></result>'
+        for number in range(20000)
+    )
+    body = f'{head}<results>{results}</results></sparql>'
+    from morph_kgc.http import Download
+    from morph_kgc.reconciliation import sparql
+
+    path = tmp_path / 'answer'
+    path.write_text(body, encoding='utf-8')
+    tracemalloc.start()
+    try:
+        _, solutions = sparql.read_solutions('E', Download(str(path), 'application/sparql-results+xml'))
+        count = sum(1 for _ in solutions)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    assert count == 20000
+    # Read whole, its 20,000 solutions take more than 20 MB.
+    assert peak < 5 * 1024 * 1024
+
+
+@pytest.mark.parametrize('matching', ['EXACT', 'LOWERCASE', 'CASE-INSENSITIVE'])
+def test_same_triples_for_labels_xml_cannot_read_as_written(tmp_path, matching):
+    """
+    Labels holding control characters, carriage returns, U+FFFF or whitespace
+    at their ends are matched alike from a vocabulary file and from an endpoint
+    holding it, whatever the shape of its answer, XML included.
+    """
+    import csv
+    import pandas as pd
+    from rdflib import Literal
+
+    labels = LABELS_XML_CANNOT_READ
+    vocabulary = tmp_path / 'vocabulary.ttl'
+    vocabulary.write_text(
+        '@prefix skos: <http://www.w3.org/2004/02/skos/core#> .\n' + ''.join(
+            f'<{CLINICAL}{number}> a skos:Concept ; skos:prefLabel {Literal(label).n3()} .\n'
+            for number, label in enumerate(labels, 1)
+        ),
+        encoding='utf-8',
+    )
+    # The labels, and the labels in upper case, as inputs.
+    inputs = [*labels, *(label.upper() for label in labels)]
+    with open(tmp_path / 'labels.csv', 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f, quoting=csv.QUOTE_ALL, lineterminator='\n')
+        writer.writerow(['id', 'label'])
+        writer.writerows(enumerate(inputs, 1))
+    assert list(pd.read_csv(tmp_path / 'labels.csv', dtype=str, keep_default_na=False)['label']) == inputs
+
+    def config(function_inputs):
+        return parity_config(tmp_path, function_inputs, matching, 'ALL').replace(
+            f'url={PARITY_VOCABULARY}', f'url={vocabulary}',
+        )
+
+    def with_labels(text):
+        mapping = re.search(r'mappings=(.*)', text).group(1)
+        with open(mapping, encoding='utf-8') as f:
+            rml = f.read()
+        with open(mapping, 'w', encoding='utf-8') as f:
+            f.write(rml.replace(
+                'test/rml-fnml/reconciliation/parity_labels.csv',
+                str(tmp_path / 'labels.csv').replace('\\', '/'),
+            ))
+        return text
+
+    from_file = morph_kgc.materialize_set(with_labels(config(file_inputs())))
+    # Each label matches itself, whatever the way of matching values.
+    assert {
+        f'<urn:id:{number}> <https://example.org/ontology/matches> <{CLINICAL}{number}>'
+        for number in range(1, len(labels) + 1)
+    } <= from_file
+
+    with VocabularyServer(vocabulary=str(vocabulary)) as server:
+        for path in PARITY_ENDPOINTS:
+            from_endpoint = morph_kgc.materialize_set(
+                with_labels(config(sparql_inputs(f'{server.url}{path}'))),
+            )
+            assert from_endpoint == from_file, path
