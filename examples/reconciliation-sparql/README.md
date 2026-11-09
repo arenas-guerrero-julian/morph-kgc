@@ -54,20 +54,19 @@ against:
     ] .
 ```
 
-The query is any SELECT query over the knowledge graph. It projects two
-variables:
+The query is any SELECT query over the knowledge graph. It projects:
 
 | Variable | Meaning |
 | --- | --- |
 | `?entity_iri` | the entity a value is reconciled with |
 | `?matching_value_1` | the value the entity is matched by |
+| `?matching_value_2`, ... | the other values the entity is matched by, for an entity that only several values identify together |
 
-A value is matched against `?matching_value_1` only. To match it against
-several properties, bind all of them to that variable, e.g. with a `UNION` or a
-property path (`schema:identifier|schema:alternateName`). Other projected
-variables, such as `?g`, are ignored, but `?matching_value_2` and the like are
-rejected, since no value is matched against them. A query that does not project
-both `?entity_iri` and `?matching_value_1` fails instead of reconciling nothing.
+To match a value against several properties, bind all of them to
+`?matching_value_1`, e.g. with a `UNION` or a property path
+(`schema:identifier|schema:alternateName`). Other projected variables, such as
+`?g`, are ignored. A query that does not project both `?entity_iri` and
+`?matching_value_1` fails instead of reconciling nothing.
 
 Values are matched exactly. To match them whatever their case, normalize both
 sides in the mapping: `BIND(LCASE(STR(?identifier)) AS ?matching_value_1)` in
@@ -82,6 +81,60 @@ query, and the same query sent to the same endpoint by several executions is
 sent once. When the reconciled entity is the object of a triple, give its object
 map `rml:termType rml:IRI`, since an object map whose
 value is the result of a function generates literals by default.
+
+### Entities matched by several values
+
+An entity that only several values identify together, such as a code within a
+coding system, is matched by all of them: the query projects one
+`?matching_value_<i>` per value, numbered from 1, and the execution binds as
+many values to reconcile, matched to the variables by position. The first is
+`grel:valueParam1`, or `grel:valueParam`, the second `grel:valueParam2`, and so
+on (`grel:valueParameter1`, `grel:valueParameter2`... are accepted as well):
+
+```turtle
+<#DiagnosisReconciliation>
+    rml:function morph-fn:reconcileEntityOverSPARQL ;
+    rml:input [
+        rml:parameter morph-fn:sparqlEndpointUrl ;
+        rml:inputValue "https://data.com/database/query"
+    ] ;
+    rml:input [
+        rml:parameter morph-fn:sparqlQuery ;
+        rml:inputValue """
+            PREFIX schema: <https://schema.org/>
+            SELECT ?entity_iri ?matching_value_1 ?matching_value_2 WHERE {
+                GRAPH ?g {
+                    ?entity_iri a schema:MedicalCode ;
+                                schema:codeValue ?matching_value_1 ;
+                                schema:codingSystem ?matching_value_2 .
+                }
+            }
+        """
+    ] ;
+    rml:input [
+        rml:parameter grel:valueParam1 ;
+        rml:inputValueMap [ rml:reference "code" ]
+    ] ;
+    rml:input [
+        rml:parameter grel:valueParam2 ;
+        rml:inputValueMap [ rml:reference "scheme" ]
+    ] .
+```
+
+A row is reconciled with the entities matched by all its values. They are
+compared one by one, exactly, as each is indexed in a column of its own: never
+joined into a string, so values holding `,`, `|` or whitespace match as they
+are, and the code `A|1` of `ICD-10` is not mistaken for the code `A` of
+`1|ICD-10`. A value may be a constant, such as the coding system of every row.
+An entity a solution leaves a value unbound for is matched by no row.
+
+The query must project as many `?matching_value_<i>` as the execution binds
+values, numbered from 1 without gaps, and the execution must bind each value
+once. Otherwise the run fails: before the query is sent when the execution is
+at fault, and as soon as it is answered when the query is. An endpoint that
+leaves the head out of its answer does not say which variables the query
+projects: a value its solutions never bind then matches nothing, and the query
+is reported as returning no entity.
 
 ### Named graphs
 
@@ -128,18 +181,28 @@ all.
 | `username`, `password` | HTTP Basic Authentication credentials. |
 | `method` | `GET` or `POST`. By default, `GET`, or `POST` for a query too long for a URL. |
 | `timeout` | seconds to wait for the answer to the query (default `300`). |
+| `ambiguity` | the policy for the values matching several entities, when the execution sets none: `ALL` (default), `NONE` or `FAIL`. |
 
 ## Function parameters
 
 | Parameter | Meaning |
 | --- | --- |
-| `grel:valueParam` | the value to reconcile. |
+| `grel:valueParam` | the value to reconcile, matched against `?matching_value_1`. |
+| `grel:valueParam2`, ... | the other values to reconcile, matched against `?matching_value_2`, ... See [Entities matched by several values](#entities-matched-by-several-values). |
 | `morph-fn:sparqlEndpointUrl` | the URL of the SPARQL endpoint the query is sent to. |
-| `morph-fn:sparqlQuery` | the SELECT query returning `?entity_iri` and `?matching_value_1`. |
+| `morph-fn:sparqlQuery` | the SELECT query returning `?entity_iri` and `?matching_value_1` (and `?matching_value_2`, ...). |
+| `morph-fn:ambiguity` | what a value matching several entities is reconciled to: `ALL` (default), `NONE` or `FAIL`. A constant, overriding the `ambiguity` option of the resource declaring the endpoint. |
 
 The endpoint and the query are constants of the mapping, since they are sent
 before any data is read. A value matching no entity yields no triple. A value
-matching several entities yields one triple per matched entity.
+matching several entities is ambiguous, and yields one triple per matched entity
+with `ALL` (the default), no triple with `NONE`, and aborts the run with `FAIL`.
+It is reported, with the entities it matches, in a log record starting with
+`MULTIPLE_MATCH`: a warning with `NONE` and a debug record with `ALL`. With
+`FAIL`, the report is the message of the error aborting the run. The policy is
+a constant of the execution, or else the
+`ambiguity` option of the resource declaring the endpoint, as in
+[`../reconciliation`](../reconciliation/README.md#ambiguous-values).
 
 ## What this example generates
 

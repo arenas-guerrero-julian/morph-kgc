@@ -371,6 +371,40 @@ def test_index_looks_values_up_alike_one_by_one_or_together(tmp_path):
     assert (len(index), index.concept_count, index.row_groups) == (3, 3, 1)
 
 
+def test_index_looks_tuples_of_values_up_alike_one_by_one_or_together(tmp_path):
+    """
+    An index matching entities by two values looks the tuples up by both, as
+    they are: tuples that would look alike joined by '|', ',' or a space are
+    told apart, one by one and together.
+    """
+    from dataclasses import replace
+    from morph_kgc.functions.tables import close_connections
+    from morph_kgc.reconciliation.index import ConceptIndexBuilder
+
+    with ConceptIndexBuilder(str(tmp_path), '512MB', arity=2) as builder:
+        for code, system, concept in [
+            ('A|1', 'ICD-10', 'c6'), ('A|1', 'ICD 10', 'c7'), ('A', '1|ICD-10', 'c8'),
+            ('B, C', 'X', 'c9'), ('B', ' C,X', 'c10'), ('A B', 'C', 'e1'), ('A', 'B C', 'e2'),
+        ]:
+            builder.add('', (code, system), concept)
+        index = builder.build()
+
+    values = [
+        ('A|1', 'ICD-10'), ('A', '1|ICD-10'), ('A|1', 'ICD-11'), ('ICD-10', 'A|1'),
+        ('B, C', 'X'), ('B', ' C,X'), ('A B', 'C'), ('A', 'B C'), ('A|1', None),
+    ]
+    try:
+        together = index.lookup_many(values)
+        one_by_one = replace(index, row_groups=100).lookup_many(values)
+    finally:
+        close_connections(str(tmp_path))
+
+    assert together == one_by_one == [
+        ['c6'], ['c8'], [], [], ['c9'], ['c10'], ['e1'], ['e2'], [],
+    ]
+    assert (len(index), index.concept_count, index.arity) == (7, 7, 2)
+
+
 def test_reconcile_vocabulary_with_multiple_processes():
     """Worker processes read the shared context back from the state directory."""
     g_morph = morph_kgc.materialize(config(
@@ -1521,7 +1555,9 @@ def test_reconcile_entity_over_sparql_from_yarrrml():
     (
         'SELECT ?entity_iri ?matching_value_1 ?matching_value_2 WHERE { GRAPH ?g { '
         '?entity_iri <https://schema.org/identifier> ?matching_value_1, ?matching_value_2 } }',
-        r'projects \?matching_value_2',
+        # The mapping reconciles a single value.
+        r'matches entities by 2 value\(s\), \?matching_value_1 \?matching_value_2, '
+        r'but the mapping reconciles 1 value\(s\) with it\.',
     ),
 ])
 def test_query_projecting_other_variables(tmp_path, query, error):
@@ -1695,3 +1731,1136 @@ def test_endpoint_answering_too_late(tmp_path):
                 f'timeout=1',
                 mapping=mapping,
             ))
+
+
+# ── Ambiguous values ──────────────────────────────────────────────────────────
+
+AMBIGUOUS_VOCABULARY = os.path.join(TEST_DIR, 'disease_vocabulary_ambiguous.ttl')
+# The concept of disease_vocabulary_ambiguous.ttl whose alternative label is
+# the preferred label of NARCOLEPSY, which is the label of pid_00002.
+ADCA_DN = 'https://example.org/vocabulary/disease/adca-dn'
+AMBIGUOUS_LABEL = 'Autosomal dominant cerebellar ataxia-deafness-narcolepsy syndrome'
+
+
+def ambiguity_error(ambiguity):
+    """The error of an execution binding the ambiguity to an invalid value."""
+    return re.escape(
+        f"binds 'urn:morph:function:ambiguity' to '{ambiguity}', which is not valid. "
+        "Must be one of: ALL, FAIL, NONE."
+    )
+
+
+def with_ambiguity(ambiguity):
+    """The replacement adding an ambiguity input to the execution of mapping.ttl."""
+    return (
+        'rml:inputValue skos:prefLabel , skos:altLabel\n    ]',
+        'rml:inputValue skos:prefLabel , skos:altLabel\n    ] ;\n'
+        '    rml:input [\n'
+        '        rml:parameter morph-fn:ambiguity ;\n'
+        f'        rml:inputValue {ambiguity}\n'
+        '    ]',
+    )
+
+
+def ambiguous_config(mapping=MAPPING, resource_options='', processes=1, configuration=''):
+    """The configuration reconciling against disease_vocabulary_ambiguous.ttl."""
+    return config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={AMBIGUOUS_VOCABULARY}\n'
+        f'{resource_options}',
+        mapping=mapping,
+        processes=processes,
+    ).replace('[CONFIGURATION]\n', f'[CONFIGURATION]\n{configuration}\n')
+
+
+def multiple_match_reports(caplog, level='WARNING'):
+    """The messages of the reports of ambiguous values logged at *level*."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelname == level and record.getMessage().startswith('MULTIPLE_MATCH')
+    ]
+
+
+def ambiguous_label_report(consequence, policy):
+    """The report of the label of pid_00002, which matches two concepts."""
+    return (
+        f"MULTIPLE_MATCH: value '{AMBIGUOUS_LABEL}' matches 2 entities of resource "
+        f"'disease_vocabulary': <{NARCOLEPSY}>, <{ADCA_DN}>. "
+        f"{consequence}, as the ambiguity policy is {policy}."
+    )
+
+
+def terms(g_morph):
+    """Every subject and object of *g_morph*."""
+    return {str(term) for term in (*g_morph.subjects(), *g_morph.objects())}
+
+
+@pytest.mark.parametrize('replacements, resource_options', [
+    ((), ''),
+    ((with_ambiguity('"ALL"'),), ''),
+    ((), 'ambiguity=all'),
+    # The execution chooses over the resource.
+    ((with_ambiguity('"ALL"'),), 'ambiguity=NONE'),
+])
+def test_ambiguous_value_reconciled_to_every_concept_by_default(
+    tmp_path, caplog, replacements, resource_options,
+):
+    """
+    A value matching several concepts yields one triple per concept by default,
+    and is only reported when debugging.
+    """
+    g_morph = morph_kgc.materialize(ambiguous_config(
+        mapping_copy(tmp_path, *replacements), resource_options,
+    ))
+
+    assert reconciled(g_morph) == {
+        ('pid_00001', ATAXIA), ('pid_00002', NARCOLEPSY), ('pid_00002', ADCA_DN),
+    }
+    assert 'MULTIPLE_MATCH' not in caplog.text
+
+
+def test_ambiguous_value_reported_when_debugging(caplog):
+    """With ALL, the report of an ambiguous value is a debug record."""
+    morph_kgc.materialize(ambiguous_config(configuration='logging_level=DEBUG'))
+
+    assert multiple_match_reports(caplog, 'DEBUG') == [
+        ambiguous_label_report('A triple is generated for each of them', 'ALL'),
+    ]
+    assert multiple_match_reports(caplog) == []
+
+
+@pytest.mark.parametrize('replacements, resource_options', [
+    ((with_ambiguity('"NONE"'),), ''),
+    ((with_ambiguity('"none"'),), ''),
+    ((with_ambiguity('" None "'),), ''),
+    ((), 'ambiguity=NONE'),
+    ((), 'ambiguity= none '),
+    # The execution chooses over the resource.
+    ((with_ambiguity('"NONE"'),), 'ambiguity=FAIL'),
+])
+def test_ambiguity_none(tmp_path, caplog, replacements, resource_options):
+    """
+    With NONE, a value matching two concepts yields no triple, and is reported
+    as a MULTIPLE_MATCH with both concepts, once, although three mapping rules
+    reconcile it. The values matching a single concept are reconciled.
+    """
+    g_morph = morph_kgc.materialize(ambiguous_config(
+        mapping_copy(tmp_path, *replacements), resource_options,
+    ))
+
+    assert reconciled(g_morph) == {('pid_00001', ATAXIA)}
+    # Neither as the object of a patient, nor as the subject of a disease.
+    assert NARCOLEPSY not in terms(g_morph) and ADCA_DN not in terms(g_morph)
+    assert ATAXIA in {str(s) for s in g_morph.subjects()}
+    assert multiple_match_reports(caplog) == [
+        ambiguous_label_report('No triple is generated for it', 'NONE'),
+    ]
+
+
+def test_ambiguous_value_of_several_rows_reported_once(tmp_path, caplog):
+    """An ambiguous value is reported once, however many rows hold it."""
+    with open(os.path.join(TEST_DIR, 'patients.csv'), encoding='utf-8') as f:
+        rows = f.read()
+    rows += f'pid_00004,{AMBIGUOUS_LABEL}\npid_00005,ADCA-DN\n'
+    (tmp_path / 'patients.csv').write_text(rows, encoding='utf-8')
+    source = str(tmp_path / 'patients.csv').replace('\\', '/')
+
+    g_morph = morph_kgc.materialize(ambiguous_config(
+        mapping_copy(
+            tmp_path,
+            ('test/rml-fnml/reconciliation/patients.csv', source),
+            with_ambiguity('"NONE"'),
+        ),
+    ))
+
+    # ADCA-DN, an alternative label of a single concept, is not ambiguous.
+    assert reconciled(g_morph) == {('pid_00001', ATAXIA), ('pid_00005', NARCOLEPSY)}
+    assert multiple_match_reports(caplog) == [
+        ambiguous_label_report('No triple is generated for it', 'NONE'),
+    ]
+
+
+@pytest.mark.parametrize('replacements, resource_options', [
+    ((with_ambiguity('"FAIL"'),), ''),
+    ((with_ambiguity('"fail"'),), 'ambiguity=NONE'),
+    ((), 'ambiguity=FAIL'),
+])
+@pytest.mark.parametrize('processes', [1, 4])
+def test_ambiguity_fail(tmp_path, replacements, resource_options, processes):
+    """With FAIL, the first ambiguous value aborts the run, reporting it."""
+    report = ambiguous_label_report('The run is aborted', 'FAIL')
+    with pytest.raises(ValueError, match=re.escape(report)):
+        morph_kgc.materialize(ambiguous_config(
+            mapping_copy(tmp_path, *replacements), resource_options, processes,
+        ))
+
+
+@pytest.mark.parametrize('replacements, resource_options', [
+    ((with_ambiguity('"FAIL"'),), ''),
+    ((), 'ambiguity=FAIL'),
+])
+def test_ambiguity_fail_without_ambiguous_values(tmp_path, replacements, resource_options):
+    """A run reconciling no ambiguous value is not aborted."""
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}\n'
+        f'{resource_options}',
+        mapping=mapping_copy(tmp_path, *replacements),
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+def test_ambiguity_none_with_multiple_processes(tmp_path):
+    """Every worker process applies the policy of the execution."""
+    g_morph = morph_kgc.materialize(ambiguous_config(
+        mapping_copy(tmp_path, with_ambiguity('"NONE"')), processes=4,
+    ))
+
+    assert reconciled(g_morph) == {('pid_00001', ATAXIA)}
+    assert NARCOLEPSY not in terms(g_morph) and ADCA_DN not in terms(g_morph)
+
+
+def test_ambiguity_with_case_insensitive_matching(tmp_path, caplog):
+    """
+    Values made ambiguous by matching them case-insensitively are ambiguous as
+    well. Here in the legacy FNML vocabulary, whose constants are rr:constant
+    value maps.
+    """
+    mapping = mapping_copy(
+        tmp_path,
+        ('fnml:valueMap [ rr:constant "CASE-INSENSITIVE" ]\n        ] .',
+         'fnml:valueMap [ rr:constant "CASE-INSENSITIVE" ]\n        ],\n'
+         '        [\n'
+         '            fnml:parameter morph-fn:ambiguity ;\n'
+         '            fnml:valueMap [ rr:constant "NONE" ]\n'
+         '        ] .'),
+        mapping=os.path.join(TEST_DIR, 'mapping_legacy_fnml.ttl'),
+    )
+    g_morph = morph_kgc.materialize(ambiguous_config(mapping))
+
+    assert reconciled(g_morph) == {('pid_00001', ATAXIA)}
+    assert multiple_match_reports(caplog) == [
+        f"MULTIPLE_MATCH: value '{AMBIGUOUS_LABEL.upper()}' matches 2 entities of "
+        f"resource 'disease_vocabulary': <{NARCOLEPSY}>, <{ADCA_DN}>. "
+        f"No triple is generated for it, as the ambiguity policy is NONE.",
+    ]
+
+
+@pytest.mark.parametrize('parameter', [
+    '                    - parameter: morph-fn:ambiguity\n'
+    '                      value: NONE\n',
+    '                    - [morph-fn:ambiguity, none]\n',
+])
+def test_ambiguity_in_yarrrml(tmp_path, parameter):
+    """The ambiguity is a plain value in YARRRML, which no prefix expands."""
+    mapping = mapping_copy(
+        tmp_path,
+        ('                      value: skos:altLabel\n',
+         '                      value: skos:altLabel\n' + parameter),
+        mapping=os.path.join(TEST_DIR, 'mapping.yarrrml'),
+    )
+    g_morph = morph_kgc.materialize(ambiguous_config(mapping))
+
+    assert reconciled(g_morph) == {('pid_00001', ATAXIA)}
+
+
+@pytest.mark.parametrize('ambiguity', ['FIRST', 'ANY', 'NO', 'ALL_MATCHES', ''])
+def test_invalid_ambiguity(tmp_path, ambiguity):
+    """
+    An ambiguity that is not one of those known fails, naming them, before the
+    vocabulary is downloaded.
+    """
+    mapping = mapping_copy(tmp_path, with_ambiguity(f'"{ambiguity}"'))
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=ambiguity_error(ambiguity)):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}',
+                mapping=mapping,
+            ))
+
+        assert server.requests == []
+
+
+@pytest.mark.parametrize('binding', [
+    'rml:inputValueMap [ rml:reference "disease_label" ]',
+    'rml:inputValueMap [ rml:template "{disease_label}" ]',
+    # A constant, but two of them.
+    'rml:inputValue "NONE" , "FAIL"',
+])
+def test_ambiguity_not_given_as_a_single_constant(tmp_path, binding):
+    """An ambiguity read from the data fails before the vocabulary is downloaded."""
+    old, new = with_ambiguity('"NONE"')
+    mapping = mapping_copy(
+        tmp_path, (old, new.replace('rml:inputValue "NONE"', binding)),
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=r"must bind 'urn:morph:function:ambiguity' at most once, to a constant"):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}',
+                mapping=mapping,
+            ))
+
+        assert server.requests == []
+
+
+@pytest.mark.parametrize('ambiguity', ['FIRST', 'yes'])
+def test_invalid_ambiguity_option(ambiguity):
+    """
+    An ambiguity option that is not one of those known fails, naming them,
+    before the vocabulary is downloaded.
+    """
+    error = (
+        f"Option 'ambiguity' of resource 'disease_vocabulary', which function "
+        f"'urn:morph:function:reconciliation:reconcileVocabularyConcept' reconciles "
+        f"against, is '{ambiguity}', which is not valid. Must be one of: ALL, FAIL, NONE."
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=re.escape(error)):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}\n'
+                f'ambiguity={ambiguity}',
+            ))
+
+        assert server.requests == []
+
+
+# The query of mapping_sparql.ttl, but with the identifier of the fourth study
+# replaced by the one of the first, which then matches both.
+AMBIGUOUS_STUDIES_QUERY = """
+            PREFIX schema: <https://schema.org/>
+            SELECT ?entity_iri ?matching_value_1 WHERE {
+                GRAPH ?g {
+                    ?entity_iri a schema:MedicalStudy ;
+                                schema:identifier ?identifier .
+                }
+                BIND(IF(?identifier = "NCT07667179", "NCT07667218", ?identifier) AS ?matching_value_1)
+            }
+        """
+
+# The reconciled studies of the patients of clinical_trials.csv.
+UNAMBIGUOUS_STUDIES = {
+    ('urn:id:p2', 'https://data.com/id/2'), ('urn:id:p2', 'https://data.com/id/3'),
+}
+AMBIGUOUS_STUDIES = {
+    ('urn:id:p1', 'https://data.com/id/1'), ('urn:id:p1', 'https://data.com/id/4'),
+}
+
+
+def with_sparql_ambiguity(ambiguity):
+    """The replacement adding an ambiguity input to the execution of mapping_sparql.ttl."""
+    return (
+        '[ rml:reference "clinical_trial_id" ]\n    ] .\n',
+        '[ rml:reference "clinical_trial_id" ]\n    ] ;\n'
+        '    rml:input [\n'
+        '        rml:parameter morph-fn:ambiguity ;\n'
+        f'        rml:inputValue {ambiguity}\n'
+        '    ] .\n',
+    )
+
+
+def studies(g_morph):
+    return {(str(s), str(o)) for s, o in g_morph.subject_objects()}
+
+
+@pytest.mark.parametrize('replacements, resource_options, expected', [
+    ((), '', UNAMBIGUOUS_STUDIES | AMBIGUOUS_STUDIES),
+    ((), 'ambiguity=NONE', UNAMBIGUOUS_STUDIES),
+    ((with_sparql_ambiguity('"none"'),), '', UNAMBIGUOUS_STUDIES),
+    ((with_sparql_ambiguity('"ALL"'),), 'ambiguity=FAIL', UNAMBIGUOUS_STUDIES | AMBIGUOUS_STUDIES),
+])
+def test_ambiguity_over_sparql(tmp_path, caplog, replacements, resource_options, expected):
+    """
+    The policy for ambiguous values is the execution's, or else the one of the
+    resource declaring the endpoint, which the mapping names by its IRI.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql', resource_options),
+            mapping=sparql_mapping(
+                tmp_path, (STUDIES_QUERY, AMBIGUOUS_STUDIES_QUERY), *replacements,
+            ),
+        ))
+
+    assert studies(g_morph) == expected
+    reports = multiple_match_reports(caplog)
+    if expected == UNAMBIGUOUS_STUDIES:
+        assert reports == [
+            f"MULTIPLE_MATCH: value 'NCT07667218' matches 2 entities of SPARQL "
+            f"endpoint '{MAPPING_ENDPOINT}': <https://data.com/id/1>, "
+            f"<https://data.com/id/4>. No triple is generated for it, as the "
+            f"ambiguity policy is NONE.",
+        ]
+    else:
+        assert reports == []
+
+
+@pytest.mark.parametrize('replacements, resource_options', [
+    ((with_sparql_ambiguity('"FAIL"'),), ''),
+    ((), 'ambiguity=FAIL'),
+])
+def test_ambiguity_fail_over_sparql(tmp_path, replacements, resource_options):
+    """With FAIL, the first ambiguous value aborts the run, reporting it."""
+    report = (
+        f"MULTIPLE_MATCH: value 'NCT07667218' matches 2 entities of SPARQL "
+        f"endpoint '{MAPPING_ENDPOINT}': <https://data.com/id/1>, "
+        f"<https://data.com/id/4>. The run is aborted, as the ambiguity policy is FAIL."
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=re.escape(report)):
+            morph_kgc.materialize(sparql_config(
+                endpoint_resource(f'{server.url}/sparql', resource_options),
+                mapping=sparql_mapping(
+                    tmp_path, (STUDIES_QUERY, AMBIGUOUS_STUDIES_QUERY), *replacements,
+                ),
+            ))
+
+
+def test_invalid_ambiguity_over_sparql(tmp_path):
+    """An invalid ambiguity fails before any query is sent."""
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=ambiguity_error('SOME')):
+            morph_kgc.materialize(sparql_config(
+                endpoint_resource(f'{server.url}/sparql'),
+                mapping=sparql_mapping(tmp_path, with_sparql_ambiguity('"SOME"')),
+            ))
+
+        assert server.requests == []
+
+
+def test_invalid_ambiguity_option_over_sparql():
+    """An invalid ambiguity option of an endpoint fails before any query is sent."""
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=r"Option 'ambiguity' of resource 'clinical_trials'.*is 'SOME'"):
+            morph_kgc.materialize(sparql_config(
+                endpoint_resource(f'{server.url}/sparql', 'ambiguity=SOME'),
+            ))
+
+        assert server.requests == []
+
+
+# ── Ambiguous values of several executions ────────────────────────────────────
+
+TWO_EXECUTIONS_MAPPING = os.path.join(TEST_DIR, 'mapping_two_executions.ttl')
+SEVERAL_SPARQL_MAPPING = os.path.join(TEST_DIR, 'mapping_sparql_several.ttl')
+# The predicates of mapping_two_executions.ttl.
+DISEASE_BY_ALT_LABEL = 'https://example.org/kg/diseaseByAltLabel'
+DISEASE = 'https://example.org/kg/disease'
+ALL_CONCEPTS = {('pid_00001', ATAXIA), ('pid_00002', NARCOLEPSY), ('pid_00002', ADCA_DN)}
+
+
+def execution_input(parameter, value):
+    """An rml:input binding *parameter* to the constant *value*, added to an execution."""
+    return f' ;\n    rml:input [ rml:parameter {parameter} ; rml:inputValue {value} ]'
+
+
+def two_executions(tmp_path, alt_label_inputs='', disease_inputs=''):
+    """
+    mapping_two_executions.ttl, whose first execution matches the preferred and
+    the alternative labels, and whose second names no attribute, with the
+    inputs given added to each.
+    """
+    return mapping_copy(
+        tmp_path,
+        ('rml:inputValue skos:altLabel\n    ] .',
+         f'rml:inputValue skos:prefLabel , skos:altLabel\n    ]{alt_label_inputs} .'),
+        ('[ rml:reference "disease_label" ]\n    ] .',
+         f'[ rml:reference "disease_label" ]\n    ]{disease_inputs} .'),
+        mapping=TWO_EXECUTIONS_MAPPING,
+    )
+
+
+def two_vocabularies_config(mapping, options_a='', options_b='', url_a=AMBIGUOUS_VOCABULARY,
+                            url_b=AMBIGUOUS_VOCABULARY, configuration=''):
+    """A configuration declaring two vocabularies, vocabulary_a and vocabulary_b."""
+    return (
+        f'[CONFIGURATION]\n'
+        f'output_format=N-QUADS\n'
+        f'number_of_processes=1\n'
+        f'{configuration}\n'
+        f'[RESOURCE:vocabulary_a]\n'
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={url_a}\n'
+        f'{options_a}\n'
+        f'[RESOURCE:vocabulary_b]\n'
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={url_b}\n'
+        f'{options_b}\n'
+        f'[DataSource]\n'
+        f'mappings={mapping}'
+    )
+
+
+@pytest.mark.parametrize('alt_label_policy, disease_policy', [('ALL', 'NONE'), ('NONE', 'ALL')])
+def test_ambiguous_value_reported_under_each_policy(tmp_path, caplog, alt_label_policy, disease_policy):
+    """
+    A value two executions reconcile under different policies is reported
+    under each, whichever mapping rule runs first.
+    """
+    mapping = two_executions(
+        tmp_path,
+        execution_input('morph-fn:ambiguity', f'"{alt_label_policy}"'),
+        execution_input('morph-fn:ambiguity', f'"{disease_policy}"'),
+    )
+    g_morph = morph_kgc.materialize(ambiguous_config(mapping, configuration='logging_level=DEBUG'))
+
+    policies = {DISEASE_BY_ALT_LABEL: alt_label_policy, DISEASE: disease_policy}
+    for predicate, policy in policies.items():
+        expected = ALL_CONCEPTS if policy == 'ALL' else {('pid_00001', ATAXIA)}
+        assert reconciled(g_morph, predicate) == expected
+    assert multiple_match_reports(caplog, 'DEBUG') == [
+        ambiguous_label_report('A triple is generated for each of them', 'ALL'),
+    ]
+    assert multiple_match_reports(caplog) == [
+        ambiguous_label_report('No triple is generated for it', 'NONE'),
+    ]
+
+
+def test_same_report_of_two_executions_written_once(tmp_path, caplog):
+    """
+    Executions looking a value up differently (here, against different
+    attributes) that report it alike write a single record.
+    """
+    g_morph = morph_kgc.materialize(ambiguous_config(
+        two_executions(tmp_path), resource_options='ambiguity=NONE',
+    ))
+
+    assert reconciled(g_morph, DISEASE_BY_ALT_LABEL) == {('pid_00001', ATAXIA)}
+    assert reconciled(g_morph, DISEASE) == {('pid_00001', ATAXIA)}
+    assert multiple_match_reports(caplog) == [
+        ambiguous_label_report('No triple is generated for it', 'NONE'),
+    ]
+
+
+@pytest.mark.parametrize('options_a, options_b', [
+    ('ambiguity=NONE', 'ambiguity=ALL'),
+    ('ambiguity=ALL', 'ambiguity=NONE'),
+    ('ambiguity=NONE', ''),
+])
+def test_ambiguity_option_of_each_resource(tmp_path, options_a, options_b):
+    """Each resource sets the policy of the executions reconciling against it."""
+    mapping = two_executions(
+        tmp_path,
+        execution_input('morph-fn:resource', '"vocabulary_a"'),
+        execution_input('morph-fn:resource', '"vocabulary_b"'),
+    )
+    g_morph = morph_kgc.materialize(two_vocabularies_config(mapping, options_a, options_b))
+
+    for predicate, options in ((DISEASE_BY_ALT_LABEL, options_a), (DISEASE, options_b)):
+        expected = {('pid_00001', ATAXIA)} if options == 'ambiguity=NONE' else ALL_CONCEPTS
+        assert reconciled(g_morph, predicate) == expected
+
+
+def test_ambiguous_value_reported_for_each_resource(tmp_path, caplog):
+    """A value ambiguous in two vocabularies is reported for each."""
+    mapping = two_executions(
+        tmp_path,
+        execution_input('morph-fn:resource', '"vocabulary_a"'),
+        execution_input('morph-fn:resource', '"vocabulary_b"'),
+    )
+    morph_kgc.materialize(two_vocabularies_config(mapping, 'ambiguity=NONE', 'ambiguity=NONE'))
+
+    assert sorted(multiple_match_reports(caplog)) == [
+        f"MULTIPLE_MATCH: value '{AMBIGUOUS_LABEL}' matches 2 entities of resource "
+        f"'{name}': <{NARCOLEPSY}>, <{ADCA_DN}>. No triple is generated for it, "
+        f"as the ambiguity policy is NONE."
+        for name in ('vocabulary_a', 'vocabulary_b')
+    ]
+
+
+@pytest.mark.parametrize('invalid', ['vocabulary_a', 'vocabulary_b'])
+def test_invalid_ambiguity_option_of_one_of_two_resources(tmp_path, invalid):
+    """
+    The ambiguity options of every resource are checked before any vocabulary
+    is downloaded, whichever is invalid.
+    """
+    mapping = two_executions(
+        tmp_path,
+        execution_input('morph-fn:resource', '"vocabulary_a"'),
+        execution_input('morph-fn:resource', '"vocabulary_b"'),
+    )
+    credentials = f'username={USERNAME}\npassword={PASSWORD}\n'
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=f"Option 'ambiguity' of resource '{invalid}'"):
+            morph_kgc.materialize(two_vocabularies_config(
+                mapping,
+                credentials + ('ambiguity=FIRST' if invalid == 'vocabulary_a' else ''),
+                credentials + ('ambiguity=FIRST' if invalid == 'vocabulary_b' else ''),
+                url_a=f'{server.url}/vocabulary',
+                url_b=f'{server.url}/vocabulary.nq',
+            ))
+
+        assert server.requests == []
+
+
+def several_endpoints(server, clinical_trials_options='', public_options=''):
+    """The endpoints of mapping_sparql_several.ttl, as test_several_reconciliations_in_one_mapping declares them."""
+    return endpoint_resource(f'{server.url}/sparql', clinical_trials_options) + (
+        f'\n[RESOURCE:public]\n'
+        f'resource_type=SPARQL_ENDPOINT\n'
+        f'iri=https://data.com/public/query\n'
+        f'url={server.url}/public/sparql\n'
+        f'{public_options}\n'
+    )
+
+
+def with_sparql_execution_input(execution, parameter, value):
+    """The replacement adding an input to *execution* of mapping_sparql_several.ttl."""
+    head = f'{execution}\n    rml:function morph-fn:reconcileEntityOverSPARQL ;\n'
+    return (head, f'{head}    rml:input [ rml:parameter {parameter} ; rml:inputValue {value} ] ;\n')
+
+
+SEVERAL_SPARQL_EXECUTIONS = [
+    '<#ClinicalTrialReconciliation>',
+    '<#ClinicalTrialReconciliationAgain>',
+    '<#DrugReconciliation>',
+    '<#PublicClinicalTrialReconciliation>',
+]
+
+
+def objects_of(g_morph, predicate):
+    return {
+        (str(s), str(o))
+        for s, o in g_morph.subject_objects(URIRef(f'https://example.org/ontology/{predicate}'))
+    }
+
+
+@pytest.mark.parametrize('execution', SEVERAL_SPARQL_EXECUTIONS)
+def test_invalid_ambiguity_of_one_of_several_sparql_executions(tmp_path, execution):
+    """The ambiguity of every execution is checked before any query is sent."""
+    mapping = sparql_mapping(
+        tmp_path,
+        with_sparql_execution_input(execution, 'morph-fn:ambiguity', '"SOME"'),
+        mapping=SEVERAL_SPARQL_MAPPING,
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=ambiguity_error('SOME')):
+            morph_kgc.materialize(sparql_config(several_endpoints(server), mapping=mapping))
+
+        assert server.requests == []
+
+
+@pytest.mark.parametrize('invalid', ['clinical_trials', 'public'])
+def test_invalid_ambiguity_option_of_one_of_several_endpoints(invalid):
+    """The ambiguity options of every endpoint are checked before any query is sent."""
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=f"Option 'ambiguity' of resource '{invalid}'.*is 'SOME'"):
+            morph_kgc.materialize(sparql_config(
+                several_endpoints(
+                    server,
+                    'ambiguity=SOME' if invalid == 'clinical_trials' else '',
+                    'ambiguity=SOME' if invalid == 'public' else '',
+                ),
+                mapping=SEVERAL_SPARQL_MAPPING,
+            ))
+
+        assert server.requests == []
+
+
+@pytest.mark.parametrize('clinical_trials_policy, public_policy', [('NONE', 'ALL'), ('ALL', 'NONE')])
+def test_ambiguity_option_of_each_endpoint(tmp_path, clinical_trials_policy, public_policy):
+    """Each endpoint's resource sets the policy of the executions querying it."""
+    mapping = sparql_mapping(
+        tmp_path, (STUDIES_QUERY, AMBIGUOUS_STUDIES_QUERY), mapping=SEVERAL_SPARQL_MAPPING,
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            several_endpoints(
+                server, f'ambiguity={clinical_trials_policy}', f'ambiguity={public_policy}',
+            ),
+            mapping=mapping,
+        ))
+
+    def expected(policy):
+        return UNAMBIGUOUS_STUDIES | (AMBIGUOUS_STUDIES if policy == 'ALL' else set())
+
+    assert objects_of(g_morph, 'participatesIn') == expected(clinical_trials_policy)
+    assert objects_of(g_morph, 'enrolledIn') == expected(clinical_trials_policy)
+    assert objects_of(g_morph, 'registeredIn') == expected(public_policy)
+
+
+@pytest.mark.parametrize('first_policy, again_policy', [('ALL', 'NONE'), ('NONE', 'ALL')])
+def test_ambiguous_value_over_sparql_reported_under_each_policy(
+    tmp_path, caplog, first_policy, again_policy,
+):
+    """
+    A value two executions sending the same query reconcile under different
+    policies is reported under each.
+    """
+    mapping = sparql_mapping(
+        tmp_path,
+        (STUDIES_QUERY, AMBIGUOUS_STUDIES_QUERY),
+        with_sparql_execution_input(
+            '<#ClinicalTrialReconciliation>', 'morph-fn:ambiguity', f'"{first_policy}"',
+        ),
+        with_sparql_execution_input(
+            '<#ClinicalTrialReconciliationAgain>', 'morph-fn:ambiguity', f'"{again_policy}"',
+        ),
+        mapping=SEVERAL_SPARQL_MAPPING,
+    )
+    with VocabularyServer() as server:
+        morph_kgc.materialize(sparql_config(several_endpoints(server), mapping=mapping).replace(
+            '[CONFIGURATION]\n', '[CONFIGURATION]\nlogging_level=DEBUG\n',
+        ))
+
+    report = (
+        f"MULTIPLE_MATCH: value 'NCT07667218' matches 2 entities of SPARQL "
+        f"endpoint '{MAPPING_ENDPOINT}': <https://data.com/id/1>, <https://data.com/id/4>. "
+    )
+    assert multiple_match_reports(caplog) == [
+        report + 'No triple is generated for it, as the ambiguity policy is NONE.',
+    ]
+    # The public endpoint, under ALL as well, is reported in a record of its own.
+    assert report + 'A triple is generated for each of them, as the ambiguity policy is ALL.' \
+        in multiple_match_reports(caplog, 'DEBUG')
+
+
+# ── Entities matched by several values ────────────────────────────────────────
+
+CODES_MAPPING = os.path.join(TEST_DIR, 'mapping_sparql_codes.ttl')
+CODES_QUERY = """
+            PREFIX schema: <https://schema.org/>
+            SELECT ?entity_iri ?matching_value_1 ?matching_value_2 WHERE {
+                GRAPH ?g {
+                    ?entity_iri a schema:MedicalCode ;
+                                schema:codeValue ?matching_value_1 ;
+                                schema:codingSystem ?matching_value_2 .
+                }
+            }
+        """
+# The values of mapping_sparql_codes.ttl, as it binds them.
+CODE_INPUT = (
+    '    rml:input [\n'
+    '        rml:parameter grel:valueParam1 ;\n'
+    '        rml:inputValueMap [ rml:reference "code" ]\n'
+    '    ]'
+)
+SCHEME_INPUT = (
+    '    rml:input [\n'
+    '        rml:parameter grel:valueParam2 ;\n'
+    '        rml:inputValueMap [ rml:reference "scheme" ]\n'
+    '    ]'
+)
+# The codes each patient of diagnoses.csv is diagnosed with.
+DIAGNOSES = {
+    ('urn:id:p1', 'https://data.com/id/6'),
+    ('urn:id:p2', 'https://data.com/id/7'),
+    ('urn:id:p3', 'https://data.com/id/8'),
+    ('urn:id:p4', 'https://data.com/id/9'),
+    ('urn:id:p5', 'https://data.com/id/10'),
+}
+
+
+def codes_mapping(tmp_path, server, *replacements, path='/public/sparql'):
+    """A copy of mapping_sparql_codes.ttl querying *path* of *server*."""
+    return sparql_mapping(
+        tmp_path, (MAPPING_ENDPOINT, f'{server.url}{path}'), *replacements, mapping=CODES_MAPPING,
+    )
+
+
+def diagnoses(g_morph):
+    return {(str(s), str(o)) for s, o in g_morph.subject_objects(URIRef(
+        'https://example.org/ontology/diagnosedWith'
+    ))}
+
+
+def test_reconcile_entities_by_two_values():
+    """
+    Rows are reconciled with the entities matched by both their code and their
+    coding system: values holding ',', '|' and whitespace are compared one by
+    one, so that the codes of 'A|1' in 'ICD-10' and 'A' in '1|ICD-10', or of
+    'B, C' in 'SNOMED CT' and 'B' in ' C,SNOMED CT', are told apart. The
+    query is sent once.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql'), mapping=CODES_MAPPING,
+        ))
+
+        assert server.requests == [('/sparql', CODES_QUERY)]
+
+    assert_isomorphic(expected_sparql_graph('output_sparql_codes.nq'), g_morph)
+
+
+@pytest.mark.parametrize('path, expected', [
+    ('/public/sparql/no-head', DIAGNOSES),
+    ('/public/sparql/results-first', DIAGNOSES),
+    ('/public/sparql/gzip', DIAGNOSES),
+    # Read in memory, as the streaming parser rejects a solution, which binds
+    # a single value and is left out.
+    ('/public/sparql/bad-term', DIAGNOSES),
+    # The parser of answers in XML trims the whitespace a literal starts with,
+    # unless the endpoint escapes it ('&#32;'), which rdflib does not: the
+    # coding system ' C,SNOMED CT' then reads 'C,SNOMED CT'.
+    ('/public/sparql/xml', DIAGNOSES - {('urn:id:p5', 'https://data.com/id/10')}),
+])
+def test_reconcile_entities_by_two_values_from_answers_in_other_shapes(tmp_path, path, expected):
+    """Every way of reading an answer reads all the values of its solutions."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(tmp_path, server, path=path),
+        ))
+
+    assert diagnoses(g_morph) == expected
+
+
+def test_reconcile_entities_by_two_values_with_multiple_processes():
+    """Worker processes look the tuples of values up in the index on disk."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql'), mapping=CODES_MAPPING, processes=4,
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES
+
+
+@pytest.mark.parametrize('replacements', [
+    (('grel:valueParam1', 'grel:valueParam'),),
+    (('grel:valueParam1', 'grel:valueParameter1'), ('grel:valueParam2', 'grel:valueParameter2')),
+    (('grel:valueParam1', 'grel:valueParameter'),),
+    # The inputs of an execution have no order.
+    ((f'{CODE_INPUT} ;\n{SCHEME_INPUT}', f'{SCHEME_INPUT} ;\n{CODE_INPUT}'),),
+])
+def test_value_parameters_numbered_under_any_spelling(tmp_path, replacements):
+    """
+    The values are matched to the variables by the number of their parameter,
+    under either GREL spelling, the first of them unnumbered or not.
+    """
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(tmp_path, server, *replacements),
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES
+
+
+def test_values_matched_by_position(tmp_path):
+    """The code bound as the second value is matched against coding systems."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server,
+                ('rml:reference "code"', 'rml:reference "SCHEME"'),
+                ('rml:reference "scheme"', 'rml:reference "code"'),
+                ('rml:reference "SCHEME"', 'rml:reference "scheme"'),
+            ),
+        ))
+
+    assert len(g_morph) == 0
+
+
+def test_constant_value(tmp_path):
+    """A value may be a constant, such as the coding system all rows are in."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server,
+                ('rml:inputValueMap [ rml:reference "scheme" ]', 'rml:inputValue "ICD-10"'),
+            ),
+        ))
+
+    # The coding system of every row is ICD-10, even when its scheme is empty.
+    assert diagnoses(g_morph) == {
+        (f'urn:id:{patient}', 'https://data.com/id/6') for patient in ('p1', 'p2', 'p6', 'p7')
+    }
+
+
+@pytest.mark.parametrize('third_value, expected', [('"Diagnosis"', DIAGNOSES), ('"Procedure"', set())])
+def test_reconcile_entities_by_three_values(tmp_path, third_value, expected):
+    """Entities are matched by any number of values."""
+    query = CODES_QUERY.replace(
+        '?matching_value_2 WHERE {', '?matching_value_2 ?matching_value_3 WHERE {',
+    ).replace(
+        'schema:codingSystem ?matching_value_2 .\n                }',
+        'schema:codingSystem ?matching_value_2 .\n                }\n'
+        '                BIND("Diagnosis" AS ?matching_value_3)',
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server,
+                (CODES_QUERY, query),
+                (SCHEME_INPUT, SCHEME_INPUT + ' ;\n'
+                 '    rml:input [ rml:parameter grel:valueParam3 ; '
+                 f'rml:inputValue {third_value} ]'),
+            ),
+        ))
+
+    assert diagnoses(g_morph) == expected
+
+
+def test_reconcile_entities_by_ten_values(tmp_path):
+    """Values are told apart by the number of their position, 10 coming after 9."""
+    query = CODES_QUERY.replace(
+        '?matching_value_2 WHERE {',
+        '?matching_value_2 '
+        + ' '.join(f'?matching_value_{position}' for position in range(3, 11)) + ' WHERE {',
+    ).replace(
+        'schema:codingSystem ?matching_value_2 .\n                }',
+        'schema:codingSystem ?matching_value_2 .\n                }\n'
+        + ''.join(
+            f'                BIND("v{position}" AS ?matching_value_{position})\n'
+            for position in range(3, 11)
+        ),
+    )
+    inputs = ''.join(
+        f' ;\n    rml:input [ rml:parameter grel:valueParam{position} ; '
+        f'rml:inputValue "v{position}" ]'
+        for position in range(3, 11)
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query), (SCHEME_INPUT, SCHEME_INPUT + inputs)),
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES
+
+
+def test_reconcile_by_one_value_and_by_two_in_one_mapping():
+    """Each query matches entities by the number of values its executions reconcile."""
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql'), mapping=f'{SPARQL_MAPPING},{CODES_MAPPING}',
+        ))
+
+        assert sorted(server.requests) == sorted([('/sparql', STUDIES_QUERY), ('/sparql', CODES_QUERY)])
+
+    # Parsed at once: each parse of a Dataset puts its triples in a graph of its own.
+    data = ''
+    for file_name in ('output_sparql.nq', 'output_sparql_codes.nq'):
+        with open(os.path.join(TEST_DIR, file_name), encoding='utf-8') as f:
+            data += f.read()
+    expected = Dataset()
+    expected.parse(data=data, format='nquads')
+    assert_isomorphic(expected, g_morph)
+
+
+def test_reconcile_entities_by_two_values_from_yarrrml(tmp_path):
+    """The values are numbered parameters in YARRRML as well."""
+    mapping = tmp_path / 'mapping.yarrrml'
+    with VocabularyServer() as server:
+        mapping.write_text(
+            'prefixes:\n'
+            '    grel: http://users.ugent.be/~bjdmeest/function/grel.ttl#\n'
+            '    morph-fn: "urn:morph:function:"\n'
+            '    bi: https://example.org/ontology/\n'
+            'mappings:\n'
+            '    diagnoses:\n'
+            '        sources:\n'
+            '            - access: test/rml-fnml/reconciliation/diagnoses.csv\n'
+            '              referenceFormulation: csv\n'
+            '        subjects: urn:id:$(patient_id)\n'
+            '        predicateobjects:\n'
+            '            - p: bi:diagnosedWith\n'
+            '              o:\n'
+            '                function: morph-fn:reconcileEntityOverSPARQL\n'
+            '                type: iri\n'
+            '                parameters:\n'
+            '                    - parameter: morph-fn:sparqlEndpointUrl\n'
+            f'                      value: {server.url}/public/sparql\n'
+            '                    - parameter: morph-fn:sparqlQuery\n'
+            '                      value: |\n'
+            + ''.join(f'                        {line.strip()}\n' for line in CODES_QUERY.strip().splitlines())
+            + '                    - [grel:valueParam2, $(scheme)]\n'
+            '                    - [grel:valueParam1, $(code)]\n',
+            encoding='utf-8',
+        )
+        g_morph = morph_kgc.materialize(sparql_config(mapping=str(mapping)))
+
+    assert diagnoses(g_morph) == DIAGNOSES
+
+
+def test_entity_missing_a_value_is_not_matched(tmp_path):
+    """An entity a solution binds no coding system to is matched by no row."""
+    query = CODES_QUERY.replace(
+        'schema:codingSystem ?matching_value_2 .',
+        '.\n                    OPTIONAL { ?entity_iri schema:codingSystem ?matching_value_2 '
+        'FILTER(?matching_value_2 != "ICD 10") }',
+    ).replace('schema:codeValue ?matching_value_1 ;', 'schema:codeValue ?matching_value_1')
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query)),
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES - {('urn:id:p2', 'https://data.com/id/7')}
+
+
+def test_ambiguous_tuple_of_values(tmp_path, caplog):
+    """A tuple of values matching several entities is ambiguous as a whole."""
+    # 'ICD 10' read as 'ICD-10' makes 'A|1' in 'ICD-10' match the codes of 6 and 7.
+    query = CODES_QUERY.replace(
+        'schema:codingSystem ?matching_value_2 .\n                }',
+        'schema:codingSystem ?system .\n                }\n'
+        '                BIND(IF(?system = "ICD 10", "ICD-10", ?system) AS ?matching_value_2)',
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql', 'ambiguity=NONE'),
+            mapping=sparql_mapping(tmp_path, (CODES_QUERY, query), mapping=CODES_MAPPING),
+        ))
+
+    assert diagnoses(g_morph) == DIAGNOSES - {
+        ('urn:id:p1', 'https://data.com/id/6'), ('urn:id:p2', 'https://data.com/id/7'),
+    }
+    assert multiple_match_reports(caplog) == [
+        f"MULTIPLE_MATCH: value ('A|1', 'ICD-10') matches 2 entities of SPARQL endpoint "
+        f"'{MAPPING_ENDPOINT}': <https://data.com/id/6>, <https://data.com/id/7>. "
+        f"No triple is generated for it, as the ambiguity policy is NONE.",
+    ]
+
+
+@pytest.mark.parametrize('path', ['/public/sparql', '/public/sparql/no-head'])
+def test_query_matching_by_more_values_than_the_mapping(tmp_path, path):
+    """
+    A query matching entities by a value the mapping does not reconcile fails,
+    even when its answer leaves its head out, instead of matching rows by some
+    of the values of entities only.
+    """
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            r'(matches entities by 2 value\(s\), \?matching_value_1 \?matching_value_2, but '
+            r'the mapping reconciles 1 value\(s\) with it|binds \?matching_value_2, so its '
+            r'query matches entities by values the mapping does not reconcile: it reconciles '
+            r'1 value\(s\) with it, \?matching_value_1)\. Bind one value to reconcile per variable'
+        )):
+            morph_kgc.materialize(sparql_config(
+                mapping=codes_mapping(tmp_path, server, (f' ;\n{SCHEME_INPUT}', ''), path=path),
+            ))
+
+
+def test_query_matching_by_fewer_values_than_the_mapping(tmp_path):
+    """A query projecting fewer values than the mapping binds fails, saying how many."""
+    query = CODES_QUERY.replace(' ?matching_value_2 WHERE', ' WHERE').replace(
+        'schema:codingSystem ?matching_value_2', 'schema:codingSystem ?system',
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            r'matches entities by 1 value\(s\), \?matching_value_1, but the mapping '
+            r"reconciles 2 value\(s\) with it\. Bind one value to reconcile per variable"
+        )):
+            morph_kgc.materialize(sparql_config(
+                mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query)),
+            ))
+
+
+@pytest.mark.parametrize('variable, error', [
+    ('matching_value_3', r'projects \?matching_value_3 but not \?matching_value_2: the values '
+                         r'an entity is matched by are numbered from 1, without gaps\.'),
+    ('matching_value_02', r'projects \?matching_value_02, which is not numbered as the values '
+                          r'an entity is matched by are: \?matching_value_1, '
+                          r'\?matching_value_2, \?matching_value_3\.\.\. from 1, without '
+                          r'leading zeros\.'),
+    ('matching_value_0', r'projects \?matching_value_0, which is not numbered'),
+])
+def test_query_projecting_values_not_numbered_from_1(tmp_path, variable, error):
+    """The variables of the values are numbered from 1, without gaps or leading zeros."""
+    query = CODES_QUERY.replace('?matching_value_2', f'?{variable}')
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=error):
+            morph_kgc.materialize(sparql_config(
+                mapping=codes_mapping(tmp_path, server, (CODES_QUERY, query)),
+            ))
+
+
+@pytest.mark.parametrize('replacements, error', [
+    # No value at all.
+    (((f'{CODE_INPUT} ;\n{SCHEME_INPUT}', '    rml:input [ rml:parameter morph-fn:unused ; '
+       'rml:inputValue "x" ]'),),
+     r"binds no value to reconcile\. Bind it to "
+     r"'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam'\."),
+    # A gap.
+    ((('grel:valueParam2', 'grel:valueParam3'),),
+     r'binds value 3 to reconcile but not value 2\. The values are numbered from 1'),
+    # A number with a leading zero numbers no value.
+    ((('grel:valueParam1 ;', 'grel:valueParam01 ;'),),
+     r'binds value 2 to reconcile but not value 1\.'),
+    # The first value twice, numbered and not.
+    (((SCHEME_INPUT, SCHEME_INPUT + ' ;\n'
+       '    rml:input [ rml:parameter grel:valueParam ; rml:inputValue "A|1" ]'),),
+     r"binds value 1 to reconcile 2 times, to "
+     r"'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam', "
+     r"'http://users\.ugent\.be/~bjdmeest/function/grel\.ttl#valueParam1'\. Bind it once"),
+    # The second value twice, under the same parameter.
+    ((('rml:inputValueMap [ rml:reference "scheme" ]',
+       'rml:inputValueMap [ rml:reference "scheme" ], [ rml:reference "code" ]'),),
+     r'binds value 2 to reconcile 2 times'),
+])
+def test_values_not_bound_once_each_from_1(tmp_path, replacements, error):
+    """
+    Values bound other than once each, numbered from 1, fail before the query
+    is sent.
+    """
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=error):
+            morph_kgc.materialize(sparql_config(
+                mapping=codes_mapping(tmp_path, server, *replacements),
+            ))
+
+        assert server.requests == []
+
+
+def test_same_query_reconciling_different_numbers_of_values(tmp_path):
+    """
+    Executions sending the same query to the same endpoint reconcile as many
+    values, the number of those it projects, which fails before it is sent.
+    """
+    mapping = sparql_mapping(
+        tmp_path,
+        with_sparql_execution_input(
+            '<#ClinicalTrialReconciliationAgain>', 'grel:valueParam2', '"ICD-10"',
+        ),
+        mapping=SEVERAL_SPARQL_MAPPING,
+    )
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            r"Executions '.*' and '.*' of function "
+            r"'urn:morph:function:reconcileEntityOverSPARQL' send the same query to "
+            r"'https://data\.com/database/query', but reconcile (1 and 2|2 and 1) values with it\."
+        )):
+            morph_kgc.materialize(sparql_config(several_endpoints(server), mapping=mapping))
+
+        assert server.requests == []
+
+
+def test_vocabulary_concepts_matched_by_the_first_value_numbered(tmp_path):
+    """The value reconciled against a vocabulary may be numbered as the first."""
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=mapping_copy(tmp_path, ('grel:valueParam ;', 'grel:valueParameter1 ;')),
+    ))
+
+    assert_isomorphic(expected_graph(), g_morph)
+
+
+def test_vocabulary_concepts_matched_by_two_values(tmp_path):
+    """The concepts of a vocabulary are matched by a single value, before it is downloaded."""
+    mapping = mapping_copy(tmp_path, (
+        'rml:inputValue skos:prefLabel , skos:altLabel\n    ]',
+        'rml:inputValue skos:prefLabel , skos:altLabel\n    ]'
+        + execution_input('grel:valueParam2', '"ICD-10"'),
+    ))
+    with VocabularyServer() as server:
+        with pytest.raises(ValueError, match=(
+            r"binds 2 values to reconcile, but the concepts of a vocabulary are matched by "
+            r"a single value\."
+        )):
+            morph_kgc.materialize(config(
+                f'resource_type=SKOS_VOCABULARY\n'
+                f'url={server.url}/vocabulary\n'
+                f'username={USERNAME}\n'
+                f'password={PASSWORD}',
+                mapping=mapping,
+            ))
+
+        assert server.requests == []
