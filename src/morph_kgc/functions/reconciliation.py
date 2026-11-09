@@ -44,10 +44,20 @@ in the configuration file, not in the mapping::
             rml:inputValue "CASE-INSENSITIVE"
         ] .
 
-``morph-fn:matching`` is ``EXACT`` (the default) or ``CASE-INSENSITIVE``, which
-also normalizes Unicode (NFKC) and collapses whitespace. It is a constant: the
-vocabulary is indexed before any data is read. Executions matching the same
-vocabulary differently share a single download of it.
+``morph-fn:matching`` says how values are compared:
+
+- ``EXACT`` (the default): as they are.
+- ``LOWERCASE``: lower-cased, and nothing else, as a Lucene index analyzing
+  them with ``KeywordTokenizer`` and ``LowerCaseFilter`` compares them: no
+  whitespace is trimmed or collapsed, and no Unicode normalization is applied,
+  so that ``Café `` matches ``café `` but not ``Café`` or ``cafe``, and
+  ``Straße`` does not match ``strasse``.
+- ``CASE-INSENSITIVE``: normalized (NFKC), with their whitespace collapsed, and
+  case-folded, so that ``Straße`` matches ``strasse``.
+
+It is a constant: what values are matched against is indexed before any data
+is read. Executions matching the same vocabulary differently share a single
+download of it, and both functions match values in the same ways.
 
 ``reconcileEntityOverSPARQL`` reconciles against the entities of any knowledge
 graph a SPARQL endpoint answers for. The mapping gives the endpoint and the
@@ -340,8 +350,8 @@ def _matching(initialization, execution) -> str:
     """How *execution* matches values: the constant it binds, EXACT when none."""
     value = _optional_constant(
         initialization, execution, MORPH_FN_MATCHING,
-        "the vocabulary is indexed before any data is read, so how values are "
-        "matched against it cannot depend on the data.",
+        "what the values are matched against is indexed before any data is "
+        "read, so how they are matched cannot depend on the data.",
     )
     if value is None:
         return EXACT_MATCHING
@@ -637,22 +647,25 @@ def _initialize_sparql(initialization) -> QueryContext:
     # A mistake in an execution, or in the resource declaring an endpoint, is
     # reported before any query is sent.
     context = QueryContext()
-    # (endpoint, query) -> the resource declaring the endpoint, and the number
-    # of values the executions sending the query reconcile, with the first of them
+    # (endpoint, query) -> the resource declaring the endpoint, the number of
+    # values the executions sending the query reconcile, with the first of them,
+    # and the ways they match values, each indexed from the same answer
     queries = {}
     for execution in initialization.executions:
         endpoint = _constant(initialization, execution, MORPH_FN_SPARQL_ENDPOINT_URL)
         query    = _constant(initialization, execution, MORPH_FN_SPARQL_QUERY)
         values   = _value_count(initialization, execution)
+        matching = _matching(initialization, execution)
         _ambiguity(initialization, execution)
 
         if (endpoint, query) not in queries:
             resource = _endpoint_resource(initialization, endpoint)
             context.ambiguities[endpoint] = _resource_ambiguity(initialization, resource)
-            queries[(endpoint, query)] = (resource, values, execution.execution_id)
+            queries[(endpoint, query)] = (resource, values, execution.execution_id, {matching: None})
             continue
 
-        _, other_values, other = queries[(endpoint, query)]
+        _, other_values, other, matchings = queries[(endpoint, query)]
+        matchings[matching] = None
         if values != other_values:
             raise ValueError(
                 f"Executions '{other}' and '{execution.execution_id}' of function "
@@ -662,13 +675,14 @@ def _initialize_sparql(initialization) -> QueryContext:
                 f"?{sparql.MATCHING_VARIABLE_PREFIX}<i> variables it projects."
             )
 
-    for (endpoint, query), (resource, values, _) in queries.items():
+    for (endpoint, query), (resource, values, _, matchings) in queries.items():
         context.indexes[(endpoint, query)] = sparql.build_index(
             resource,
             query,
             state_dir    = initialization.state_dir,
             memory_limit = initialization.memory_limit,
             arity        = values,
+            matchings    = tuple(matchings),
         )
 
     return context
@@ -681,28 +695,34 @@ def _initialize_sparql(initialization) -> QueryContext:
     value       = VALUE_PARAMETERS,
     endpoint    = MORPH_FN_SPARQL_ENDPOINT_URL,
     query       = MORPH_FN_SPARQL_QUERY,
+    matching    = MORPH_FN_MATCHING,
     ambiguity   = MORPH_FN_AMBIGUITY,
 )
-def reconcile_entity_over_sparql(context, value, endpoint=None, query=None, ambiguity=None):
+def reconcile_entity_over_sparql(
+    context, value, endpoint=None, query=None, matching=None, ambiguity=None,
+):
     """
     Reconcile each of *value* against the entities a SPARQL query returns: the
     value of each row, or the tuple of its values, when it binds several.
     """
-    # Every execution bound a single constant endpoint and query, which the
-    # initializer has indexed, and at most one policy, which it has checked.
+    # Every execution bound a single constant endpoint and query, and at most
+    # one matching, which the initializer has indexed, and at most one policy,
+    # which it has checked.
     value       = [row_values[0] if len(row_values) == 1 else row_values for row_values in value]
     endpoints   = _per_row(endpoint, len(value))
     queries     = _per_row(query, len(value))
+    matchings   = _per_row(EXACT_MATCHING if matching is None else matching, len(value))
     ambiguities = _per_row(ambiguity, len(value))
 
     groups: dict[tuple, list[int]] = {}
-    for row, key in enumerate(zip(endpoints, queries, ambiguities)):
+    for row, key in enumerate(zip(endpoints, queries, matchings, ambiguities)):
         groups.setdefault(key, []).append(row)
 
     def lookup(key, values):
-        row_endpoint, row_query, row_ambiguity = key
+        row_endpoint, row_query, row_matching, row_ambiguity = key
+        indexes = context.indexes[(row_endpoint, row_query)]
         return (
-            context.indexes[(row_endpoint, row_query)].lookup_many(values),
+            indexes[parse_matching(row_matching)].lookup_many(values),
             f"SPARQL endpoint '{row_endpoint}'",
             _row_ambiguity(row_ambiguity, context.ambiguity(row_endpoint)),
         )

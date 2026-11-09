@@ -648,6 +648,7 @@ def test_matching_in_legacy_fnml():
     '                    - parameter: morph-fn:matching\n'
     '                      value: CASE-INSENSITIVE\n',
     '                    - [morph-fn:matching, case-insensitive]\n',
+    '                    - [morph-fn:matching, lowercase]\n',
 ])
 def test_matching_in_yarrrml(tmp_path, parameter):
     """The matching is a plain value in YARRRML, which no prefix expands."""
@@ -830,7 +831,7 @@ def test_invalid_matching(tmp_path, matching):
     """A matching that is not one of those known fails, naming them."""
     error = (
         f"binds 'urn:morph:function:matching' to '{matching}', which is not valid. "
-        "Must be one of: CASE-INSENSITIVE, EXACT."
+        "Must be one of: CASE-INSENSITIVE, EXACT, LOWERCASE."
     )
     with pytest.raises(ValueError, match=re.escape(error)):
         morph_kgc.materialize(config(
@@ -2862,5 +2863,260 @@ def test_vocabulary_concepts_matched_by_two_values(tmp_path):
                 f'password={PASSWORD}',
                 mapping=mapping,
             ))
+
+        assert server.requests == []
+
+
+# ── Ways of matching values ───────────────────────────────────────────────────
+
+MATCHING_VOCABULARY = os.path.join(TEST_DIR, 'matching_vocabulary.ttl')
+TERM = 'https://example.org/vocabulary/term/'
+# What 'Café ', 'Straße' and 'STRASSE' (patients_matching.csv) match, by way of
+# matching: in a Lucene index of keywords lower-cased, as LOWERCASE matches
+# them, each matches a single concept, which matching them case-insensitively
+# makes ambiguous.
+MATCHED_TERMS = {
+    'EXACT': set(),
+    'LOWERCASE': {('pid_00001', f'{TERM}1'), ('pid_00002', f'{TERM}7'), ('pid_00003', f'{TERM}6')},
+    'CASE-INSENSITIVE': {
+        *(('pid_00001', f'{TERM}{term}') for term in (1, 3, 4, 5)),
+        *((pid, f'{TERM}{term}') for pid in ('pid_00002', 'pid_00003') for term in (6, 7)),
+    },
+}
+
+
+def test_normalize_by_matching():
+    """
+    LOWERCASE lower-cases each character as Lucene's LowerCaseFilter does, and
+    does nothing else; CASE-INSENSITIVE also normalizes Unicode, collapses
+    whitespace and case-folds.
+    """
+    from morph_kgc.reconciliation.index import normalize
+
+    def lowercase(value):
+        return normalize(value, 'LOWERCASE')
+
+    assert lowercase('Café ') == lowercase('café ') == 'café '
+    assert lowercase('Café ') not in (lowercase('cafe'), lowercase('Café'), lowercase('café '))
+    assert lowercase('Straße') == 'straße' != lowercase('strasse')
+    # Where str.lower() and Java's Character.toLowerCase(int) differ, as Lucene.
+    assert lowercase('İSTANBUL') == 'istanbul'
+    assert lowercase('ΟΔΟΣ ΣΟΦΙΑΣ') == 'οδοσ σοφιασ'
+    assert lowercase(' Ⅻ  ﬁ\t') == ' ⅻ  ﬁ\t'
+
+    def case_insensitive(value):
+        return normalize(value, 'CASE-INSENSITIVE')
+
+    assert case_insensitive('Café ') == case_insensitive('café  ') == 'café'
+    assert case_insensitive('Straße') == case_insensitive('STRASSE') == 'strasse'
+
+    assert normalize('Café ', 'EXACT') == 'Café '
+
+
+@pytest.mark.parametrize('matching', ['EXACT', 'LOWERCASE', 'CASE-INSENSITIVE'])
+def test_ways_of_matching_against_a_vocabulary(tmp_path, matching):
+    """
+    LOWERCASE matches 'Café ' to 'café ' only, not to 'cafe', 'Café', its
+    decomposed form or 'café  ', and 'Straße' to 'straße', not to 'strasse'.
+    """
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={MATCHING_VOCABULARY}',
+        mapping=mapping_copy(
+            tmp_path,
+            ('test/rml-fnml/reconciliation/patients.csv',
+             'test/rml-fnml/reconciliation/patients_matching.csv'),
+            with_matching(f'"{matching}"'),
+        ),
+    ))
+
+    assert reconciled(g_morph) == MATCHED_TERMS[matching]
+
+
+@pytest.mark.parametrize('matching', ['"LOWERCASE"', '"lowercase"', '" Lowercase "'])
+def test_reconcile_lowercase_matching(tmp_path, matching):
+    """Lower-case matching, in any case, reconciles values that differ in case only."""
+    g_morph = morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={VOCABULARY}',
+        mapping=mapping_copy(tmp_path, with_matching(matching), mapping=UPPERCASE_MAPPING),
+    ))
+
+    assert_isomorphic(reconciled_graph(), g_morph)
+
+
+def test_executions_matching_three_ways_download_the_vocabulary_once(tmp_path):
+    """Executions matching a vocabulary in each way share a single download of it."""
+    executions = ''.join(
+        f'\n<#{matching.title().replace("-", "")}Execution>\n'
+        '    rml:function morph-fr:reconcileVocabularyConcept ;\n'
+        '    rml:input [ rml:parameter grel:valueParam ; '
+        'rml:inputValueMap [ rml:reference "disease_label" ] ] ;\n'
+        f'    rml:input [ rml:parameter morph-fn:matching ; rml:inputValue "{matching}" ] .\n'
+        for matching in MATCHED_TERMS
+    )
+    maps = ''.join(
+        f'    rml:predicateObjectMap [\n'
+        f'        rml:predicate <https://example.org/kg/{matching}> ;\n'
+        f'        rml:objectMap [ rml:functionExecution <#{matching.title().replace("-", "")}Execution> ; '
+        f'rml:termType rml:IRI ]\n'
+        f'    ] ;\n'
+        for matching in MATCHED_TERMS
+    )
+    mapping = tmp_path / 'mapping.ttl'
+    mapping.write_text(
+        '@prefix rml: <http://w3id.org/rml/> .\n'
+        '@prefix grel: <http://users.ugent.be/~bjdmeest/function/grel.ttl#> .\n'
+        '@prefix morph-fr: <urn:morph:function:reconciliation:> .\n'
+        '@prefix morph-fn: <urn:morph:function:> .\n'
+        '@base <http://example.com/base/> .\n\n'
+        '<#PatientsMapping>\n'
+        '    a rml:TriplesMap ;\n'
+        '    rml:logicalSource [\n'
+        '        rml:source "test/rml-fnml/reconciliation/patients_matching.csv" ;\n'
+        '        rml:referenceFormulation rml:CSV\n'
+        '    ] ;\n'
+        + maps +
+        '    rml:subjectMap [ rml:template "https://example.org/kg/patient/{pid}" ] .\n'
+        + executions,
+        encoding='utf-8',
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(config(
+            f'resource_type=SKOS_VOCABULARY\n'
+            f'url={server.url}/matching-vocabulary\n'
+            f'username={USERNAME}\n'
+            f'password={PASSWORD}',
+            mapping=str(mapping),
+        ))
+
+        assert [path for path, _ in server.requests] == ['/matching-vocabulary']
+
+    for matching, expected in MATCHED_TERMS.items():
+        assert reconciled(g_morph, f'https://example.org/kg/{matching}') == expected
+
+
+# The labels of matching_vocabulary.ttl, answered by a query.
+MATCHING_QUERY = (
+    'SELECT ?entity_iri ?matching_value_1 WHERE { VALUES (?entity_iri ?matching_value_1) { '
+    + ' '.join(
+        f'(<{TERM}{term}> "{label}")'
+        for term, label in enumerate(
+            ['café ', 'cafe', 'Café', 'café ', 'café  ', 'strasse', 'straße'], 1,
+        )
+    )
+    + ' } }'
+)
+
+
+def with_sparql_input(parameter, value):
+    """The replacement adding an input to the execution of mapping_sparql.ttl."""
+    return (
+        '[ rml:reference "clinical_trial_id" ]\n    ] .\n',
+        '[ rml:reference "clinical_trial_id" ]\n    ] ;\n'
+        '    rml:input [\n'
+        f'        rml:parameter {parameter} ;\n'
+        f'        rml:inputValue {value}\n'
+        '    ] .\n',
+    )
+
+
+def patients_matching_source(tmp_path):
+    """patients_matching.csv, as clinical_trials.csv names its columns."""
+    with open(os.path.join(TEST_DIR, 'patients_matching.csv'), encoding='utf-8') as f:
+        rows = f.read().replace('pid,disease_label', 'patient_id,clinical_trial_id')
+    (tmp_path / 'clinical_trials.csv').write_text(rows, encoding='utf-8')
+    return ('test/rml-fnml/reconciliation/clinical_trials.csv',
+            str(tmp_path / 'clinical_trials.csv').replace('\\', '/'))
+
+
+@pytest.mark.parametrize('matching', [None, 'EXACT', 'LOWERCASE', 'CASE-INSENSITIVE'])
+def test_ways_of_matching_over_sparql(tmp_path, matching):
+    """The entities a SPARQL query returns are matched in the same ways."""
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (STUDIES_QUERY, MATCHING_QUERY),
+            patients_matching_source(tmp_path),
+            *([with_sparql_input('morph-fn:matching', f'"{matching}"')] if matching else []),
+        )
+        g_morph = morph_kgc.materialize(sparql_config(mapping=mapping))
+
+    assert {
+        (str(s).replace('urn:id:', ''), str(o)) for s, o in g_morph.subject_objects()
+    } == MATCHED_TERMS[matching or 'EXACT']
+
+
+def test_same_query_matched_two_ways_is_sent_once(tmp_path):
+    """
+    Executions sending the same query to the same endpoint, matching values in
+    different ways, share a single answer, indexed for each.
+    """
+    with open(os.path.join(TEST_DIR, 'clinical_trials.csv'), encoding='utf-8') as f:
+        rows = f.read().replace('NCT07667218', 'nct07667218')
+    (tmp_path / 'clinical_trials.csv').write_text(rows, encoding='utf-8')
+    source = str(tmp_path / 'clinical_trials.csv').replace('\\', '/')
+    mapping = sparql_mapping(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/clinical_trials.csv', source),
+        with_sparql_execution_input(
+            '<#ClinicalTrialReconciliationAgain>', 'morph-fn:matching', '"LOWERCASE"',
+        ),
+        mapping=SEVERAL_SPARQL_MAPPING,
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(several_endpoints(server), mapping=mapping))
+
+        assert server.requests.count(('/sparql', STUDIES_QUERY)) == 1
+
+    # The lower-cased identifier of p1 only matches lower-cased.
+    lowercased = ('urn:id:p1', 'https://data.com/id/1')
+    assert objects_of(g_morph, 'participatesIn') == UNAMBIGUOUS_STUDIES
+    assert objects_of(g_morph, 'enrolledIn') == UNAMBIGUOUS_STUDIES | {lowercased}
+
+
+@pytest.mark.parametrize('matching, expected', [
+    ('EXACT', {('urn:id:p2', 'https://data.com/id/7')}),
+    ('LOWERCASE', DIAGNOSES),
+])
+def test_ways_of_matching_several_values(tmp_path, matching, expected):
+    """Each of the values an entity is matched by is matched the same way."""
+    with open(os.path.join(TEST_DIR, 'diagnoses.csv'), encoding='utf-8') as f:
+        rows = f.read().splitlines()
+    # Lower-cased, but the row of p2.
+    rows = [row if row.startswith('p2,') else row.lower() for row in rows]
+    (tmp_path / 'diagnoses.csv').write_text('\n'.join(rows) + '\n', encoding='utf-8')
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server,
+                ('test/rml-fnml/reconciliation/diagnoses.csv',
+                 str(tmp_path / 'diagnoses.csv').replace('\\', '/')),
+                (SCHEME_INPUT, SCHEME_INPUT + execution_input('morph-fn:matching', f'"{matching}"')),
+            ),
+        ))
+
+    assert diagnoses(g_morph) == expected
+
+
+@pytest.mark.parametrize('binding, error', [
+    ('rml:inputValue "FUZZY"',
+     re.escape("binds 'urn:morph:function:matching' to 'FUZZY', which is not valid. "
+               "Must be one of: CASE-INSENSITIVE, EXACT, LOWERCASE.")),
+    ('rml:inputValueMap [ rml:reference "clinical_trial_id" ]',
+     r"must bind 'urn:morph:function:matching' at most once, to a constant"),
+])
+def test_matching_over_sparql_not_a_valid_constant(tmp_path, binding, error):
+    """A matching that is invalid, or read from the data, fails before the query is sent."""
+    old, new = with_sparql_input('morph-fn:matching', '"LOWERCASE"')
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (old, new.replace('rml:inputValue "LOWERCASE"', binding)),
+        )
+        with pytest.raises(ValueError, match=error):
+            morph_kgc.materialize(sparql_config(mapping=mapping))
 
         assert server.requests == []

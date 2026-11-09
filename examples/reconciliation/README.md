@@ -92,12 +92,29 @@ all.
 | `grel:valueParam` | the value to reconcile (`grel:valueParam1` is accepted as well). A concept is matched by a single value. |
 | `morph-fn:resource` | name of the `[RESOURCE:<name>]` section to reconcile against. May be omitted when a single vocabulary is declared. `morph-fn:vocabularyIRI` is an accepted spelling, and also accepts the IRI identifying the vocabulary. |
 | `morph-fn:attributeIRI` | the vocabulary property (or properties) the value is matched against, e.g. `skos:prefLabel`. Bind it several times to match against several: they are matched as a union, since RDF puts no order on the values of a property. `grel:attributeIRI` is accepted as well, and both may be bound together. When omitted, the `attributes` option of the resource applies. |
-| `morph-fn:matching` | how the value is matched: `EXACT` (default) or `CASE-INSENSITIVE`, which also normalizes Unicode (NFKC) and collapses whitespace. A constant, since the vocabulary is indexed before any data is read. Executions matching the same vocabulary differently share a single download of it. |
+| `morph-fn:matching` | how the value is matched: `EXACT` (default), `LOWERCASE` or `CASE-INSENSITIVE`. See [Ways of matching values](#ways-of-matching-values). A constant, since the vocabulary is indexed before any data is read. Executions matching the same vocabulary differently share a single download of it. |
 | `morph-fn:ambiguity` | what a value matching several concepts is reconciled to: `ALL` (default), `NONE` or `FAIL`. See [Ambiguous values](#ambiguous-values). A constant, overriding the `ambiguity` option of the resource. |
 
 A value matching no concept yields no triple. Resources typed as concept schemes or
 collections are never matched. The concepts are IRIs, so an object map
 generating them needs `rml:termType rml:IRI`.
+
+## Ways of matching values
+
+`morph-fn:matching` says how the value and the labels of the vocabulary are
+compared:
+
+| Matching | Compares values | `Café ` matches | `Straße` matches |
+| --- | --- | --- | --- |
+| `EXACT` | as they are. The default. | `Café ` | `Straße` |
+| `LOWERCASE` | lower-cased, and nothing else: no whitespace is trimmed or collapsed, and no Unicode normalization is applied. | `café `, `CAFÉ ` (not `Café`, `cafe` or `café  `) | `straße` (not `strasse`) |
+| `CASE-INSENSITIVE` | normalized (NFKC), with their whitespace collapsed, and case-folded. | `café`, `Café  `, `café` decomposed (NFD)... | `strasse`, `STRASSE` |
+
+`LOWERCASE` matches as a Lucene index analyzing the values with
+`KeywordTokenizer` and `LowerCaseFilter` does, which lower-cases each character
+on its own: as Python's `str.lower()` does, but for `İ`, lower-cased to `i`,
+and a final `Σ`, to `σ`. `CASE-INSENSITIVE` matches more, which may turn a
+value matching a single concept into an ambiguous one.
 
 ## Ambiguous values
 
