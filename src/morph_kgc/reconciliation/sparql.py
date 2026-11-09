@@ -68,6 +68,7 @@ its URL is not enough: a ``[RESOURCE:<name>]`` section whose ``url`` (or
     method=POST
 """
 
+import codecs
 import gzip
 import json
 import logging
@@ -75,7 +76,7 @@ import re
 from http.client import HTTPException
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
-from xml.etree.ElementTree import iterparse
+from xml.etree.ElementTree import XMLParser, iterparse
 
 import pyoxigraph
 
@@ -104,16 +105,29 @@ RESULTS_FORMATS = {
 
 # The characters XML 1.0 allows nowhere, not even escaped, which some stores
 # (rdflib, Oxigraph) still write raw in the literals of an answer in XML: the C0
-# control characters but tab, line feed and carriage return. In UTF-8, where their
-# bytes are never part of another character, each is read as one of the 32
-# noncharacters U+FDD0 to U+FDEF, which Unicode keeps for such internal use and
-# data does not hold, and given back in the text of the term.
-XML_DISALLOWED_BYTES = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]")
-XML_STAND_IN = 0xFDD0
-XML_RESTORED_CHARACTERS = {
-    XML_STAND_IN + byte: byte
-    for byte in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20))
+# control characters but tab, line feed and carriage return, and U+FFFE and
+# U+FFFF. In UTF-8, where their bytes are never part of another character, each
+# is read as one of the noncharacters U+FDD0 to U+FDEF, which Unicode sets aside
+# for internal use and data seldom holds, and given back in the text of the term.
+# In an answer holding any of them, a term holding one of those noncharacters is
+# read with the character it stands for.
+XML_DISALLOWED = re.compile(rb"[\x00-\x08\x0b\x0c\x0e-\x1f]|\xef\xbf[\xbe\xbf]")
+XML_STAND_INS = {
+    **{
+        chr(code): chr(0xFDD0 + code)
+        for code in (*range(0x00, 0x09), 0x0B, 0x0C, *range(0x0E, 0x20))
+    },
+    # Those of tab and line feed, which XML allows.
+    "\uFFFE": "\uFDD9",
+    "\uFFFF": "\uFDDA",
 }
+XML_STAND_IN_BYTES = {
+    character.encode("utf-8"): stand_in.encode("utf-8")
+    for character, stand_in in XML_STAND_INS.items()
+}
+XML_RESTORED_CHARACTERS = str.maketrans({
+    stand_in: character for character, stand_in in XML_STAND_INS.items()
+})
 
 # The variables the query projects: the entity, and the values it is matched by,
 # numbered from 1.
@@ -373,11 +387,14 @@ def _parse_xml_solutions(endpoint: str, answer: Download, arity: int):
     try:
         with open(answer.path, "rb") as answer_file:
             reader = _XmlReader(answer_file)
+            # Whatever the declaration names it, e.g. 'utf8', which expat does
+            # not know.
+            parser = XMLParser(encoding="utf-8") if reader.utf8 else None
             # The depth of the element an event is about, the root being 1, and
             # the element of the results, while they are read.
             depth = 0
             results = None
-            for event, element in iterparse(reader, events=("start", "end")):
+            for event, element in iterparse(reader, events=("start", "end"), parser=parser):
                 if event == "start":
                     depth += 1
                     if depth <= 2:
@@ -433,37 +450,60 @@ def _parse_xml_solutions(endpoint: str, answer: Download, arity: int):
 
 class _XmlReader:
     """
-    An answer in XML read for the parser, with the control characters XML does
-    not allow read as noncharacters when it is in UTF-8, as it is by default.
-    *replaced* says whether any was.
+    An answer in XML read for the parser, without the whitespace some endpoints
+    write before its XML declaration. When it is in UTF-8, as it is by default,
+    which *utf8* says, the characters XML does not allow are read as
+    noncharacters, and *replaced* says whether any was.
     """
+
+    # As much as iterparse reads at once.
+    CHUNK_SIZE = 16 * 1024
 
     def __init__(self, answer_file):
         self._file = answer_file
-        self._utf8 = None
+        self._held, self.utf8 = _xml_start(answer_file.read(self.CHUNK_SIZE))
         self.replaced = False
 
     def read(self, size: int = -1) -> bytes:
-        chunk = self._file.read(size)
-        if self._utf8 is None:
-            self._utf8 = _is_utf8(chunk)
-        if self._utf8 and XML_DISALLOWED_BYTES.search(chunk):
+        data = self._file.read(size)
+        chunk, self._held = self._held + data, b""
+        if not self.utf8:
+            return chunk
+        if data:
+            # The start of U+FFFE or U+FFFF cut by the end of the chunk is read
+            # with the next.
+            cut = 2 if chunk.endswith(b"\xef\xbf") else 1 if chunk.endswith(b"\xef") else 0
+            if cut:
+                chunk, self._held = chunk[:-cut], chunk[-cut:]
+        if XML_DISALLOWED.search(chunk):
             self.replaced = True
-            chunk = XML_DISALLOWED_BYTES.sub(
-                lambda match: chr(XML_STAND_IN + match[0][0]).encode("utf-8"), chunk,
-            )
+            chunk = XML_DISALLOWED.sub(lambda match: XML_STAND_IN_BYTES[match[0]], chunk)
         return chunk
 
 
-def _is_utf8(start: bytes) -> bool:
-    """Whether the XML document starting with *start* is in UTF-8."""
+def _xml_start(start: bytes) -> tuple[bytes, bool]:
+    """
+    The first bytes of an XML document, without the whitespace before its XML
+    declaration, and whether it is in UTF-8.
+    """
     # A byte order mark or a zero byte in the first characters: UTF-16 or UTF-32.
     if start[:2] in (b"\xfe\xff", b"\xff\xfe") or b"\x00" in start[:4]:
-        return False
-    declaration = re.match(
-        rb"(?:\xef\xbb\xbf)?<\?xml[^>]*?\sencoding\s*=\s*[\"']([^\"']*)", start,
-    )
-    return declaration is None or declaration[1].lower() in (b"utf-8", b"utf8")
+        return start, False
+    bom = b"\xef\xbb\xbf" if start.startswith(b"\xef\xbb\xbf") else b""
+    text = start[len(bom):].lstrip(b" \t\r\n")
+    if not re.match(rb"<\?xml\s", text):
+        return start, True
+    declaration = re.match(rb"<\?xml\s([^>]*)\?>", text)
+    if declaration is None:
+        # Longer than the bytes read, as no store writes it: left to the parser.
+        return start, False
+    encoding = re.search(rb"\sencoding\s*=\s*[\"']([^\"']*)", b" " + declaration[1])
+    try:
+        utf8 = encoding is None or codecs.lookup(encoding[1].decode("ascii")).name == "utf-8"
+    except (LookupError, UnicodeDecodeError):
+        # Left to the parser, which says it does not know it.
+        utf8 = False
+    return bom + text, utf8
 
 
 def _local_name(tag: str) -> str:
@@ -475,8 +515,8 @@ def _xml_term(binding, restore: bool = False) -> tuple[str, str | None] | None:
     """
     The kind and value of the term a <binding> element binds, None when it
     binds none. The text of a literal is kept exactly; that of an IRI or a blank
-    node, which cannot hold whitespace, is stripped of any around it. *restore*
-    gives back the control characters the reader read as noncharacters.
+    node, which cannot hold the whitespace of XML, is stripped of any around it.
+    *restore* gives back the characters the reader read as noncharacters.
     """
     if binding is None:
         return None
@@ -490,7 +530,7 @@ def _xml_term(binding, restore: bool = False) -> tuple[str, str | None] | None:
         value = term.text or ""
         if restore:
             value = value.translate(XML_RESTORED_CHARACTERS)
-        return kind, value if kind == "literal" else value.strip()
+        return kind, value if kind == "literal" else value.strip(" \t\n\r")
     return None
 
 

@@ -1699,7 +1699,8 @@ def read_xml_answer(tmp_path, answer):
     from morph_kgc.reconciliation.sparql import read_solutions
 
     path = tmp_path / 'answer.xml'
-    path.write_text(answer, encoding='utf-8')
+    # As bytes, with the same line endings on every platform.
+    path.write_bytes(answer.encode('utf-8'))
     variables, solutions = read_solutions(
         'https://example.org/sparql', Download(str(path), 'application/sparql-results+xml'),
     )
@@ -1714,13 +1715,21 @@ def read_xml_answer(tmp_path, answer):
     ('<literal/>', ('literal', '')),
     ('<literal>&#32;B &amp; C</literal>', ('literal', ' B & C')),
     ('<literal><![CDATA[ B & C ]]></literal>', ('literal', ' B & C ')),
-    # Control characters XML does not allow, which rdflib and Oxigraph write raw.
+    # Characters XML does not allow, which rdflib and Oxigraph write raw.
     ('<literal> B\x0bC\x01</literal>', ('literal', ' B\x0bC\x01')),
     ('<literal><![CDATA[\x0cB & C]]></literal>', ('literal', '\x0cB & C')),
+    ('<literal>B\uffffC\ufffe</literal>', ('literal', 'B\uffffC\ufffe')),
+    # So many that the reads of the answer cut some of them.
+    pytest.param(
+        '<literal>' + 'B\uffff\x0b' * 20000 + '</literal>', ('literal', 'B\uffff\x0b' * 20000),
+        id='cut-by-reads',
+    ),
     # A noncharacter the reader reads them as, kept as it is.
     ('<literal>\ufddb</literal>', ('literal', '\ufddb')),
-    # An IRI cannot hold whitespace, which only its serialization puts around it.
+    # An IRI cannot hold the whitespace of XML, which only its serialization
+    # puts around it, but may hold other whitespace.
     ('<uri>\n  https://data.com/id/10\n</uri>', ('uri', 'https://data.com/id/10')),
+    ('<uri>https://data.com/id/10\u00a0</uri>', ('uri', 'https://data.com/id/10\u00a0')),
     ('', None),
 ])
 def test_values_of_answers_in_xml(tmp_path, term, expected):
@@ -1737,10 +1746,28 @@ def test_values_of_answers_in_xml(tmp_path, term, expected):
 def test_unbound_values_of_answers_in_xml(tmp_path):
     """A value left unbound, whose binding stores leave out, is read as unbound."""
     answer = XML_ANSWER.replace('      <binding name="matching_value_1">{term}</binding>\n', '')
+    assert 'matching_value_1">' not in answer
 
     assert read_xml_answer(tmp_path, answer) == (
         ['entity_iri', 'matching_value_1'], [(('uri', 'https://data.com/id/10'), (None,))],
     )
+
+
+@pytest.mark.parametrize('answer', [
+    # Whitespace before the XML declaration, which some endpoints write.
+    '\n' + XML_ANSWER,
+    '\ufeff \n' + XML_ANSWER,
+    # An alias of UTF-8 the XML parser does not know.
+    XML_ANSWER.replace('encoding="utf-8"', "encoding='UTF8'"),
+    XML_ANSWER.replace('<?xml version="1.0" encoding="utf-8"?>\n', ''),
+])
+def test_answers_in_xml_declared_in_other_ways(tmp_path, answer):
+    """An answer in UTF-8 is read however it declares it."""
+    term = '<literal> Müller\x0b</literal>'
+
+    assert read_xml_answer(tmp_path, answer.format(term=term))[1] == [
+        (('uri', 'https://data.com/id/10'), (('literal', ' Müller\x0b'),)),
+    ]
 
 
 @pytest.mark.parametrize('answer, detail', [
