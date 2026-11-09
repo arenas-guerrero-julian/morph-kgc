@@ -438,52 +438,97 @@ def _read_xml_solutions(endpoint: str, answer: Download, arity: int = 1):
 _XML_UNREADABLE_CODES = (
     set(range(0x00, 0x09)) | {0x0B, 0x0C, 0x0D} | set(range(0x0E, 0x20)) | {0xFFFE, 0xFFFF}
 )
-_XML_UNREADABLE = re.compile(
-    rb"[\x00-\x08\x0b-\x1f]|\xef\xbf[\xbe\xbf]|&#(?:x([0-9a-fA-F]{1,6})|([0-9]{1,7}));"
-)
 # The errors of an XML parser rejecting a character, which pyoxigraph reads:
 # not well-formed (invalid token), and reference to invalid character number.
 # The answer is then read by pyoxigraph; any other error, such as an answer cut
 # short, which pyoxigraph may read in part without saying so, fails.
 _XML_CHARACTER_ERRORS = {4, 14}
-# The private-use characters standing in for them while the answer is read, in
-# the last plane of Unicode, which no value is expected to hold.
+# The private-use characters standing in for them while the answer is read, at
+# the end of the last plane of Unicode: U+10FF00 plus their code (plus 0xFE and
+# 0xFF for U+FFFE and U+FFFF). A literal holding one of them, or the character
+# escaping them, U+10FF20, holds it escaped, preceded by U+10FF20, so that any
+# literal is read as written.
 _XML_PLACEHOLDER_BASE = 0x10FF00
+_XML_ESCAPE = chr(0x10FF20)
 _XML_FROM_PLACEHOLDERS = {
     _XML_PLACEHOLDER_BASE + (code & 0xFF): code for code in _XML_UNREADABLE_CODES
 }
+_XML_ESCAPED_CODES = set(_XML_FROM_PLACEHOLDERS) | {ord(_XML_ESCAPE)}
+# What is rewritten in the content of a literal: control characters (carriage
+# returns included), U+FFFE and U+FFFF, the placeholders and the escape (in
+# UTF-8), and character references, of which only those to any of them are.
+_XML_REWRITTEN = re.compile(
+    rb"[\x00-\x08\x0b-\x1f]"
+    rb"|\xef\xbf[\xbe\xbf]"
+    rb"|\xf4\x8f\xbc[\x80-\xa0]|\xf4\x8f\xbf[\xbe\xbf]"
+    rb"|&#(?:x0*([0-9a-fA-F]{1,6})|0*([0-9]{1,7}));"
+)
+# Every byte but control characters, to tell quickly whether content holds any.
+_XML_NOT_CONTROL = bytes(
+    byte for byte in range(256) if byte in (0x09, 0x0A) or byte >= 0x20
+)
+# The placeholders and the escape, in a literal as read, and how they are read.
+_XML_MARKED = re.compile(f"[{chr(_XML_PLACEHOLDER_BASE)}-{_XML_ESCAPE}\U0010fffe\U0010ffff]")
+_XML_UNMARKED = re.compile(
+    f"{_XML_ESCAPE}(.)|[{chr(_XML_PLACEHOLDER_BASE)}-{chr(_XML_PLACEHOLDER_BASE + 0x1F)}"
+    "\U0010fffe\U0010ffff]",
+    re.DOTALL,
+)
 # The start of the start tag of a literal, whatever the prefix of its namespace.
-_XML_LITERAL_START = re.compile(rb"<(?:[A-Za-z_][\w.\-]*:)?literal(?=[\s/>])")
-# Bytes held back at the end of what has been read, which may be the start of
-# a start tag of a literal, of a character reference or of a character.
-_XML_LITERAL_START_LENGTH = 64
-_XML_REFERENCE_LENGTH = 12
+_XML_LITERAL_START = re.compile(rb"""<(?:[^\s<>/:=!?"']+:)?literal(?=[\s/>])""")
+# An XML declaration naming the encoding of the answer, which is only rewritten
+# in UTF-8 (or ASCII, a part of it).
+_XML_DECLARED_ENCODING = re.compile(
+    rb"""^(?:\xef\xbb\xbf)?\s*<\?xml[^>]*?encoding\s*=\s*["']([A-Za-z0-9._-]+)["']"""
+)
+_XML_REWRITTEN_ENCODINGS = {b"utf-8", b"utf8", b"us-ascii", b"ascii"}
 
 
-def _xml_placeholder(match) -> bytes:
-    """The placeholder of the character *match* is, or itself when XML reads it."""
+def _xml_rewritten(match) -> bytes:
+    """
+    What *match*, in the content of a literal, is rewritten as: the placeholder
+    of a character XML cannot read as written, or a character escaped.
+    """
+    written = match.group(0)
     hexadecimal, decimal = match.group(1), match.group(2)
     if hexadecimal is not None or decimal is not None:
         code = int(hexadecimal, 16) if hexadecimal is not None else int(decimal)
+        if code in _XML_ESCAPED_CODES:
+            return (_XML_ESCAPE + chr(code)).encode("utf-8")
         if code not in _XML_UNREADABLE_CODES or code == 0x0D:
-            # A carriage return written as a reference is read as it is.
-            return match.group(0)
-    elif match.group(0).startswith(b"\xef"):
-        code = 0xFFFE if match.group(0) == b"\xef\xbf\xbe" else 0xFFFF
+            # Read as it is, a carriage return written as a reference included.
+            return written
+    elif written.startswith(b"\xf4"):
+        return _XML_ESCAPE.encode("utf-8") + written
+    elif written.startswith(b"\xef"):
+        code = 0xFFFE if written == b"\xef\xbf\xbe" else 0xFFFF
     else:
-        code = match.group(0)[0]
+        code = written[0]
     return chr(_XML_PLACEHOLDER_BASE + (code & 0xFF)).encode("utf-8")
+
+
+def _xml_literal_text(text: str) -> str:
+    """The text of a literal as written, its placeholders and escapes read."""
+    if text.isascii() or not _XML_MARKED.search(text):
+        return text
+    return _XML_UNMARKED.sub(
+        lambda match: match.group(1)
+        if match.group(1) is not None
+        else chr(_XML_FROM_PLACEHOLDERS[ord(match.group(0))]),
+        text,
+    )
 
 
 class _XmlLiteralFile(io.RawIOBase):
     """
     The file of an answer in XML, encoded in UTF-8, read with the characters of
     its literals XML parsers cannot read as they are written (see
-    _XML_UNREADABLE) replaced with private-use placeholders, which
-    :func:`_xml_term` turns back: a literal holding them is then read as it is
-    written, as from an answer in JSON, rather than failing the whole answer or
-    turning its carriage returns into line feeds. Nothing outside the content
-    of literals is changed. It is read as a stream, as the answer is.
+    _XML_UNREADABLE_CODES) replaced with private-use placeholders, which
+    :func:`_xml_literal_text` turns back: a literal holding them is then read
+    as it is written, as from an answer in JSON, rather than failing the whole
+    answer or turning its carriage returns into line feeds. Nothing outside
+    the content of literals is changed, and an answer in another encoding is
+    read as it is. It is read as a stream, as the answer is.
     """
 
     def __init__(self, path: str, chunk_size: int = 1 << 16) -> None:
@@ -494,6 +539,15 @@ class _XmlLiteralFile(io.RawIOBase):
         self._output = bytearray()
         self._in_literal = False
         self._end = False
+        # The start of the answer, read to tell its encoding, then as the rest.
+        self._start = self._file.read(1024)
+        declared = _XML_DECLARED_ENCODING.match(self._start)
+        self._rewritten = not (
+            # UTF-16 or UTF-32, with or without a byte order mark.
+            self._start[:2] in (b"\xff\xfe", b"\xfe\xff")
+            or b"\x00" in self._start[:4]
+            or (declared is not None and declared.group(1).lower() not in _XML_REWRITTEN_ENCODINGS)
+        )
 
     def readable(self) -> bool:
         return True
@@ -512,19 +566,30 @@ class _XmlLiteralFile(io.RawIOBase):
         super().close()
 
     def _fill(self) -> None:
-        chunk = self._file.read(self._chunk_size)
+        if self._start:
+            chunk, self._start = self._start[:self._chunk_size], self._start[self._chunk_size:]
+        else:
+            chunk = self._file.read(self._chunk_size)
         self._end = not chunk
         data = self._pending + chunk
+        if not self._rewritten:
+            self._output += data
+            self._pending = b""
+            return
         position = 0
         while position < len(data):
             if not self._in_literal:
                 match = _XML_LITERAL_START.search(data, position)
                 end = data.find(b">", match.end()) if match else -1
                 if match is None or end == -1:
-                    # What is left may be the start of a start tag of a literal.
-                    keep = len(data) if self._end else (
-                        match.start() if match else max(position, len(data) - _XML_LITERAL_START_LENGTH)
-                    )
+                    if self._end:
+                        keep = len(data)
+                    elif match is not None:
+                        keep = match.start()
+                    else:
+                        # A tag left unfinished may be the start tag of a literal.
+                        last = data.rfind(b"<", position)
+                        keep = last if last != -1 and data.find(b">", last) == -1 else len(data)
                     self._output += data[position:keep]
                     position = keep
                     break
@@ -538,12 +603,23 @@ class _XmlLiteralFile(io.RawIOBase):
                 stop = len(data) if close == -1 else close
                 if close == -1 and not self._end:
                     # What is left may be the start of the end tag, of a
-                    # character reference or of a character.
-                    held = max(position, len(data) - _XML_REFERENCE_LENGTH)
-                    for start in (data.rfind(b"&", held), data.rfind(b"<", held), data.rfind(b"\xef", held)):
+                    # character reference or of a character in UTF-8.
+                    ampersand = data.rfind(b"&", position)
+                    if ampersand != -1 and data.find(b";", ampersand) == -1:
+                        stop = ampersand
+                    if data.endswith(b"<"):
+                        stop = min(stop, len(data) - 1)
+                    for lead in (b"\xef", b"\xf4"):
+                        start = data.rfind(lead, max(position, len(data) - 3))
                         if start != -1:
                             stop = min(stop, start)
-                self._output += _XML_UNREADABLE.sub(_xml_placeholder, data[position:stop])
+                content = data[position:stop]
+                if (
+                    b"&#" in content or b"\xef\xbf" in content or b"\xf4\x8f" in content
+                    or content.translate(None, _XML_NOT_CONTROL)
+                ):
+                    content = _XML_REWRITTEN.sub(_xml_rewritten, content)
+                self._output += content
                 position = stop
                 if close == -1:
                     break
@@ -562,7 +638,7 @@ def _xml_term(binding) -> tuple[str, str | None] | None:
         kind = _xml_tag(term)
         if kind == "literal":
             # Exactly as written, whitespace included (see _XmlLiteralFile).
-            return "literal", (term.text or "").translate(_XML_FROM_PLACEHOLDERS)
+            return "literal", _xml_literal_text(term.text or "")
         if kind in ("uri", "bnode"):
             return kind, (term.text or "").strip()
         # A triple term has no value of its own to match.

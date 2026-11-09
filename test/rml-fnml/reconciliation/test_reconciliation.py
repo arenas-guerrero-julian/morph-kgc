@@ -3454,6 +3454,9 @@ def test_answer_in_xml_cut_short(monkeypatch, tmp_path, caplog, end):
 LABELS_XML_CANNOT_READ = [
     'Agenesis\u000bof enamel', 'Two\r\nlines', 'Carriage\rreturn', ' padded\t',
     'a\x01b', 'x\ufffey', 'x\uffffy', 'form\x0cfeed',
+    # The private-use characters standing in for them while they are read, and
+    # the one escaping those, which a literal may hold as well.
+    'x\U0010ff01y', 'x\U0010ff0dy', '\U0010ff00', 'x\U0010ff20y', 'x\U0010fffey', 'x\U0010ffffy',
 ]
 
 
@@ -3510,6 +3513,10 @@ def test_answer_in_xml_read_in_any_chunks(tmp_path, monkeypatch, chunk_size):
 
     body = vocabulary_answer('rdflib', LABELS_XML_CANNOT_READ).replace(
         b'a\x01b', b'a&#x1;b',
+    ).replace(
+        'x\U0010ff01y'.encode('utf-8'), b'x&#x10FF01;y',
+    ).replace(
+        'x\U0010ff20y'.encode('utf-8'), b'x&#1113888;y',
     ).replace(b'<literal>', b'<literal xml:lang="en">', 2)
     original = sparql._XmlLiteralFile.__init__
 
@@ -3520,6 +3527,50 @@ def test_answer_in_xml_read_in_any_chunks(tmp_path, monkeypatch, chunk_size):
     _, solutions = read_answer(tmp_path, body.decode('utf-8'))
 
     assert sorted(value for _, ((_, value),) in solutions) == sorted(LABELS_XML_CANNOT_READ)
+
+
+@pytest.mark.parametrize('chunk_size', [1, 3, 7, 1 << 16])
+@pytest.mark.parametrize('prefix', ['sr', 'r' * 200, 'é'])
+def test_answer_in_xml_with_any_namespace_prefix(tmp_path, monkeypatch, chunk_size, prefix):
+    """The literals of an answer in XML are read as written whatever their namespace prefix."""
+    from morph_kgc.reconciliation import sparql
+
+    original = sparql._XmlLiteralFile.__init__
+    monkeypatch.setattr(
+        sparql._XmlLiteralFile, '__init__', lambda self, path: original(self, path, chunk_size),
+    )
+    results = ''.join(
+        f'<{prefix}:result><{prefix}:binding name="entity_iri"><{prefix}:uri>https://e/{number}'
+        f'</{prefix}:uri></{prefix}:binding><{prefix}:binding name="matching_value_1">'
+        f'<{prefix}:literal>a\r{number}&#x00000001;b</{prefix}:literal></{prefix}:binding></{prefix}:result>'
+        for number in range(300)
+    )
+    body = (
+        f'<?xml version="1.0" encoding="UTF-8"?><{prefix}:sparql xmlns:{prefix}='
+        f'"http://www.w3.org/2005/sparql-results#"><{prefix}:head><{prefix}:variable name="entity_iri"/>'
+        f'<{prefix}:variable name="matching_value_1"/></{prefix}:head><{prefix}:results>{results}'
+        f'</{prefix}:results></{prefix}:sparql>'
+    )
+    _, solutions = read_answer(tmp_path, body)
+
+    assert [value for _, ((_, value),) in solutions] == [f'a\r{number}\x01b' for number in range(300)]
+
+
+def test_answer_in_xml_in_another_encoding_read_as_it_is(tmp_path):
+    """
+    An answer declared in an encoding other than UTF-8 is read as an XML parser
+    reads it, its carriage returns read as line feeds, rather than garbled.
+    """
+    from morph_kgc.http import Download
+    from morph_kgc.reconciliation import sparql
+
+    path = tmp_path / 'answer'
+    path.write_bytes(XML_ANSWER.replace(
+        '<?xml version="1.0"?>', '<?xml version="1.0" encoding="ISO-8859-1"?>',
+    ).replace(' Café\t', 'Café\r\nline two').encode('latin-1'))
+    _, solutions = sparql.read_solutions('E', Download(str(path), 'application/sparql-results+xml'))
+
+    assert list(solutions)[0] == (('uri', 'https://e/1'), (('literal', 'Café\nline two'),))
 
 
 @pytest.mark.parametrize('cut', ['head', 'results'])
