@@ -2501,10 +2501,9 @@ def test_reconcile_entities_by_two_values():
     # Read in memory, as the streaming parser rejects a solution, which binds
     # a single value and is left out.
     ('/public/sparql/bad-term', DIAGNOSES),
-    # The parser of answers in XML trims the whitespace a literal starts with,
-    # unless the endpoint escapes it ('&#32;'), which rdflib does not: the
-    # coding system ' C,SNOMED CT' then reads 'C,SNOMED CT'.
-    ('/public/sparql/xml', DIAGNOSES - {('urn:id:p5', 'https://data.com/id/10')}),
+    # The coding system ' C,SNOMED CT' starts with a space, which an answer in
+    # XML keeps, unescaped, as rdflib writes it.
+    ('/public/sparql/xml', DIAGNOSES),
 ])
 def test_reconcile_entities_by_two_values_from_answers_in_other_shapes(tmp_path, path, expected):
     """Every way of reading an answer reads all the values of its solutions."""
@@ -3147,3 +3146,250 @@ def test_matching_over_sparql_not_a_valid_constant(tmp_path, binding, error):
             morph_kgc.materialize(sparql_config(mapping=mapping))
 
         assert server.requests == []
+
+
+# ── The same triples from a vocabulary file and a SPARQL endpoint ─────────────
+
+PARITY_VOCABULARY = os.path.join(TEST_DIR, 'parity_vocabulary.ttl')
+CLINICAL = 'https://example.org/vocabulary/clinical/'
+# The query reading the labels of parity_vocabulary.ttl, the attributes the
+# vocabulary file is matched against.
+PARITY_QUERY = """
+            PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+            SELECT ?entity_iri ?matching_value_1 WHERE {
+                ?entity_iri a skos:Concept ;
+                            skos:prefLabel|skos:altLabel ?matching_value_1 .
+            }
+        """
+# The concepts each row of parity_labels.csv is reconciled with, matching
+# values in each way, with the ambiguity policy ALL. Rows 1 and 2 are those of
+# the request: a trailing space, and 'A2' for 'A₂'.
+PARITY_MATCHES = {
+    'EXACT': {(4, 1)},
+    'LOWERCASE': {(3, 2), (4, 1), (5, 3), (6, 4), (7, 5), (8, 1)},
+    'CASE-INSENSITIVE': {
+        (1, 1), (2, 2), (3, 2), (4, 1), (5, 3), (5, 4), (6, 3), (6, 4), (7, 5), (8, 1), (9, 1),
+    },
+}
+# The ways an endpoint answers the query (see server.py).
+PARITY_ENDPOINTS = [
+    '/public/vocabulary/sparql',
+    '/public/vocabulary/sparql/xml',
+    '/public/vocabulary/sparql/no-head',
+    '/public/vocabulary/sparql/results-first',
+    '/public/vocabulary/sparql/gzip',
+    '/public/vocabulary/sparql/bad-term',
+]
+
+
+def parity_config(tmp_path, function_inputs, matching, ambiguity, processes=1):
+    """
+    A configuration reconciling the labels of parity_labels.csv by an execution
+    with *function_inputs*, matching values in the way *matching* and with the
+    ambiguity policy *ambiguity*, otherwise the same for both functions.
+    """
+    # A file of its own, as a run reads it after the previous one ran.
+    mapping = tmp_path / f'mapping_{len(list(tmp_path.glob("mapping_*.ttl")))}.ttl'
+    mapping.write_text(
+        '@prefix rml: <http://w3id.org/rml/> .\n'
+        '@prefix grel: <http://users.ugent.be/~bjdmeest/function/grel.ttl#> .\n'
+        '@prefix morph-fr: <urn:morph:function:reconciliation:> .\n'
+        '@prefix morph-fn: <urn:morph:function:> .\n'
+        '@prefix skos: <http://www.w3.org/2004/02/skos/core#> .\n'
+        '@base <http://example.com/base/> .\n\n'
+        '<#LabelsMapping>\n'
+        '    a rml:TriplesMap ;\n'
+        '    rml:logicalSource [\n'
+        '        rml:source "test/rml-fnml/reconciliation/parity_labels.csv" ;\n'
+        '        rml:referenceFormulation rml:CSV\n'
+        '    ] ;\n'
+        '    rml:subjectMap [ rml:template "urn:id:{id}" ] ;\n'
+        '    rml:predicateObjectMap [\n'
+        '        rml:predicate <https://example.org/ontology/matches> ;\n'
+        '        rml:objectMap [ rml:functionExecution <#Reconciliation> ; rml:termType rml:IRI ]\n'
+        '    ] .\n\n'
+        '<#Reconciliation>\n'
+        f'{function_inputs}'
+        '    rml:input [ rml:parameter grel:valueParam ; rml:inputValueMap [ rml:reference "label" ] ] ;\n'
+        f'    rml:input [ rml:parameter morph-fn:matching ; rml:inputValue "{matching}" ] ;\n'
+        f'    rml:input [ rml:parameter morph-fn:ambiguity ; rml:inputValue "{ambiguity}" ] .\n',
+        encoding='utf-8',
+    )
+    return (
+        f'[CONFIGURATION]\n'
+        f'number_of_processes={processes}\n'
+        f'[RESOURCE:parity_vocabulary]\n'
+        f'resource_type=SKOS_VOCABULARY\n'
+        f'url={PARITY_VOCABULARY}\n'
+        f'[DataSource]\n'
+        f'mappings={mapping}'
+    )
+
+
+def file_inputs():
+    """The inputs of an execution reconciling against parity_vocabulary.ttl as a file."""
+    return (
+        '    rml:function morph-fr:reconcileVocabularyConcept ;\n'
+        '    rml:input [ rml:parameter morph-fn:resource ; rml:inputValue "parity_vocabulary" ] ;\n'
+        '    rml:input [ rml:parameter morph-fn:attributeIRI ; '
+        'rml:inputValue skos:prefLabel , skos:altLabel ] ;\n'
+    )
+
+
+def sparql_inputs(endpoint):
+    """The inputs of an execution reconciling against *endpoint*, holding parity_vocabulary.ttl."""
+    return (
+        '    rml:function morph-fn:reconcileEntityOverSPARQL ;\n'
+        f'    rml:input [ rml:parameter morph-fn:sparqlEndpointUrl ; rml:inputValue "{endpoint}" ] ;\n'
+        f'    rml:input [ rml:parameter morph-fn:sparqlQuery ; rml:inputValue """{PARITY_QUERY}""" ] ;\n'
+    )
+
+
+def parity_triples(matches):
+    return {
+        f'<urn:id:{row}> <https://example.org/ontology/matches> <{CLINICAL}{concept}>'
+        for row, concept in matches
+    }
+
+
+@pytest.mark.parametrize('ambiguity', ['ALL', 'NONE'])
+@pytest.mark.parametrize('matching', ['EXACT', 'LOWERCASE', 'CASE-INSENSITIVE'])
+def test_same_triples_from_a_vocabulary_file_and_a_sparql_endpoint(tmp_path, matching, ambiguity):
+    """
+    The same data, mapping and way of matching values give the same triples
+    whether the vocabulary is read from a file or queried from an endpoint
+    holding it, whatever the shape of its answer: both are matched by Morph-KGC,
+    without the query normalizing anything.
+    """
+    expected = PARITY_MATCHES[matching]
+    if ambiguity == 'NONE':
+        rows = [row for row, _ in expected]
+        expected = {(row, concept) for row, concept in expected if rows.count(row) == 1}
+
+    from_file = morph_kgc.materialize_set(parity_config(tmp_path, file_inputs(), matching, ambiguity))
+    assert from_file == parity_triples(expected)
+
+    with VocabularyServer() as server:
+        for path in PARITY_ENDPOINTS:
+            from_endpoint = morph_kgc.materialize_set(parity_config(
+                tmp_path, sparql_inputs(f'{server.url}{path}'), matching, ambiguity,
+            ))
+            assert from_endpoint == from_file, path
+
+
+def test_same_triples_from_a_vocabulary_file_and_a_sparql_endpoint_with_multiple_processes(tmp_path):
+    """Worker processes match values alike, whichever the backend."""
+    from_file = morph_kgc.materialize_set(
+        parity_config(tmp_path, file_inputs(), 'CASE-INSENSITIVE', 'ALL', processes=4),
+    )
+    with VocabularyServer() as server:
+        from_endpoint = morph_kgc.materialize_set(parity_config(
+            tmp_path, sparql_inputs(f'{server.url}/public/vocabulary/sparql'),
+            'CASE-INSENSITIVE', 'ALL', processes=4,
+        ))
+
+    assert from_endpoint == from_file == parity_triples(PARITY_MATCHES['CASE-INSENSITIVE'])
+
+
+XML_ANSWER = '''<?xml version="1.0"?>
+<sparql xmlns="http://www.w3.org/2005/sparql-results#">
+  <head><variable name="entity_iri"/><variable name="matching_value_1"/><variable name="g"/></head>
+  <results>
+    <result>
+      <binding name="entity_iri"><uri> https://e/1 </uri></binding>
+      <binding name="matching_value_1"><literal> Café\t</literal></binding>
+    </result>
+    <result>
+      <binding name="entity_iri"><uri>https://e/2</uri></binding>
+      <binding name="matching_value_1"><literal xml:lang="fr">   </literal></binding>
+    </result>
+    <result>
+      <binding name="entity_iri"><uri>https://e/3</uri></binding>
+      <binding name="matching_value_1"><literal datatype="http://www.w3.org/2001/XMLSchema#integer">7</literal></binding>
+    </result>
+    <result>
+      <binding name="entity_iri"><uri>https://e/4</uri></binding>
+      <binding name="matching_value_1"><bnode>b0</bnode></binding>
+    </result>
+    <result>
+      <binding name="entity_iri"><uri>https://e/5</uri></binding>
+      <binding name="matching_value_1"><literal></literal></binding>
+    </result>
+    <result>
+      <binding name="entity_iri"><uri>https://e/6</uri></binding>
+    </result>
+  </results>
+</sparql>
+'''
+
+
+def read_answer(tmp_path, body, content_type='application/sparql-results+xml'):
+    from morph_kgc.http import Download
+    from morph_kgc.reconciliation import sparql
+
+    path = tmp_path / 'answer'
+    path.write_bytes(body.encode('utf-8'))
+    variables, solutions = sparql.read_solutions('E', Download(str(path), content_type))
+    return variables, list(solutions)
+
+
+def test_answer_in_xml_read_as_written(tmp_path):
+    """
+    The literals of an answer in XML are read exactly as written, whitespace
+    included, as those of an answer in JSON are.
+    """
+    variables, solutions = read_answer(tmp_path, XML_ANSWER)
+
+    assert variables == ['entity_iri', 'matching_value_1', 'g']
+    assert solutions == [
+        (('uri', 'https://e/1'), (('literal', ' Café\t'),)),
+        (('uri', 'https://e/2'), (('literal', '   '),)),
+        (('uri', 'https://e/3'), (('literal', '7'),)),
+        (('uri', 'https://e/4'), (('bnode', 'b0'),)),
+        (('uri', 'https://e/5'), (('literal', ''),)),
+        (('uri', 'https://e/6'), (None,)),
+    ]
+
+
+def test_values_neither_iris_nor_literals_are_not_indexed(tmp_path):
+    """
+    A blank node, whose label only means something in the answer, is no value
+    an entity is matched by, as it is not in a vocabulary file.
+    """
+    from morph_kgc.functions.tables import close_connections
+    from morph_kgc.reconciliation import sparql
+
+    indexes, _ = sparql._index_solutions(
+        [
+            (('uri', 'https://e/1'), (('bnode', 'b0'),)),
+            (('uri', 'https://e/2'), (('literal', 'b0'),)),
+            (('uri', 'https://e/3'), (('uri', 'b0'),)),
+            (('uri', 'https://e/4'), (('triple', None),)),
+        ],
+        str(tmp_path), '512MB',
+    )
+    try:
+        assert indexes['EXACT'].lookup('b0') == ['https://e/2', 'https://e/3']
+    finally:
+        close_connections(str(tmp_path))
+
+
+@pytest.mark.parametrize('body, error', [
+    ('<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#">'
+     '<head/><boolean>true</boolean></sparql>', 'it is the answer to an ASK query'),
+    ('<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#">'
+     '<results></results></sparql>', 'it has no head before its results'),
+    ('<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#"><head>',
+     'did not answer with SPARQL results'),
+    ('not XML at all', 'did not answer with SPARQL results'),
+])
+def test_answer_in_xml_that_is_not_select_results(tmp_path, body, error):
+    """An answer in XML that holds no SELECT results fails, saying why."""
+    with pytest.raises(ValueError, match=error):
+        read_answer(tmp_path, body)
+
+
+def test_answer_in_xml_cut_short(tmp_path):
+    """An answer in XML cut short fails while its solutions are read."""
+    with pytest.raises(ValueError, match='did not answer with SPARQL results'):
+        read_answer(tmp_path, XML_ANSWER[:XML_ANSWER.index('<binding name="entity_iri"><uri>https://e/3')])

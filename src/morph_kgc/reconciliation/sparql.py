@@ -51,9 +51,12 @@ head first, as most stores write it, and when every term in it is well formed;
 otherwise it is read whole into memory, with a warning. Whether its patterns
 read the named graphs of the endpoint is up to the query, since stores differ on
 whether their default graph includes them. Values are matched as the
-execution says, exactly by default (see ``morph-fn:matching``): the answer is
-indexed once for every way of matching values of the executions sending the
-query, which is sent once.
+execution says, exactly by default (see ``morph-fn:matching``), by the same
+normalization as against a vocabulary file, applied here to the values of the
+answer, which the query returns as they are: the answer is indexed once for
+every way of matching values of the executions sending the query, which is sent
+once. Answers in XML are read by the standard library, which keeps the
+whitespace a literal starts or ends with, which pyoxigraph's parser trims.
 
 How the endpoint is accessed is declared in the configuration file, only when
 its URL is not enough: a ``[RESOURCE:<name>]`` section whose ``url`` (or
@@ -74,6 +77,7 @@ import re
 from http.client import HTTPException
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit
+from xml.etree import ElementTree
 
 import pyoxigraph
 
@@ -88,6 +92,7 @@ SPARQL_RESULTS_JSON = "application/sparql-results+json"
 
 # The serializations of SPARQL results read as a stream, by content type. JSON
 # is the one asked for; the others are read too, should an endpoint send them.
+# XML is read by the standard library (see _read_xml_solutions).
 RESULTS_FORMATS = {
     SPARQL_RESULTS_JSON:               pyoxigraph.QueryResultsFormat.JSON,
     "application/json":                pyoxigraph.QueryResultsFormat.JSON,
@@ -96,6 +101,15 @@ RESULTS_FORMATS = {
     "text/xml":                        pyoxigraph.QueryResultsFormat.XML,
     "text/tab-separated-values":       pyoxigraph.QueryResultsFormat.TSV,
 }
+
+# The namespace of the elements of SPARQL results in XML.
+XML_RESULTS_NAMESPACE = "{http://www.w3.org/2005/sparql-results#}"
+
+# The kinds of terms a value an entity is matched by may be: an IRI or a
+# literal, as the values of a vocabulary are ('typed-literal' in the JSON
+# results of SPARQL 1.0). A blank node, whose label only means something in
+# the answer, is no value.
+VALUE_KINDS = {"uri", "literal", "typed-literal"}
 
 # The variables the query projects: the entity, and the values it is matched by,
 # numbered from 1.
@@ -228,6 +242,8 @@ def read_solutions(endpoint: str, answer: Download, arity: int = 1):
     """
     json_format = pyoxigraph.QueryResultsFormat.JSON
     results_format = RESULTS_FORMATS.get(answer.content_type, json_format)
+    if results_format == pyoxigraph.QueryResultsFormat.XML:
+        return _read_xml_solutions(endpoint, answer, arity)
     try:
         results = pyoxigraph.parse_query_results(path=answer.path, format=results_format)
     except SyntaxError as exc:
@@ -291,8 +307,95 @@ def _solution_term(term) -> tuple[str, str] | None:
         return None
     if isinstance(term, pyoxigraph.NamedNode):
         return "uri", term.value
+    if isinstance(term, pyoxigraph.Literal):
+        return "literal", term.value
+    if isinstance(term, pyoxigraph.BlankNode):
+        return "bnode", term.value
     # A triple term has no value of its own to match.
-    return type(term).__name__.lower(), getattr(term, "value", None)
+    return "triple", None
+
+
+def _read_xml_solutions(endpoint: str, answer: Download, arity: int = 1):
+    """
+    The variables an answer in XML projects and its solutions, as
+    :func:`read_solutions` gives them, read as a stream by the standard
+    library, which keeps the text of every literal as it is: the parser of
+    pyoxigraph trims the whitespace a literal starts or ends with, which a
+    value is matched by as well. The answer is read twice, its head first, so
+    that its file is only open while its solutions are read.
+    """
+    variables = None
+    try:
+        with open(answer.path, "rb") as answer_file:
+            # The head, and whether results or a boolean, the answer to an ASK
+            # query, come after it.
+            for event, element in ElementTree.iterparse(answer_file, events=("start", "end")):
+                tag = _xml_tag(element)
+                if event == "end" and tag == "head":
+                    variables = [
+                        variable.get("name")
+                        for variable in element
+                        if _xml_tag(variable) == "variable"
+                    ]
+                elif event == "start" and tag == "boolean":
+                    raise _not_results(endpoint, answer, "it is the answer to an ASK query")
+                elif event == "start" and tag == "results":
+                    break
+    except ElementTree.ParseError as exc:
+        raise _not_results(endpoint, answer, exc) from exc
+    if variables is None:
+        raise _not_results(endpoint, answer, "it has no head before its results")
+
+    matched = matching_variables(arity)
+    if any(variable not in variables for variable in (ENTITY_VARIABLE, *matched)):
+        # check_variables says which is missing.
+        return variables, iter(())
+
+    def solutions():
+        try:
+            with open(answer.path, "rb") as answer_file:
+                results = None
+                for event, element in ElementTree.iterparse(answer_file, events=("start", "end")):
+                    tag = _xml_tag(element)
+                    if event == "start" and tag == "results":
+                        results = element
+                    elif event == "end" and tag == "result":
+                        bound = {
+                            binding.get("name"): _xml_term(binding)
+                            for binding in element
+                            if _xml_tag(binding) == "binding"
+                        }
+                        # The solutions read are dropped, so that memory does not
+                        # grow with the size of the answer.
+                        if results is not None:
+                            results.clear()
+                        yield (
+                            bound.get(ENTITY_VARIABLE),
+                            tuple(bound.get(variable) for variable in matched),
+                        )
+        except ElementTree.ParseError as exc:
+            raise _not_results(endpoint, answer, exc) from exc
+
+    return variables, solutions()
+
+
+def _xml_tag(element) -> str:
+    """The name of an element of SPARQL results in XML, without its namespace."""
+    return element.tag.removeprefix(XML_RESULTS_NAMESPACE)
+
+
+def _xml_term(binding) -> tuple[str, str | None] | None:
+    """The kind and value of the term of a binding of SPARQL results in XML."""
+    for term in binding:
+        kind = _xml_tag(term)
+        if kind == "literal":
+            # Exactly as written, whitespace included.
+            return "literal", term.text or ""
+        if kind in ("uri", "bnode"):
+            return kind, (term.text or "").strip()
+        # A triple term has no value of its own to match.
+        return kind, None
+    return None
 
 
 def _read_json_solutions(endpoint: str, answer: Download, reason, arity: int = 1):
@@ -453,9 +556,12 @@ def _index_solutions(
     not_iris = 0
     with ConceptIndexBuilder(state_dir, memory_limit, *matchings, arity=arity) as builder:
         for entity, values in solutions:
-            # Unbound in this solution, e.g. by an OPTIONAL pattern: an entity
-            # is only matched by all its values.
-            if entity is None or any(value is None or value[1] is None for value in values):
+            # Unbound in this solution, e.g. by an OPTIONAL pattern, or bound
+            # to no IRI or literal: an entity is only matched by all its values.
+            if entity is None or any(
+                value is None or value[0] not in VALUE_KINDS or value[1] is None
+                for value in values
+            ):
                 continue
             # A blank node or a literal identifies no entity outside the answer.
             if entity[0] != "uri":
@@ -485,6 +591,7 @@ def build_index(
     """
     endpoint = resource.get_url()
     answer = run_query(resource, query, state_dir)
+    solutions = None
     try:
         variables, solutions = read_solutions(endpoint, answer, arity)
         if variables is not None:
@@ -501,6 +608,10 @@ def build_index(
                 solutions, state_dir, memory_limit, arity, matchings,
             )
     finally:
+        # A reader of the answer left halfway through closes its file, which
+        # Windows cannot remove while it is open.
+        if hasattr(solutions, "close"):
+            solutions.close()
         answer.remove()
 
     if not_iris:

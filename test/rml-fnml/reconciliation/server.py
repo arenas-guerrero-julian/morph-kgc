@@ -25,6 +25,12 @@ The SPARQL endpoints evaluate queries over the knowledge graph of
 
 The other endpoints answer in JSON with the head first, as most stores do.
 
+The same endpoints under ``/public/vocabulary`` (``/public/vocabulary/sparql``,
+``/public/vocabulary/sparql/xml``...) evaluate queries over the SKOS vocabulary
+of ``parity_vocabulary.ttl`` instead, as its default graph, so that the
+reconciliation against a vocabulary file and against an endpoint holding the
+same data can be compared.
+
 ``/vocabulary.gz`` serves the vocabulary gzipped, ``/vocabulary.broken-gz``
 says it does but does not, ``/vocabulary.multi-gz`` serves it gzipped in two
 members, as concatenated gzip files are, and ``/vocabulary.cut`` closes the
@@ -62,9 +68,12 @@ VOCABULARY_FILES = {
 }
 
 
-def _knowledge_graph(default_union):
+def _knowledge_graph(default_union, file_name='clinical_trials.trig'):
     dataset = Dataset(default_union=default_union)
-    dataset.parse(os.path.join(TEST_DIR, 'clinical_trials.trig'), format='trig')
+    dataset.parse(
+        os.path.join(TEST_DIR, file_name),
+        format='trig' if file_name.endswith('.trig') else 'turtle',
+    )
     return dataset
 
 
@@ -83,6 +92,10 @@ SPARQL_ENDPOINTS = {
 
 # Paths answered without authentication.
 PUBLIC_PREFIX = '/public/'
+
+# The prefix of the endpoints over the vocabulary of parity_vocabulary.ttl.
+VOCABULARY_ENDPOINTS_PREFIX = '/public/vocabulary/'
+VOCABULARY_ENDPOINTS_FILE = 'parity_vocabulary.ttl'
 
 
 def _expected_authorization():
@@ -138,11 +151,19 @@ class _Handler(BaseHTTPRequestHandler):
                 self._respond(200, body, content_type, cut=True)
             else:
                 self._respond(200, body, content_type)
-        elif path in SPARQL_ENDPOINTS:
+        elif path in SPARQL_ENDPOINTS or (
+            path.startswith(VOCABULARY_ENDPOINTS_PREFIX)
+            and path.replace(VOCABULARY_ENDPOINTS_PREFIX, PUBLIC_PREFIX, 1) in SPARQL_ENDPOINTS
+        ):
             if path.endswith('/slow'):
                 time.sleep(1.5)
             try:
-                results = _knowledge_graph(SPARQL_ENDPOINTS[path]).query(query)
+                if path.startswith(VOCABULARY_ENDPOINTS_PREFIX):
+                    # A vocabulary serialized as triples is its default graph.
+                    knowledge_graph = _knowledge_graph(True, VOCABULARY_ENDPOINTS_FILE)
+                else:
+                    knowledge_graph = _knowledge_graph(SPARQL_ENDPOINTS[path])
+                results = knowledge_graph.query(query)
             except Exception as exc:
                 self._respond(400, str(exc).encode(), 'text/plain')
                 return

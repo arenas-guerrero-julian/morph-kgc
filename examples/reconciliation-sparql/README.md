@@ -76,6 +76,18 @@ and nothing else, as a Lucene index of keywords) or `CASE-INSENSITIVE`
 Executions matching the answer to the same query differently share it: the
 query is sent once.
 
+Morph-KGC matches the values itself, both those of the answer
+(`?matching_value_<i>`), as it indexes them, and those it reconciles, exactly
+as it matches them against a vocabulary file: the query returns the values as
+they are, and needs no `LCASE`. The same data, mapping and way of matching
+values therefore give the same triples whether a vocabulary is read from a file
+or queried from an endpoint holding it, provided that the query returns the
+values the file is matched against: the labels of its concepts (e.g.
+`skos:prefLabel|skos:altLabel`), and no concept scheme or collection, which a
+vocabulary file never matches. An IRI or a literal is a value, a blank node is
+not, as in a vocabulary file. Answers in JSON, XML and TSV are all read with
+their values as they are, whitespace included.
+
 Declare the prefixes the query uses: an endpoint is not bound to know `schema:`
 or any other prefix.
 
