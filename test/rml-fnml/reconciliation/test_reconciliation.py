@@ -1477,8 +1477,9 @@ def test_value_matching_several_entities(tmp_path):
 
 def test_case_insensitive_matching_in_the_mapping(tmp_path):
     """
-    Values are matched exactly, so a mapping matching them whatever their case
-    lowercases both the values of the query and the values it reconciles.
+    Values are matched exactly by default, so that, rather than binding
+    morph-fn:matching, a mapping may match them whatever their case by
+    lowercasing both the values of the query and the values it reconciles.
     """
     with open(os.path.join(TEST_DIR, 'clinical_trials.csv'), encoding='utf-8') as f:
         rows = f.read().replace('NCT07667218', 'nct07667218').replace('NCT07667205', 'Nct07667205')
@@ -2888,7 +2889,7 @@ MATCHED_TERMS = {
 def test_normalize_by_matching():
     """
     LOWERCASE lower-cases each character as Lucene's LowerCaseFilter does, and
-    does nothing else; CASE-INSENSITIVE also normalizes Unicode, collapses
+    does nothing else; CASE-INSENSITIVE normalizes Unicode, collapses
     whitespace and case-folds.
     """
     from morph_kgc.reconciliation.index import normalize
@@ -2909,6 +2910,8 @@ def test_normalize_by_matching():
 
     assert case_insensitive('Café ') == case_insensitive('café  ') == 'café'
     assert case_insensitive('Straße') == case_insensitive('STRASSE') == 'strasse'
+    # Case-folding keeps the dot of 'İ', which lower-casing as Lucene drops.
+    assert case_insensitive('İSTANBUL') != case_insensitive('istanbul')
 
     assert normalize('Café ', 'EXACT') == 'Café '
 
@@ -3031,12 +3034,15 @@ def patients_matching_source(tmp_path):
 
 
 @pytest.mark.parametrize('matching', [None, 'EXACT', 'LOWERCASE', 'CASE-INSENSITIVE'])
-def test_ways_of_matching_over_sparql(tmp_path, matching):
+# The second answer is read in memory, as the streaming parser rejects a
+# solution, which matches nothing.
+@pytest.mark.parametrize('path', ['/public/sparql', '/public/sparql/bad-term'])
+def test_ways_of_matching_over_sparql(tmp_path, matching, path):
     """The entities a SPARQL query returns are matched in the same ways."""
     with VocabularyServer() as server:
         mapping = sparql_mapping(
             tmp_path,
-            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (MAPPING_ENDPOINT, f'{server.url}{path}'),
             (STUDIES_QUERY, MATCHING_QUERY),
             patients_matching_source(tmp_path),
             *([with_sparql_input('morph-fn:matching', f'"{matching}"')] if matching else []),
@@ -3046,6 +3052,28 @@ def test_ways_of_matching_over_sparql(tmp_path, matching):
     assert {
         (str(s).replace('urn:id:', ''), str(o)) for s, o in g_morph.subject_objects()
     } == MATCHED_TERMS[matching or 'EXACT']
+
+
+@pytest.mark.parametrize('matching, expected', [
+    ('"lowercase"', 'LOWERCASE'),
+    ('" Lowercase "', 'LOWERCASE'),
+    ('"case-insensitive"', 'CASE-INSENSITIVE'),
+])
+def test_ways_of_matching_over_sparql_in_any_case(tmp_path, matching, expected):
+    """The way of matching values over SPARQL is named in any case."""
+    with VocabularyServer() as server:
+        mapping = sparql_mapping(
+            tmp_path,
+            (MAPPING_ENDPOINT, f'{server.url}/public/sparql'),
+            (STUDIES_QUERY, MATCHING_QUERY),
+            patients_matching_source(tmp_path),
+            with_sparql_input('morph-fn:matching', matching),
+        )
+        g_morph = morph_kgc.materialize(sparql_config(mapping=mapping))
+
+    assert {
+        (str(s).replace('urn:id:', ''), str(o)) for s, o in g_morph.subject_objects()
+    } == MATCHED_TERMS[expected]
 
 
 def test_same_query_matched_two_ways_is_sent_once(tmp_path):

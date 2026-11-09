@@ -1,7 +1,7 @@
 # Labels telling the ways of matching values apart: matched against 'Café ',
 # 'Straße' and 'STRASSE' (patients_matching.csv), LOWERCASE only lower-cases,
-# while CASE-INSENSITIVE also normalizes Unicode (NFKC), collapses whitespace
-# and case-folds, matching several concepts.
+# while CASE-INSENSITIVE normalizes Unicode (NFKC), collapses whitespace and
+# case-folds, matching several concepts.
 
 @prefix skos: <http://www.w3.org/2004/02/skos/core#> .
 @prefix term: <https://example.org/vocabulary/term/> .

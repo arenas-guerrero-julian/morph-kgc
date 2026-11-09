@@ -70,8 +70,8 @@ To match a value against several properties, bind all of them to
 
 Values are matched exactly, unless the execution binds `morph-fn:matching` to
 another way of matching them, as against a vocabulary: `LOWERCASE` (lower-cased,
-and nothing else, as a Lucene index of keywords) or `CASE-INSENSITIVE` (also
-normalized, with their whitespace collapsed, and case-folded), described in
+and nothing else, as a Lucene index of keywords) or `CASE-INSENSITIVE`
+(normalized, with their whitespace collapsed, and case-folded), described in
 [`../reconciliation`](../reconciliation/README.md#ways-of-matching-values).
 Executions matching the answer to the same query differently share it: the
 query is sent once.
@@ -126,10 +126,10 @@ on (`grel:valueParameter1`, `grel:valueParameter2`... are accepted as well):
 ```
 
 A row is reconciled with the entities matched by all its values. They are
-compared one by one, exactly, as each is indexed in a column of its own: never
-joined into a string, so values holding `,`, `|` or whitespace match as they
-are, and the code `A|1` of `ICD-10` is not mistaken for the code `A` of
-`1|ICD-10`. A value may be a constant, such as the coding system of every row.
+compared one by one, each as `morph-fn:matching` says (exactly, by default), as
+each is indexed in a column of its own: never joined into a string, so values
+holding `,` or `|` are not split, and the code `A|1` of `ICD-10` is not
+mistaken for the code `A` of `1|ICD-10`. A value may be a constant, such as the coding system of every row.
 An entity a solution leaves a value unbound for is matched by no row.
 
 The query must project as many `?matching_value_<i>` as the execution binds

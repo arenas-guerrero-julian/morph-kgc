@@ -102,19 +102,22 @@ generating them needs `rml:termType rml:IRI`.
 ## Ways of matching values
 
 `morph-fn:matching` says how the value and the labels of the vocabulary are
-compared:
+compared. In the examples below, the value `Café␠` ends with a space, which
+`␠` stands for:
 
-| Matching | Compares values | `Café ` matches | `Straße` matches |
+| Matching | Compares values | `Café␠` matches | `Straße` matches |
 | --- | --- | --- | --- |
-| `EXACT` | as they are. The default. | `Café ` | `Straße` |
-| `LOWERCASE` | lower-cased, and nothing else: no whitespace is trimmed or collapsed, and no Unicode normalization is applied. | `café `, `CAFÉ ` (not `Café`, `cafe` or `café  `) | `straße` (not `strasse`) |
-| `CASE-INSENSITIVE` | normalized (NFKC), with their whitespace collapsed, and case-folded. | `café`, `Café  `, `café` decomposed (NFD)... | `strasse`, `STRASSE` |
+| `EXACT` | as they are. The default. | `Café␠` | `Straße` |
+| `LOWERCASE` | lower-cased, and nothing else: no whitespace is trimmed or collapsed, and no Unicode normalization is applied. | `café␠`, `CAFÉ␠`; not `Café` (no space), `cafe`, `café␠␠` (two spaces) or `café␠` decomposed (NFD) | `straße`; not `strasse` |
+| `CASE-INSENSITIVE` | normalized (NFKC), with their whitespace collapsed, and case-folded. | `café␠`, `Café` (no space), `café␠␠` (two spaces), `café␠` decomposed (NFD)...; not `cafe` | `strasse`, `STRASSE`, `straße` |
 
 `LOWERCASE` matches as a Lucene index analyzing the values with
 `KeywordTokenizer` and `LowerCaseFilter` does, which lower-cases each character
 on its own: as Python's `str.lower()` does, but for `İ`, lower-cased to `i`,
 and a final `Σ`, to `σ`. `CASE-INSENSITIVE` matches more, which may turn a
-value matching a single concept into an ambiguous one.
+value matching a single concept into an ambiguous one, with one exception:
+case-folding turns `İ` into `i` followed by a combining dot above, so that it
+matches neither `i` nor `I`, which `LOWERCASE` matches it to.
 
 ## Ambiguous values
 
