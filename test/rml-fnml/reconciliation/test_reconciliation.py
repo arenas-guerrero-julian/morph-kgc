@@ -3747,12 +3747,16 @@ def test_same_triples_for_labels_xml_cannot_read_as_written(tmp_path, matching):
 
     labels = LABELS_XML_CANNOT_READ
     vocabulary = tmp_path / 'vocabulary.ttl'
+    # Written as it is: rdflib writes a label holding a line feed as a long
+    # literal holding it, which Windows would write as a carriage return and a
+    # line feed, changing the label.
     vocabulary.write_text(
         '@prefix skos: <http://www.w3.org/2004/02/skos/core#> .\n' + ''.join(
             f'<{CLINICAL}{number}> a skos:Concept ; skos:prefLabel {Literal(label).n3()} .\n'
             for number, label in enumerate(labels, 1)
         ),
         encoding='utf-8',
+        newline='\n',
     )
     # The labels, and the labels in upper case, as inputs.
     inputs = [*labels, *(label.upper() for label in labels)]
