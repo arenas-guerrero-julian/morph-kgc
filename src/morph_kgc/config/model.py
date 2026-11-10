@@ -25,6 +25,7 @@ from .defaults import (
     DEFAULT_API_TOKEN,
     DEFAULT_STATE_DIR,
     DEFAULT_STATE_MEMORY_LIMIT,
+    DEFAULT_RECONCILIATION_REPORT,
     DEFAULT_LOGGING_LEVEL,
     DEFAULT_LOGGING_FILE,
 )
@@ -248,6 +249,9 @@ class MorphConfig:
     api_token: str = DEFAULT_API_TOKEN
     state_dir: str = DEFAULT_STATE_DIR
     state_memory_limit: str = DEFAULT_STATE_MEMORY_LIMIT
+    # File the reconciliation functions report the values they match to no
+    # entity or to several to, in JSON Lines; empty for no report.
+    reconciliation_report: str = DEFAULT_RECONCILIATION_REPORT
 
     # -- Logging -------------------------------------------------------------
     logging_level: str = DEFAULT_LOGGING_LEVEL
@@ -269,6 +273,7 @@ class MorphConfig:
         self._validate_mapping_partitioning()
         self._validate_number_of_processes()
         self._validate_state_memory_limit()
+        self._validate_reconciliation_report()
         self._validate_paths()
         self._coerce_list_fields()
         self._setup_logging()
@@ -314,6 +319,15 @@ class MorphConfig:
         from ..functions.tables import check_memory_limit
 
         check_memory_limit(self.state_memory_limit)
+
+    def _validate_reconciliation_report(self) -> None:
+        self.reconciliation_report = str(self.reconciliation_report or "").strip()
+        if self.reconciliation_report and os.path.isdir(self.reconciliation_report):
+            raise ValueError(
+                f"'reconciliation_report' value '{self.reconciliation_report}' is a "
+                "directory. It must be the path of the file the report is written to, "
+                "e.g. 'reconciliation_report.jsonl'."
+            )
 
     def _validate_paths(self) -> None:
         _create_dirs_in_path(self.logging_file)

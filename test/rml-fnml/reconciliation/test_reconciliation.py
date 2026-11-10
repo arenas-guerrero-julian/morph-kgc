@@ -3795,3 +3795,186 @@ def test_same_triples_for_labels_xml_cannot_read_as_written(tmp_path, matching):
                 with_labels(config(sparql_inputs(f'{server.url}{path}'))),
             )
             assert from_endpoint == from_file, path
+
+
+# ── Reconciliation report ─────────────────────────────────────────────────────
+
+DISEASE_EXECUTION = 'http://example.com/base/#DiseaseReconciliationExecution'
+VOCABULARY_FUNCTION = 'urn:morph:function:reconciliation:reconcileVocabularyConcept'
+SPARQL_FUNCTION = 'urn:morph:function:reconcileEntityOverSPARQL'
+
+
+def read_report(path):
+    import json
+
+    with open(path, encoding='utf-8') as f:
+        return [json.loads(line) for line in f]
+
+
+def summaries(caplog):
+    return [
+        record.getMessage() for record in caplog.records
+        if record.levelname == 'INFO' and record.getMessage().startswith('Execution ')
+    ]
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report(tmp_path, caplog, processes):
+    """
+    A value matched to no concept, and one matched to several, each occurring in
+    several rows and reconciled for two triples maps, are reported once each,
+    whatever the number of processes, and the execution is summarized.
+    """
+    with open(os.path.join(TEST_DIR, 'patients.csv'), encoding='utf-8') as f:
+        rows = f.read()
+    rows += f'pid_00004,Not a disease in the vocabulary\npid_00005,{AMBIGUOUS_LABEL}\n'
+    (tmp_path / 'patients.csv').write_text(rows, encoding='utf-8')
+    source = str(tmp_path / 'patients.csv').replace('\\', '/')
+    mapping = mapping_copy(tmp_path, ('test/rml-fnml/reconciliation/patients.csv', source))
+    report = tmp_path / 'reports' / 'report.jsonl'
+
+    morph_kgc.materialize(ambiguous_config(
+        mapping, 'ambiguity=NONE', processes, configuration=f'reconciliation_report={report}',
+    ))
+
+    shared = {
+        'resource': 'disease_vocabulary',
+        'matching': 'EXACT',
+        'function_iri': VOCABULARY_FUNCTION,
+        'execution_id': DISEASE_EXECUTION,
+        'triples_maps': [
+            'http://example.com/base/#DiseaseResourceMapping', 'http://example.com/base/#PatientsMapping',
+        ],
+        'sources': [source],
+        'data_sources': ['DataSource'],
+        'mappings': [mapping],
+    }
+    assert read_report(report) == [
+        {
+            'outcome': 'MULTIPLE_MATCH',
+            'value': AMBIGUOUS_LABEL,
+            'normalized_value': AMBIGUOUS_LABEL,
+            'ambiguity': 'NONE',
+            'candidates': [NARCOLEPSY, ADCA_DN],
+            **shared,
+        },
+        {
+            'outcome': 'NO_MATCH',
+            'value': 'Not a disease in the vocabulary',
+            'normalized_value': 'Not a disease in the vocabulary',
+            **shared,
+        },
+    ]
+    # The rule of PatientsMapping reconciles the 5 rows (1 matched, 2 unmatched,
+    # 2 ambiguous), and each of the two rules of DiseaseResourceMapping, which
+    # only reads the labels, the 3 distinct ones (1 of each).
+    assert summaries(caplog) == [
+        f"Execution '{DISEASE_EXECUTION}' of function '{VOCABULARY_FUNCTION}' handled 11 "
+        "value(s): 3 matched, 4 unmatched (1 distinct), 4 ambiguous (1 distinct)."
+    ]
+
+
+def test_no_reconciliation_report_by_default(tmp_path, caplog):
+    """Without 'reconciliation_report', no report is written, but the executions are summarized."""
+    morph_kgc.materialize(ambiguous_config(MAPPING))
+
+    assert not list(tmp_path.iterdir())
+    assert len(summaries(caplog)) == 1
+
+
+def test_reconciliation_report_replaces_that_of_an_earlier_run(tmp_path):
+    """The report of a run replaces that of an earlier run."""
+    report = tmp_path / 'report.jsonl'
+    report.write_text('a report of an earlier run\n', encoding='utf-8')
+
+    morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}',
+    ).replace('[CONFIGURATION]\n', f'[CONFIGURATION]\nreconciliation_report={report}\n'))
+
+    # Pid_00003 matches no concept of the vocabulary.
+    assert [record['value'] for record in read_report(report)] == ['Not a disease in the vocabulary']
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report_of_a_run_aborted(tmp_path, processes):
+    """A run aborted on an ambiguous value reports it."""
+    report = tmp_path / 'report.jsonl'
+    with pytest.raises(ValueError, match='MULTIPLE_MATCH'):
+        morph_kgc.materialize(ambiguous_config(
+            MAPPING, 'ambiguity=FAIL', processes, configuration=f'reconciliation_report={report}',
+        ))
+
+    assert {(record['outcome'], record['value'], record['ambiguity']) for record in read_report(report)
+            if record['outcome'] == 'MULTIPLE_MATCH'} == {('MULTIPLE_MATCH', AMBIGUOUS_LABEL, 'FAIL')}
+
+
+def test_reconciliation_report_over_sparql(tmp_path, caplog):
+    """
+    Values matched by several values together, against the answer to a query,
+    are reported as arrays, with the endpoint and the hash of the query, as
+    read and as looked up.
+    """
+    import hashlib
+
+    # 'ICD 10' read as 'ICD-10' makes 'A|1' in 'ICD-10' match the codes of 6 and 7.
+    query = CODES_QUERY.replace(
+        'schema:codingSystem ?matching_value_2 .\n                }',
+        'schema:codingSystem ?system .\n                }\n'
+        '                BIND(IF(?system = "ICD 10", "ICD-10", ?system) AS ?matching_value_2)',
+    )
+    report = tmp_path / 'report.jsonl'
+    with VocabularyServer() as server:
+        morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server, (CODES_QUERY, query),
+                (SCHEME_INPUT, SCHEME_INPUT + execution_input('morph-fn:matching', '"LOWERCASE"')),
+            ),
+        ).replace('[CONFIGURATION]\n', f'[CONFIGURATION]\nreconciliation_report={report}\n'))
+        endpoint = f'{server.url}/public/sparql'
+
+    shared = {
+        'endpoint': endpoint,
+        'query_hash': hashlib.sha256(query.encode('utf-8')).hexdigest(),
+        'matching': 'LOWERCASE',
+        'function_iri': SPARQL_FUNCTION,
+        'triples_maps': ['http://example.com/base/#DiagnosesMapping'],
+        'sources': ['test/rml-fnml/reconciliation/diagnoses.csv'],
+        'data_sources': ['DataSource'],
+    }
+    records = read_report(report)
+    for record in records:
+        assert record.pop('execution_id') == 'http://example.com/base/#DiagnosisReconciliation'
+        assert record.pop('mappings')
+    assert records == [
+        {
+            'outcome': 'MULTIPLE_MATCH',
+            'value': ['A|1', 'ICD-10'],
+            'normalized_value': ['a|1', 'icd-10'],
+            'ambiguity': 'ALL',
+            'candidates': ['https://data.com/id/6', 'https://data.com/id/7'],
+            **shared,
+        },
+        # 'A|1' in 'ICD 10', which the query reads as in 'ICD-10'.
+        {
+            'outcome': 'NO_MATCH',
+            'value': ['A|1', 'ICD 10'],
+            'normalized_value': ['a|1', 'icd 10'],
+            **shared,
+        },
+        {
+            'outcome': 'NO_MATCH',
+            'value': ['A|1', 'ICD-11'],
+            'normalized_value': ['a|1', 'icd-11'],
+            **shared,
+        },
+    ]
+
+
+def test_outcomes_argument_named_as_another(tmp_path):
+    """A function cannot receive its outcomes under the name of another argument."""
+    from morph_kgc.functions.bif_decorator import make_stateful_decorator
+
+    with pytest.raises(ValueError, match="declares 'context' as its outcomes argument"):
+        make_stateful_decorator({})(
+            fun_id='http://example.com/f', initializer=lambda: {}, outcomes_parameter='context',
+        )(lambda value, context: value)

@@ -219,6 +219,11 @@ all.
 | `morph-fn:matching` | how the value is matched: `EXACT` (default), `LOWERCASE` or `CASE-INSENSITIVE`. A constant. |
 | `morph-fn:ambiguity` | what a value matching several entities is reconciled to: `ALL` (default), `NONE` or `FAIL`. A constant, overriding the `ambiguity` option of the resource declaring the endpoint. |
 
+The values matched to no entity, and to several, are reported to the file the
+`reconciliation_report` option of the configuration file names, with the
+endpoint and the SHA-256 hash of the query: see
+[`../reconciliation`](../reconciliation/README.md#reconciliation-report).
+
 The endpoint and the query are constants of the mapping, since they are sent
 before any data is read. A value matching no entity yields no triple. A value
 matching several entities is ambiguous, and yields one triple per matched entity

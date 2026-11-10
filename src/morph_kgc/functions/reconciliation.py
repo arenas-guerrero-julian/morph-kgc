@@ -128,6 +128,11 @@ that gives the value and the IRIs of every entity it matches: a warning with
 process writes each record once, however many rows and mapping rules hold the
 value. With ``FAIL``, the report is the message of the error aborting the run.
 
+Both functions report how many values they matched to one entity, to none and
+to several, logged as a summary of each execution, and record each distinct
+value matched to none or to several in the report the 'reconciliation_report'
+option names (see :mod:`morph_kgc.functions.outcomes`).
+
 An object map using a function needs
 ``rml:termType rml:IRI`` (``rr:termType rr:IRI``, ``type: iri`` in YARRRML):
 one whose value is the result of a function generates literals by default
@@ -135,6 +140,7 @@ one whose value is the result of a function generates literals by default
 """
 
 import logging
+from hashlib import sha256
 from urllib.parse import urlsplit
 
 from ..config.model import (
@@ -166,6 +172,7 @@ from ..reconciliation.index import (
     VALID_MATCHINGS,
     QueryContext,
     ReconciliationContext,
+    normalize,
     parse_ambiguity,
     parse_matching,
 )
@@ -507,19 +514,56 @@ def _attributes(attribute) -> tuple:
     return (attribute,)
 
 
-def _reconcile_rows(context, values, groups, lookup) -> list:
+def _reconcile_rows(context, values, groups, lookup, outcomes=None) -> list:
     """
     Reconcile *values*, the rows of each group of *groups* (key -> row
     numbers) with a single call to ``lookup(key, values)``, which returns the
-    entities each value matches, what they are entities of, and the policy for
-    ambiguous values.
+    entities each value matches, what they are entities of, the policy for
+    ambiguous values, the way of matching values, and the fields naming what
+    they are entities of in the records of *outcomes*.
     """
     results = [None] * len(values)
     for key, rows in groups.items():
-        matches, target, ambiguity = lookup(key, [values[row] for row in rows])
+        matches, target, ambiguity, matching, fields = lookup(key, [values[row] for row in rows])
         for row, row_matches in zip(rows, matches):
+            if outcomes is not None:
+                # Before a value is reconciled, which may abort the run.
+                _report(outcomes, values[row], row_matches, matching, ambiguity, fields)
             results[row] = _result(context, target, ambiguity, values[row], row_matches)
     return results
+
+
+def _report(outcomes, value, matches, matching, ambiguity, fields) -> None:
+    """
+    Count the outcome of reconciling *value*, and record it when it matches no
+    entity or several (see :mod:`morph_kgc.functions.outcomes`): the value as
+    read, and as looked up, how it was matched, and what it was matched against.
+    """
+    if len(matches) == 1:
+        outcomes.count("MATCH")
+        return
+    outcome = MULTIPLE_MATCH if matches else NO_MATCH
+    outcomes.count(outcome)
+
+    components = list(value) if isinstance(value, (tuple, list)) else None
+    normalized = (
+        None if value is None
+        else [None if component is None else normalize(component, matching) for component in components]
+        if components is not None
+        else normalize(value, matching)
+    )
+    record = {
+        "value": components if components is not None else value,
+        "normalized_value": normalized,
+        **fields,
+        "matching": matching,
+    }
+    if matches:
+        record["ambiguity"] = ambiguity
+        record["candidates"] = list(matches)
+    # A value is told apart by what it is matched against as well, which an
+    # execution may read from the data.
+    outcomes.record(outcome, [fields, record["value"]], **record)
 
 
 @stateful_bif(
@@ -531,9 +575,11 @@ def _reconcile_rows(context, values, groups, lookup) -> list:
     attribute   = MergedAliases(MORPH_ATTRIBUTE_PARAMETERS),
     matching    = MORPH_FN_MATCHING,
     ambiguity   = MORPH_FN_AMBIGUITY,
+    outcomes_parameter = "outcomes",
 )
 def reconcile_vocabulary_concept(
     context, value, resource=None, attribute=None, matching=None, ambiguity=None,
+    outcomes=None,
 ):
     """Reconcile each of *value* against a SKOS vocabulary fetched from a URL."""
     # The single value of each row, which the initializer has checked.
@@ -561,9 +607,11 @@ def reconcile_vocabulary_concept(
             index.lookup_many(values, row_attributes),
             f"resource '{name}'",
             _row_ambiguity(row_ambiguity, context.ambiguity(name)),
+            index.matching,
+            {"resource": name},
         )
 
-    return _reconcile_rows(context, value, groups, lookup)
+    return _reconcile_rows(context, value, groups, lookup, outcomes)
 
 
 # ── SPARQL endpoint ───────────────────────────────────────────────────────────
@@ -719,9 +767,11 @@ def _initialize_sparql(initialization) -> QueryContext:
     query       = MORPH_FN_SPARQL_QUERY,
     matching    = MORPH_FN_MATCHING,
     ambiguity   = MORPH_FN_AMBIGUITY,
+    outcomes_parameter = "outcomes",
 )
 def reconcile_entity_over_sparql(
     context, value, endpoint=None, query=None, matching=None, ambiguity=None,
+    outcomes=None,
 ):
     """
     Reconcile each of *value* against the entities a SPARQL query returns: the
@@ -742,11 +792,16 @@ def reconcile_entity_over_sparql(
 
     def lookup(key, values):
         row_endpoint, row_query, row_matching, row_ambiguity = key
-        indexes = context.indexes[(row_endpoint, row_query)]
+        index = context.indexes[(row_endpoint, row_query)][parse_matching(row_matching)]
         return (
-            indexes[parse_matching(row_matching)].lookup_many(values),
+            index.lookup_many(values),
             f"SPARQL endpoint '{row_endpoint}'",
             _row_ambiguity(row_ambiguity, context.ambiguity(row_endpoint)),
+            index.matching,
+            {
+                "endpoint": row_endpoint,
+                "query_hash": sha256(row_query.encode("utf-8")).hexdigest(),
+            },
         )
 
-    return _reconcile_rows(context, value, groups, lookup)
+    return _reconcile_rows(context, value, groups, lookup, outcomes)

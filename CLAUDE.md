@@ -81,7 +81,7 @@ CI (`.github/workflows/ci.yml`) runs `pytest` on ubuntu, windows and macos with 
 | `mapping/` | `parser.py` (orchestrator plus SPARQL), `normalizer.py`, `model.py` (dataclasses), `partitioner.py`, `formats/{rml,r2rml,yarrrml}.py` |
 | `materializer/` | `pipeline.py`, `executor.py`, `stages/{load,references,join,terms,assemble}.py` |
 | `source/` | Adapter registry in `protocol.py`, registration in `__init__.py`; `file.py` (CSV/Excel/Parquet/JSON/XML/geo/DuckDB), `relational.py` (SQLAlchemy), `property_graph.py` (Neo4j), `http_api.py`, `python_data.py` (in-memory) |
-| `functions/` | FNML: `bif_decorator.py`, `registry.py`, `executor.py`, `param_resolver.py`, `state.py`, `tables.py` (DuckDB/Parquet), `udf_loader.py`, `grel/*_functions.py`, `grel/safe_eval.py`, `reconciliation.py` |
+| `functions/` | FNML: `bif_decorator.py`, `registry.py`, `executor.py`, `param_resolver.py`, `state.py`, `tables.py` (DuckDB/Parquet), `outcomes.py` (per-process outcome files merged into the reconciliation report after the run), `udf_loader.py`, `grel/*_functions.py`, `grel/safe_eval.py`, `reconciliation.py` |
 | `reconciliation/` | SKOS and SPARQL index builders (`skos.py`, `sparql.py`, `index.py`) |
 | `http.py` | stdlib HTTP client used only by HTTP API sources and reconciliation |
 | `testing.py` | `assert_isomorphic` (RDFC-1.0 canonicalization through pyoxigraph; compares graph names and blank nodes) |
