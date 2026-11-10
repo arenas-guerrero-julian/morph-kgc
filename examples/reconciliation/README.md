@@ -184,7 +184,8 @@ It holds one line per distinct value an execution matched to no entity
 number of rows holding it, of mapping rules reconciling it and of processes
 (`number_of_processes`), written when the run ends, also when it is aborted
 (ambiguity `FAIL`). Its directory is created as the configuration is read,
-and a path it cannot be written to is an error then. With the vocabulary
+and a path it cannot be written to is an error then; an existing file, or a
+device such as `/dev/stdout`, needs only to be writable itself. With the vocabulary
 `disease_vocabulary_ambiguous.ttl` of the tests and `ambiguity=NONE` (see
 [Ambiguous values](#ambiguous-values)), this example writes:
 

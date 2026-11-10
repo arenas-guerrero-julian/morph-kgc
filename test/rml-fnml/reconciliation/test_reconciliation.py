@@ -4111,6 +4111,43 @@ def test_reconciliation_report_of_the_values_of_a_nested_function(tmp_path, repo
         )
 
 
+def test_reconciliation_report_of_a_list_a_nested_function_returns(tmp_path):
+    """
+    A list a nested function returns, reconciled against an index matching an
+    entity by a single value, is looked up, and so reported, as a string.
+    """
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        f'pid,disease_label\npid_00001,{NOT_A_DISEASE}|{AMBIGUOUS_LABEL}\n', encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValueMap [ rml:reference "disease_label" ]',
+         'rml:inputValueMap [ rml:functionExecution <#SplitExecution> ]'),
+    )
+    with open(mapping, 'a', encoding='utf-8', newline='\n') as f:
+        f.write(
+            '\n<#SplitExecution>\n'
+            '    rml:function grel:string_split ;\n'
+            '    rml:input [\n'
+            '        rml:parameter grel:valueParameter ;\n'
+            '        rml:inputValueMap [ rml:reference "disease_label" ]\n'
+            '    ] ;\n'
+            '    rml:input [ rml:parameter grel:p_string_sep ; rml:inputValue "|" ] .\n'
+        )
+    report = tmp_path / 'report.jsonl'
+
+    morph_kgc.materialize(with_report(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}', mapping=mapping,
+    ), report))
+
+    # Looked up as the string of the list, not as two values.
+    looked_up = str([NOT_A_DISEASE, AMBIGUOUS_LABEL])
+    assert [(record['outcome'], record['value'], record['normalized_value'])
+            for record in read_report(report)] == [('NO_MATCH', looked_up, looked_up)]
+
+
 @pytest.mark.parametrize('reconciles', [True, False])
 def test_reconciliation_report_emptied_when_nothing_is_reported(tmp_path, reconciles):
     """
@@ -4135,15 +4172,101 @@ def test_reconciliation_report_emptied_when_nothing_is_reported(tmp_path, reconc
     assert report.read_text(encoding='utf-8') == ''
 
 
+def load_with_report(report):
+    """The configuration of the vocabulary, writing the report to *report*, as it is read."""
+    from morph_kgc.config.loaders import load_config
+
+    return load_config(with_report(config(f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}'), report))
+
+
+@pytest.mark.parametrize('name', [
+    'directory', 'reports' + os.sep, os.path.join('reports', 'sub', ''), os.path.join('reports', '.'),
+])
+def test_reconciliation_report_path_names_a_directory(tmp_path, name):
+    """
+    A report path naming a directory, existing or not, is an error as the
+    configuration is read, and creates no directory.
+    """
+    (tmp_path / 'directory').mkdir()
+
+    with pytest.raises(ValueError, match="'reconciliation_report' value .* names a directory"):
+        load_with_report(f'{tmp_path}{os.sep}{name}')
+    assert not (tmp_path / 'reports').exists()
+
+
 def test_reconciliation_report_path_not_writable(tmp_path):
-    """A report path that cannot be written to is an error as the configuration is read."""
+    """A report path whose directory cannot be created is an error as the configuration is read."""
     not_a_directory = tmp_path / 'file'
     not_a_directory.write_text('', encoding='utf-8')
 
     with pytest.raises(ValueError, match="'reconciliation_report' value .* cannot be created"):
-        morph_kgc.materialize(with_report(config(
-            f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}',
-        ), not_a_directory / 'report.jsonl'))
+        load_with_report(not_a_directory / 'report.jsonl')
+
+
+@pytest.mark.parametrize('target', ['missing directory', 'loop'])
+def test_reconciliation_report_path_of_a_link_not_writable(tmp_path, target):
+    """A link the report cannot be written through is an error as the configuration is read."""
+    report = tmp_path / 'report.jsonl'
+    try:
+        os.symlink(tmp_path / 'missing' / 'report.jsonl' if target == 'missing directory' else report, report)
+    except (OSError, NotImplementedError):
+        pytest.skip('links cannot be created')
+
+    with pytest.raises(ValueError, match="'reconciliation_report' value .* is not a path the report can be written to"):
+        load_with_report(report)
+
+
+def test_reconciliation_report_path_created_with_its_directory_only(tmp_path):
+    """Reading the configuration creates the directory of the report, but not the report."""
+    report = tmp_path / 'reports' / 'report.jsonl'
+
+    load_with_report(report)
+
+    assert (tmp_path / 'reports').is_dir()
+    assert not report.exists()
+
+
+@pytest.mark.parametrize('denied, accepted', [('directory', True), ('file', False)])
+def test_reconciliation_report_existing_file(tmp_path, monkeypatch, denied, accepted):
+    """
+    An existing report file, or a device such as /dev/stdout, needs only to be
+    writable itself, whatever its directory.
+    """
+    report = tmp_path / 'reports' / 'report.jsonl'
+    report.parent.mkdir()
+    report.write_text('a report of an earlier run\n', encoding='utf-8')
+    denied_path = os.fspath(report.parent if denied == 'directory' else report)
+    access = os.access
+    monkeypatch.setattr(os, 'access', lambda path, mode, *args, **kwargs: (
+        False if os.fspath(path) == denied_path and mode & os.W_OK else access(path, mode, *args, **kwargs)
+    ))
+
+    if not accepted:
+        with pytest.raises(ValueError, match="'reconciliation_report' value .* the file is not writable"):
+            load_with_report(report)
+        return
+    loaded = load_with_report(report)
+    monkeypatch.undo()
+
+    morph_kgc.materialize(loaded)
+
+    assert [record['value'] for record in read_report(report)] == [NOT_A_DISEASE]
+
+
+@pytest.mark.skipif(
+    sys.platform == 'win32' or os.geteuid() == 0,
+    reason='the permissions of a directory are not enforced on Windows, nor for root',
+)
+def test_reconciliation_report_path_in_a_directory_not_writable(tmp_path):
+    """A report to be created in a directory that cannot be written to is an error as the configuration is read."""
+    read_only = tmp_path / 'read-only'
+    read_only.mkdir()
+    read_only.chmod(0o555)
+    try:
+        with pytest.raises(ValueError, match="'reconciliation_report' value .* is not a path the report can be written to"):
+            load_with_report(read_only / 'report.jsonl')
+    finally:
+        read_only.chmod(0o755)
 
 
 def test_reconciliation_report_leaves_out_a_line_not_written_whole(tmp_path, caplog):

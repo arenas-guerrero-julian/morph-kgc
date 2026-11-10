@@ -324,9 +324,10 @@ class MorphConfig:
         report = self.reconciliation_report = str(self.reconciliation_report or "").strip()
         if not report:
             return
-        if os.path.isdir(report):
+        # 'reports/' names a directory as well before it exists.
+        if os.path.isdir(report) or os.path.basename(report) in ("", os.curdir, os.pardir):
             raise ValueError(
-                f"'reconciliation_report' value '{report}' is a "
+                f"'reconciliation_report' value '{report}' names a "
                 "directory. It must be the path of the file the report is written to, "
                 "e.g. 'reconciliation_report.jsonl'."
             )
@@ -341,11 +342,33 @@ class MorphConfig:
                 f"can be written to: its directory '{parent}' cannot be created "
                 f"({exc.strerror or exc})."
             ) from exc
-        if not os.access(parent, os.W_OK) or (os.path.exists(report) and not os.access(report, os.W_OK)):
+        if os.path.exists(report):
+            # An existing file, or a device such as /dev/stdout, is written to in
+            # place, which needs no access to its directory. It is not opened
+            # before the end, which a pipe would read as the end of the report.
+            if not os.access(report, os.W_OK):
+                raise ValueError(
+                    f"'reconciliation_report' value '{report}' is not a path the "
+                    "report can be written to: the file is not writable."
+                )
+            return
+        # A file to be created (also through a dangling link) is created to tell
+        # whether it can be, and removed unless a link names it.
+        linked = os.path.lexists(report)
+        try:
+            with open(report, "a", encoding="utf-8"):
+                pass
+        except OSError as exc:
             raise ValueError(
                 f"'reconciliation_report' value '{report}' is not a path the report "
-                "can be written to: it is not writable."
-            )
+                f"can be written to ({exc.strerror or exc})."
+            ) from exc
+        if not linked:
+            try:
+                os.remove(report)
+            except OSError:
+                # Left empty, until the report replaces it.
+                pass
 
     def _validate_paths(self) -> None:
         _create_dirs_in_path(self.logging_file)
