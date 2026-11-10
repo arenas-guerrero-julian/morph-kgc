@@ -3795,3 +3795,524 @@ def test_same_triples_for_labels_xml_cannot_read_as_written(tmp_path, matching):
                 with_labels(config(sparql_inputs(f'{server.url}{path}'))),
             )
             assert from_endpoint == from_file, path
+
+
+# ── Reconciliation report ─────────────────────────────────────────────────────
+
+DISEASE_EXECUTION = 'http://example.com/base/#DiseaseReconciliationExecution'
+VOCABULARY_FUNCTION = 'urn:morph:function:reconciliation:reconcileVocabularyConcept'
+SPARQL_FUNCTION = 'urn:morph:function:reconcileEntityOverSPARQL'
+
+
+def read_report(path):
+    import json
+
+    with open(path, encoding='utf-8') as f:
+        return [json.loads(line) for line in f]
+
+
+def summaries(caplog):
+    return [
+        record.getMessage() for record in caplog.records
+        if record.levelname == 'INFO' and record.getMessage().startswith('Execution ')
+    ]
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report(tmp_path, caplog, processes):
+    """
+    A value matched to no concept, and one matched to several, each occurring in
+    several rows and reconciled for two triples maps, are reported once each,
+    whatever the number of processes, and the execution is summarized.
+    """
+    with open(os.path.join(TEST_DIR, 'patients.csv'), encoding='utf-8') as f:
+        rows = f.read()
+    rows += f'pid_00004,Not a disease in the vocabulary\npid_00005,{AMBIGUOUS_LABEL}\n'
+    (tmp_path / 'patients.csv').write_text(rows, encoding='utf-8')
+    source = str(tmp_path / 'patients.csv').replace('\\', '/')
+    mapping = mapping_copy(tmp_path, ('test/rml-fnml/reconciliation/patients.csv', source))
+    report = tmp_path / 'reports' / 'report.jsonl'
+
+    morph_kgc.materialize(ambiguous_config(
+        mapping, 'ambiguity=NONE', processes, configuration=f'reconciliation_report={report}',
+    ))
+
+    shared = {
+        'resource': 'disease_vocabulary',
+        'matching': 'EXACT',
+        'function_iri': VOCABULARY_FUNCTION,
+        'execution_id': DISEASE_EXECUTION,
+        'triples_maps': [
+            'http://example.com/base/#DiseaseResourceMapping', 'http://example.com/base/#PatientsMapping',
+        ],
+        'sources': [source],
+        'data_sources': ['DataSource'],
+        'mappings': [mapping],
+    }
+    assert read_report(report) == [
+        {
+            'outcome': 'MULTIPLE_MATCH',
+            'value': AMBIGUOUS_LABEL,
+            'normalized_value': AMBIGUOUS_LABEL,
+            'ambiguity': 'NONE',
+            'candidates': [NARCOLEPSY, ADCA_DN],
+            **shared,
+        },
+        {
+            'outcome': 'NO_MATCH',
+            'value': 'Not a disease in the vocabulary',
+            'normalized_value': 'Not a disease in the vocabulary',
+            **shared,
+        },
+    ]
+    # The rule of PatientsMapping reconciles the 5 rows (1 matched, 2 unmatched,
+    # 2 ambiguous), and each of the two rules of DiseaseResourceMapping, which
+    # only reads the labels, the 3 distinct ones (1 of each).
+    assert summaries(caplog) == [
+        f"Execution '{DISEASE_EXECUTION}' of function '{VOCABULARY_FUNCTION}' handled 11 "
+        "value(s): 3 matched, 4 unmatched (1 distinct), 4 ambiguous (1 distinct)."
+    ]
+
+
+def test_no_reconciliation_report_by_default(caplog):
+    """Without 'reconciliation_report', no report is written, but the executions are summarized."""
+    from morph_kgc.config.loaders import load_config
+
+    assert load_config(ambiguous_config(MAPPING)).reconciliation_report == ''
+
+    morph_kgc.materialize(ambiguous_config(MAPPING))
+
+    assert not [record for record in caplog.records
+                if record.getMessage().startswith('Reconciliation report written')]
+    assert len(summaries(caplog)) == 1
+
+
+def test_reconciliation_report_replaces_that_of_an_earlier_run(tmp_path):
+    """The report of a run replaces that of an earlier run."""
+    report = tmp_path / 'report.jsonl'
+    report.write_text('a report of an earlier run\n', encoding='utf-8')
+
+    morph_kgc.materialize(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}',
+    ).replace('[CONFIGURATION]\n', f'[CONFIGURATION]\nreconciliation_report={report}\n'))
+
+    # Pid_00003 matches no concept of the vocabulary.
+    assert [record['value'] for record in read_report(report)] == ['Not a disease in the vocabulary']
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report_of_a_run_aborted(tmp_path, processes):
+    """A run aborted on an ambiguous value reports it."""
+    report = tmp_path / 'report.jsonl'
+    with pytest.raises(ValueError, match='MULTIPLE_MATCH'):
+        morph_kgc.materialize(ambiguous_config(
+            MAPPING, 'ambiguity=FAIL', processes, configuration=f'reconciliation_report={report}',
+        ))
+
+    assert {(record['outcome'], record['value'], record['ambiguity']) for record in read_report(report)
+            if record['outcome'] == 'MULTIPLE_MATCH'} == {('MULTIPLE_MATCH', AMBIGUOUS_LABEL, 'FAIL')}
+
+
+def test_reconciliation_report_over_sparql(tmp_path, caplog):
+    """
+    Values matched by several values together, against the answer to a query,
+    are reported as arrays, with the endpoint and the hash of the query, as
+    read and as looked up.
+    """
+    import hashlib
+
+    # 'ICD 10' read as 'ICD-10' makes 'A|1' in 'ICD-10' match the codes of 6 and 7.
+    query = CODES_QUERY.replace(
+        'schema:codingSystem ?matching_value_2 .\n                }',
+        'schema:codingSystem ?system .\n                }\n'
+        '                BIND(IF(?system = "ICD 10", "ICD-10", ?system) AS ?matching_value_2)',
+    )
+    report = tmp_path / 'report.jsonl'
+    with VocabularyServer() as server:
+        morph_kgc.materialize(sparql_config(
+            mapping=codes_mapping(
+                tmp_path, server, (CODES_QUERY, query),
+                (SCHEME_INPUT, SCHEME_INPUT + execution_input('morph-fn:matching', '"LOWERCASE"')),
+            ),
+        ).replace('[CONFIGURATION]\n', f'[CONFIGURATION]\nreconciliation_report={report}\n'))
+        endpoint = f'{server.url}/public/sparql'
+
+    shared = {
+        'endpoint': endpoint,
+        'query_hash': hashlib.sha256(query.encode('utf-8')).hexdigest(),
+        'matching': 'LOWERCASE',
+        'function_iri': SPARQL_FUNCTION,
+        'triples_maps': ['http://example.com/base/#DiagnosesMapping'],
+        'sources': ['test/rml-fnml/reconciliation/diagnoses.csv'],
+        'data_sources': ['DataSource'],
+    }
+    records = read_report(report)
+    for record in records:
+        assert record.pop('execution_id') == 'http://example.com/base/#DiagnosisReconciliation'
+        assert record.pop('mappings')
+    assert records == [
+        {
+            'outcome': 'MULTIPLE_MATCH',
+            'value': ['A|1', 'ICD-10'],
+            'normalized_value': ['a|1', 'icd-10'],
+            'ambiguity': 'ALL',
+            'candidates': ['https://data.com/id/6', 'https://data.com/id/7'],
+            **shared,
+        },
+        # 'A|1' in 'ICD 10', which the query reads as in 'ICD-10'.
+        {
+            'outcome': 'NO_MATCH',
+            'value': ['A|1', 'ICD 10'],
+            'normalized_value': ['a|1', 'icd 10'],
+            **shared,
+        },
+        {
+            'outcome': 'NO_MATCH',
+            'value': ['A|1', 'ICD-11'],
+            'normalized_value': ['a|1', 'icd-11'],
+            **shared,
+        },
+    ]
+
+
+def with_report(ini, report):
+    """*ini* writing the reconciliation report to *report*."""
+    return ini.replace('[CONFIGURATION]\n', f'[CONFIGURATION]\nreconciliation_report={report}\n')
+
+
+NOT_A_DISEASE = 'Not a disease in the vocabulary'
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report_one_record_per_execution(tmp_path, caplog, processes):
+    """A value two executions match to no concept is reported once for each, and each is summarized."""
+    report = tmp_path / 'report.jsonl'
+    morph_kgc.materialize(with_report(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}',
+        mapping=TWO_EXECUTIONS_MAPPING, processes=processes,
+    ), report))
+
+    records = [(record['execution_id'], record['outcome'], record['value']) for record in read_report(report)]
+    assert len(records) == len(set(records))
+    assert {(execution, value) for execution, _, value in records if value == NOT_A_DISEASE} == {
+        ('http://example.com/base/#AltLabelReconciliationExecution', NOT_A_DISEASE),
+        (DISEASE_EXECUTION, NOT_A_DISEASE),
+    }
+    assert len(summaries(caplog)) == 2
+
+
+def test_reconciliation_report_one_record_per_resource(tmp_path):
+    """A value matched to no concept of either of the resources its rows name is reported for each."""
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        f'pid,disease_label,vocabulary\npid_00001,{NOT_A_DISEASE},vocabulary_a\n'
+        f'pid_00002,{NOT_A_DISEASE},vocabulary_b\n',
+        encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValue "disease_vocabulary"', 'rml:inputValueMap [ rml:reference "vocabulary" ]'),
+    )
+    report = tmp_path / 'report.jsonl'
+
+    morph_kgc.materialize(two_vocabularies_config(
+        mapping, url_a=VOCABULARY, configuration=f'reconciliation_report={report}',
+    ))
+
+    assert [(record['resource'], record['outcome'], record['value']) for record in read_report(report)] == [
+        ('vocabulary_a', 'NO_MATCH', NOT_A_DISEASE), ('vocabulary_b', 'NO_MATCH', NOT_A_DISEASE),
+    ]
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report_gathers_the_candidates_of_every_row(tmp_path, processes):
+    """
+    A value matched against attributes read from the data, to several concepts
+    in each row, is reported once, with the concepts of all of its rows.
+    """
+    vocabulary = tmp_path / 'vocabulary.ttl'
+    vocabulary.write_text(
+        '@prefix skos: <http://www.w3.org/2004/02/skos/core#> .\n'
+        '<https://ex.org/A> a skos:Concept ; skos:prefLabel "X" .\n'
+        '<https://ex.org/B> a skos:Concept ; skos:prefLabel "X" .\n'
+        '<https://ex.org/C> a skos:Concept ; skos:prefLabel "Y" ; skos:altLabel "X" .\n'
+        '<https://ex.org/D> a skos:Concept ; skos:prefLabel "Z" ; skos:altLabel "X" .\n',
+        encoding='utf-8',
+    )
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        f'pid,disease_label,attribute\np1,X,{SKOS}prefLabel\np2,X,{SKOS}altLabel\n', encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValue skos:prefLabel , skos:altLabel', 'rml:inputValueMap [ rml:reference "attribute" ]'),
+    )
+    report = tmp_path / 'report.jsonl'
+
+    g_morph = morph_kgc.materialize(with_report(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={vocabulary}', mapping=mapping, processes=processes,
+    ), report))
+
+    candidates = [f'https://ex.org/{concept}' for concept in 'ABCD']
+    assert reconciled(g_morph) == {
+        ('p1', candidates[0]), ('p1', candidates[1]), ('p2', candidates[2]), ('p2', candidates[3]),
+    }
+    assert [(record['outcome'], record['value'], record['candidates']) for record in read_report(report)] == [
+        ('MULTIPLE_MATCH', 'X', candidates),
+    ]
+
+
+@pytest.mark.parametrize('report', [False, True])
+def test_reconciliation_report_of_the_values_of_a_nested_function(tmp_path, report):
+    """
+    The values a nested function returns, of any type, are reconciled as
+    strings, and reported as such: reporting them never fails the run.
+    """
+    udfs = tmp_path / 'udfs.py'
+    udfs.write_text(
+        'from decimal import Decimal\n\n'
+        "@udf(fun_id='http://example.com/length', "
+        "text='http://users.ugent.be/~bjdmeest/function/grel.ttl#valueParam')\n"
+        'def length(text):\n'
+        '    return Decimal(len(text))\n',
+        encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('rml:inputValueMap [ rml:reference "disease_label" ]',
+         'rml:inputValueMap [ rml:functionExecution <#LengthExecution> ]'),
+    )
+    with open(mapping, 'a', encoding='utf-8', newline='\n') as f:
+        f.write(
+            '\n<#LengthExecution>\n'
+            '    rml:function <http://example.com/length> ;\n'
+            '    rml:input [\n'
+            '        rml:parameter grel:valueParam ;\n'
+            '        rml:inputValueMap [ rml:reference "disease_label" ]\n'
+            '    ] .\n'
+        )
+    report_path = tmp_path / 'report.jsonl'
+    ini = config(f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}', mapping=mapping).replace(
+        '[CONFIGURATION]\n', f'[CONFIGURATION]\nudfs={udfs}\n',
+    )
+
+    g_morph = morph_kgc.materialize(with_report(ini, report_path) if report else ini)
+
+    assert not reconciled(g_morph)
+    if report:
+        with open(os.path.join(TEST_DIR, 'patients.csv'), encoding='utf-8') as f:
+            labels = [line.rstrip('\n').split(',', 1)[1] for line in f.readlines()[1:]]
+        # A record per distinct value: two of the labels are as long.
+        assert sorted((record['outcome'], record['value'], record['normalized_value'])
+                      for record in read_report(report_path)) == sorted(
+            {('NO_MATCH', str(len(label)), str(len(label))) for label in labels}
+        )
+
+
+def test_reconciliation_report_of_a_list_a_nested_function_returns(tmp_path):
+    """
+    A list a nested function returns, reconciled against an index matching an
+    entity by a single value, is looked up, and so reported, as a string.
+    """
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        f'pid,disease_label\npid_00001,{NOT_A_DISEASE}|{AMBIGUOUS_LABEL}\n', encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValueMap [ rml:reference "disease_label" ]',
+         'rml:inputValueMap [ rml:functionExecution <#SplitExecution> ]'),
+    )
+    with open(mapping, 'a', encoding='utf-8', newline='\n') as f:
+        f.write(
+            '\n<#SplitExecution>\n'
+            '    rml:function grel:string_split ;\n'
+            '    rml:input [\n'
+            '        rml:parameter grel:valueParameter ;\n'
+            '        rml:inputValueMap [ rml:reference "disease_label" ]\n'
+            '    ] ;\n'
+            '    rml:input [ rml:parameter grel:p_string_sep ; rml:inputValue "|" ] .\n'
+        )
+    report = tmp_path / 'report.jsonl'
+
+    morph_kgc.materialize(with_report(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}', mapping=mapping,
+    ), report))
+
+    # Looked up as the string of the list, not as two values.
+    looked_up = str([NOT_A_DISEASE, AMBIGUOUS_LABEL])
+    assert [(record['outcome'], record['value'], record['normalized_value'])
+            for record in read_report(report)] == [('NO_MATCH', looked_up, looked_up)]
+
+
+@pytest.mark.parametrize('reconciles', [True, False])
+def test_reconciliation_report_emptied_when_nothing_is_reported(tmp_path, reconciles):
+    """
+    The report of a run reporting no value, matching every one or reconciling
+    none, replaces that of an earlier run.
+    """
+    if reconciles:
+        patients = tmp_path / 'patients.csv'
+        with open(os.path.join(TEST_DIR, 'patients.csv'), encoding='utf-8') as f:
+            # The rows of pid_00001 and pid_00002, which match a concept each.
+            patients.write_text(''.join(f.readlines()[:3]), encoding='utf-8')
+        mapping = mapping_copy(tmp_path, ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()))
+    else:
+        mapping = os.path.join(TEST_DIR, '..', '..', 'rml-core', 'csv', 'RMLTC0001a', 'mapping.ttl')
+    report = tmp_path / 'report.jsonl'
+    report.write_text('a report of an earlier run\n', encoding='utf-8')
+
+    morph_kgc.materialize(with_report(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}', mapping=mapping,
+    ), report))
+
+    assert report.read_text(encoding='utf-8') == ''
+
+
+def load_with_report(report):
+    """The configuration of the vocabulary, writing the report to *report*, as it is read."""
+    from morph_kgc.config.loaders import load_config
+
+    return load_config(with_report(config(f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}'), report))
+
+
+@pytest.mark.parametrize('name', [
+    'directory', 'reports' + os.sep, os.path.join('reports', 'sub', ''), os.path.join('reports', '.'),
+])
+def test_reconciliation_report_path_names_a_directory(tmp_path, name):
+    """
+    A report path naming a directory, existing or not, is an error as the
+    configuration is read, and creates no directory.
+    """
+    (tmp_path / 'directory').mkdir()
+
+    with pytest.raises(ValueError, match="'reconciliation_report' value .* names a directory"):
+        load_with_report(f'{tmp_path}{os.sep}{name}')
+    assert not (tmp_path / 'reports').exists()
+
+
+def test_reconciliation_report_path_not_writable(tmp_path):
+    """A report path whose directory cannot be created is an error as the configuration is read."""
+    not_a_directory = tmp_path / 'file'
+    not_a_directory.write_text('', encoding='utf-8')
+
+    with pytest.raises(ValueError, match="'reconciliation_report' value .* cannot be created"):
+        load_with_report(not_a_directory / 'report.jsonl')
+
+
+@pytest.mark.parametrize('target', ['missing directory', 'loop'])
+def test_reconciliation_report_path_of_a_link_not_writable(tmp_path, target):
+    """A link the report cannot be written through is an error as the configuration is read."""
+    report = tmp_path / 'report.jsonl'
+    try:
+        os.symlink(tmp_path / 'missing' / 'report.jsonl' if target == 'missing directory' else report, report)
+    except (OSError, NotImplementedError):
+        pytest.skip('links cannot be created')
+
+    with pytest.raises(ValueError, match="'reconciliation_report' value .* is not a path the report can be written to"):
+        load_with_report(report)
+
+
+def test_reconciliation_report_path_created_with_its_directory_only(tmp_path):
+    """Reading the configuration creates the directory of the report, but not the report."""
+    report = tmp_path / 'reports' / 'report.jsonl'
+
+    load_with_report(report)
+
+    assert (tmp_path / 'reports').is_dir()
+    assert not report.exists()
+
+
+@pytest.mark.parametrize('denied, accepted', [('directory', True), ('file', False)])
+def test_reconciliation_report_existing_file(tmp_path, monkeypatch, denied, accepted):
+    """
+    An existing report file, or a device such as /dev/stdout, needs only to be
+    writable itself, whatever its directory.
+    """
+    report = tmp_path / 'reports' / 'report.jsonl'
+    report.parent.mkdir()
+    report.write_text('a report of an earlier run\n', encoding='utf-8')
+    denied_path = os.fspath(report.parent if denied == 'directory' else report)
+    access = os.access
+    monkeypatch.setattr(os, 'access', lambda path, mode, *args, **kwargs: (
+        False if os.fspath(path) == denied_path and mode & os.W_OK else access(path, mode, *args, **kwargs)
+    ))
+
+    if not accepted:
+        with pytest.raises(ValueError, match="'reconciliation_report' value .* the file is not writable"):
+            load_with_report(report)
+        return
+    loaded = load_with_report(report)
+    monkeypatch.undo()
+
+    morph_kgc.materialize(loaded)
+
+    assert [record['value'] for record in read_report(report)] == [NOT_A_DISEASE]
+
+
+@pytest.mark.skipif(
+    sys.platform == 'win32' or os.geteuid() == 0,
+    reason='the permissions of a directory are not enforced on Windows, nor for root',
+)
+def test_reconciliation_report_path_in_a_directory_not_writable(tmp_path):
+    """A report to be created in a directory that cannot be written to is an error as the configuration is read."""
+    read_only = tmp_path / 'read-only'
+    read_only.mkdir()
+    read_only.chmod(0o555)
+    try:
+        with pytest.raises(ValueError, match="'reconciliation_report' value .* is not a path the report can be written to"):
+            load_with_report(read_only / 'report.jsonl')
+    finally:
+        read_only.chmod(0o755)
+
+
+def test_reconciliation_report_leaves_out_a_line_not_written_whole(tmp_path, caplog):
+    """
+    A line of outcomes a process could not finish writing (a worker terminated
+    as the run is aborted) is left out of the report, with a warning.
+    """
+    import json
+    from types import SimpleNamespace
+
+    from morph_kgc.functions.outcomes import report_outcomes
+
+    state_dir = tmp_path / 'state'
+    state_dir.mkdir()
+    counts = {'counts': {'NO_MATCH': 1}, 'execution_id': '#E', 'function_iri': 'urn:f'}
+    record = {
+        'key': ['#E', 'NO_MATCH', 'v'],
+        'rule': {'triples_map': '#TM', 'source': 'data.csv', 'data_source': 'DataSource'},
+        'record': {'outcome': 'NO_MATCH', 'value': 'v', 'function_iri': 'urn:f', 'execution_id': '#E'},
+    }
+    (state_dir / 'outcomes-1.jsonl').write_text(
+        f'{json.dumps(counts)}\n{json.dumps(record)}\n{json.dumps(record)[:30]}',
+        encoding='ascii', newline='\n',
+    )
+    report = tmp_path / 'report.jsonl'
+
+    report_outcomes(str(state_dir), SimpleNamespace(
+        reconciliation_report=str(report),
+        data_sources={'DataSource': SimpleNamespace(mappings=['mapping.ttl'])},
+    ))
+
+    assert read_report(report) == [{
+        'outcome': 'NO_MATCH', 'value': 'v', 'function_iri': 'urn:f', 'execution_id': '#E',
+        'triples_maps': ['#TM'], 'sources': ['data.csv'], 'data_sources': ['DataSource'],
+        'mappings': ['mapping.ttl'],
+    }]
+    assert [record.getMessage() for record in caplog.records if record.levelname == 'WARNING'] == [
+        f"Line 3 of '{state_dir / 'outcomes-1.jsonl'}' is not a whole outcome, it is left out."
+    ]
+
+
+def test_outcomes_argument_named_as_another(tmp_path):
+    """A function cannot receive its outcomes under the name of another argument."""
+    from morph_kgc.functions.bif_decorator import make_stateful_decorator
+
+    with pytest.raises(ValueError, match="declares 'context' as its outcomes argument"):
+        make_stateful_decorator({})(
+            fun_id='http://example.com/f', initializer=lambda: {}, outcomes_parameter='context',
+        )(lambda value, context: value)

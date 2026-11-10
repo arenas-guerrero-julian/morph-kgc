@@ -57,6 +57,7 @@ from typing import Any, Optional
 from ..config.defaults import DEFAULT_STATE_MEMORY_LIMIT
 from ..constants import LOGGING_NAMESPACE, RML_CONSTANT
 from .model import FNMLExecution
+from .outcomes import forget_outcomes
 from .registry import FunctionRegistry
 from .tables import ParquetTable, close_connections, write_table
 
@@ -430,6 +431,7 @@ def release_contexts(session: Optional[ContextSession]) -> None:
     for cache_key in [key for key in list(_LOADED_CONTEXTS) if key[0] == session.path]:
         _LOADED_CONTEXTS.pop(cache_key, None)
     close_connections(session.path)
+    forget_outcomes(session.path)
 
     shutil.rmtree(session.path, ignore_errors=True)
     LOGGER.debug(f"State directory '{session.path}' removed.")
