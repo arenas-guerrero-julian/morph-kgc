@@ -581,6 +581,12 @@ def _constant(initialization, execution, parameter_iri) -> str:
     return values[0]
 
 
+def _listed(items, quoted=True) -> str:
+    """*items* as a list in a sentence: 'a', 'b' and 'c'."""
+    items = [f"'{item}'" if quoted else str(item) for item in items]
+    return items[0] if len(items) == 1 else f"{', '.join(items[:-1])} and {items[-1]}"
+
+
 def _endpoint_resource(initialization, endpoint: str) -> ResourceConfig:
     """
     The SPARQL endpoint at the URL *endpoint*: the resource of the configuration
@@ -647,14 +653,15 @@ def _initialize_sparql(initialization) -> QueryContext:
 
     Each execution of the function pairs a query with its endpoint, so a mapping
     may reconcile against several knowledge graphs. A query sent to the same
-    endpoint by several executions is sent once.
+    endpoint by several executions is sent once, which is logged, and its
+    answer indexed for each way of matching values of those executions.
     """
     # A mistake in an execution, or in the resource declaring an endpoint, is
     # reported before any query is sent.
     context = QueryContext()
     # (endpoint, query) -> the resource declaring the endpoint, the number of
-    # values the executions sending the query reconcile, with the first of them,
-    # and the ways they match values, each indexed from the same answer
+    # values the executions sending the query reconcile, the executions, and
+    # the ways they match values, each indexed from the same answer
     queries = {}
     for execution in initialization.executions:
         endpoint = _constant(initialization, execution, MORPH_FN_SPARQL_ENDPOINT_URL)
@@ -666,10 +673,12 @@ def _initialize_sparql(initialization) -> QueryContext:
         if (endpoint, query) not in queries:
             resource = _endpoint_resource(initialization, endpoint)
             context.ambiguities[endpoint] = _resource_ambiguity(initialization, resource)
-            queries[(endpoint, query)] = (resource, values, execution.execution_id, {matching: None})
+            queries[(endpoint, query)] = (resource, values, [execution.execution_id], {matching: None})
             continue
 
-        _, other_values, other, matchings = queries[(endpoint, query)]
+        _, other_values, executions, matchings = queries[(endpoint, query)]
+        other = executions[0]
+        executions.append(execution.execution_id)
         matchings[matching] = None
         if values != other_values:
             raise ValueError(
@@ -680,7 +689,15 @@ def _initialize_sparql(initialization) -> QueryContext:
                 f"?{sparql.MATCHING_VARIABLE_PREFIX}<i> variables it projects."
             )
 
-    for (endpoint, query), (resource, values, _, matchings) in queries.items():
+    for (endpoint, query), (resource, values, executions, matchings) in queries.items():
+        if len(executions) > 1:
+            LOGGER.info(
+                f"Executions {_listed(sorted(executions))} of function "
+                f"'{initialization.function_iri}' send the same query to SPARQL "
+                f"endpoint '{endpoint}': it is sent once, and its answer is indexed "
+                f"for {_listed(sorted(matching.lower() for matching in matchings), quoted=False)} "
+                "matching."
+            )
         context.indexes[(endpoint, query)] = sparql.build_index(
             resource,
             query,

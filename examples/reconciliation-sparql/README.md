@@ -73,8 +73,12 @@ another way of matching them, as against a vocabulary: `LOWERCASE` (lower-cased,
 and nothing else, as a Lucene index of keywords) or `CASE-INSENSITIVE`
 (normalized, with their whitespace collapsed, and case-folded), described in
 [`../reconciliation`](../reconciliation/README.md#ways-of-matching-values).
-Executions matching the answer to the same query differently share it: the
-query is sent once.
+Executions sending the same query to the same endpoint, whether they match
+values the same way or not, share its answer: the query is sent once, and its
+answer indexed once for each way of matching values they use. Which executions
+share a query is logged (`INFO`). A query is shared only when it is written the
+same, character for character, and sent to the endpoint the mapping names the
+same way.
 
 Morph-KGC matches the values itself, both those of the answer
 (`?matching_value_<i>`), as it indexes them, and those it reconciles, exactly
