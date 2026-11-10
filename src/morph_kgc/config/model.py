@@ -321,12 +321,30 @@ class MorphConfig:
         check_memory_limit(self.state_memory_limit)
 
     def _validate_reconciliation_report(self) -> None:
-        self.reconciliation_report = str(self.reconciliation_report or "").strip()
-        if self.reconciliation_report and os.path.isdir(self.reconciliation_report):
+        report = self.reconciliation_report = str(self.reconciliation_report or "").strip()
+        if not report:
+            return
+        if os.path.isdir(report):
             raise ValueError(
-                f"'reconciliation_report' value '{self.reconciliation_report}' is a "
+                f"'reconciliation_report' value '{report}' is a "
                 "directory. It must be the path of the file the report is written to, "
                 "e.g. 'reconciliation_report.jsonl'."
+            )
+        # The report is written once every rule is materialized: a path it cannot
+        # be written to fails the run before, as those of the other outputs do.
+        parent = Path(report).parent
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(
+                f"'reconciliation_report' value '{report}' is not a path the report "
+                f"can be written to: its directory '{parent}' cannot be created "
+                f"({exc.strerror or exc})."
+            ) from exc
+        if not os.access(parent, os.W_OK) or (os.path.exists(report) and not os.access(report, os.W_OK)):
+            raise ValueError(
+                f"'reconciliation_report' value '{report}' is not a path the report "
+                "can be written to: it is not writable."
             )
 
     def _validate_paths(self) -> None:

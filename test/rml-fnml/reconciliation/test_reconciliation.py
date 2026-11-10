@@ -3874,11 +3874,16 @@ def test_reconciliation_report(tmp_path, caplog, processes):
     ]
 
 
-def test_no_reconciliation_report_by_default(tmp_path, caplog):
+def test_no_reconciliation_report_by_default(caplog):
     """Without 'reconciliation_report', no report is written, but the executions are summarized."""
+    from morph_kgc.config.loaders import load_config
+
+    assert load_config(ambiguous_config(MAPPING)).reconciliation_report == ''
+
     morph_kgc.materialize(ambiguous_config(MAPPING))
 
-    assert not list(tmp_path.iterdir())
+    assert not [record for record in caplog.records
+                if record.getMessage().startswith('Reconciliation report written')]
     assert len(summaries(caplog)) == 1
 
 
@@ -3967,6 +3972,216 @@ def test_reconciliation_report_over_sparql(tmp_path, caplog):
             'normalized_value': ['a|1', 'icd-11'],
             **shared,
         },
+    ]
+
+
+def with_report(ini, report):
+    """*ini* writing the reconciliation report to *report*."""
+    return ini.replace('[CONFIGURATION]\n', f'[CONFIGURATION]\nreconciliation_report={report}\n')
+
+
+NOT_A_DISEASE = 'Not a disease in the vocabulary'
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report_one_record_per_execution(tmp_path, caplog, processes):
+    """A value two executions match to no concept is reported once for each, and each is summarized."""
+    report = tmp_path / 'report.jsonl'
+    morph_kgc.materialize(with_report(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}',
+        mapping=TWO_EXECUTIONS_MAPPING, processes=processes,
+    ), report))
+
+    records = [(record['execution_id'], record['outcome'], record['value']) for record in read_report(report)]
+    assert len(records) == len(set(records))
+    assert {(execution, value) for execution, _, value in records if value == NOT_A_DISEASE} == {
+        ('http://example.com/base/#AltLabelReconciliationExecution', NOT_A_DISEASE),
+        (DISEASE_EXECUTION, NOT_A_DISEASE),
+    }
+    assert len(summaries(caplog)) == 2
+
+
+def test_reconciliation_report_one_record_per_resource(tmp_path):
+    """A value matched to no concept of either of the resources its rows name is reported for each."""
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        f'pid,disease_label,vocabulary\npid_00001,{NOT_A_DISEASE},vocabulary_a\n'
+        f'pid_00002,{NOT_A_DISEASE},vocabulary_b\n',
+        encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValue "disease_vocabulary"', 'rml:inputValueMap [ rml:reference "vocabulary" ]'),
+    )
+    report = tmp_path / 'report.jsonl'
+
+    morph_kgc.materialize(two_vocabularies_config(
+        mapping, url_a=VOCABULARY, configuration=f'reconciliation_report={report}',
+    ))
+
+    assert [(record['resource'], record['outcome'], record['value']) for record in read_report(report)] == [
+        ('vocabulary_a', 'NO_MATCH', NOT_A_DISEASE), ('vocabulary_b', 'NO_MATCH', NOT_A_DISEASE),
+    ]
+
+
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report_gathers_the_candidates_of_every_row(tmp_path, processes):
+    """
+    A value matched against attributes read from the data, to several concepts
+    in each row, is reported once, with the concepts of all of its rows.
+    """
+    vocabulary = tmp_path / 'vocabulary.ttl'
+    vocabulary.write_text(
+        '@prefix skos: <http://www.w3.org/2004/02/skos/core#> .\n'
+        '<https://ex.org/A> a skos:Concept ; skos:prefLabel "X" .\n'
+        '<https://ex.org/B> a skos:Concept ; skos:prefLabel "X" .\n'
+        '<https://ex.org/C> a skos:Concept ; skos:prefLabel "Y" ; skos:altLabel "X" .\n'
+        '<https://ex.org/D> a skos:Concept ; skos:prefLabel "Z" ; skos:altLabel "X" .\n',
+        encoding='utf-8',
+    )
+    patients = tmp_path / 'patients.csv'
+    patients.write_text(
+        f'pid,disease_label,attribute\np1,X,{SKOS}prefLabel\np2,X,{SKOS}altLabel\n', encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()),
+        ('rml:inputValue skos:prefLabel , skos:altLabel', 'rml:inputValueMap [ rml:reference "attribute" ]'),
+    )
+    report = tmp_path / 'report.jsonl'
+
+    g_morph = morph_kgc.materialize(with_report(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={vocabulary}', mapping=mapping, processes=processes,
+    ), report))
+
+    candidates = [f'https://ex.org/{concept}' for concept in 'ABCD']
+    assert reconciled(g_morph) == {
+        ('p1', candidates[0]), ('p1', candidates[1]), ('p2', candidates[2]), ('p2', candidates[3]),
+    }
+    assert [(record['outcome'], record['value'], record['candidates']) for record in read_report(report)] == [
+        ('MULTIPLE_MATCH', 'X', candidates),
+    ]
+
+
+@pytest.mark.parametrize('report', [False, True])
+def test_reconciliation_report_of_the_values_of_a_nested_function(tmp_path, report):
+    """
+    The values a nested function returns, of any type, are reconciled as
+    strings, and reported as such: reporting them never fails the run.
+    """
+    udfs = tmp_path / 'udfs.py'
+    udfs.write_text(
+        'from decimal import Decimal\n\n'
+        "@udf(fun_id='http://example.com/length', "
+        "text='http://users.ugent.be/~bjdmeest/function/grel.ttl#valueParam')\n"
+        'def length(text):\n'
+        '    return Decimal(len(text))\n',
+        encoding='utf-8',
+    )
+    mapping = mapping_copy(
+        tmp_path,
+        ('rml:inputValueMap [ rml:reference "disease_label" ]',
+         'rml:inputValueMap [ rml:functionExecution <#LengthExecution> ]'),
+    )
+    with open(mapping, 'a', encoding='utf-8', newline='\n') as f:
+        f.write(
+            '\n<#LengthExecution>\n'
+            '    rml:function <http://example.com/length> ;\n'
+            '    rml:input [\n'
+            '        rml:parameter grel:valueParam ;\n'
+            '        rml:inputValueMap [ rml:reference "disease_label" ]\n'
+            '    ] .\n'
+        )
+    report_path = tmp_path / 'report.jsonl'
+    ini = config(f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}', mapping=mapping).replace(
+        '[CONFIGURATION]\n', f'[CONFIGURATION]\nudfs={udfs}\n',
+    )
+
+    g_morph = morph_kgc.materialize(with_report(ini, report_path) if report else ini)
+
+    assert not reconciled(g_morph)
+    if report:
+        with open(os.path.join(TEST_DIR, 'patients.csv'), encoding='utf-8') as f:
+            labels = [line.rstrip('\n').split(',', 1)[1] for line in f.readlines()[1:]]
+        # A record per distinct value: two of the labels are as long.
+        assert sorted((record['outcome'], record['value'], record['normalized_value'])
+                      for record in read_report(report_path)) == sorted(
+            {('NO_MATCH', str(len(label)), str(len(label))) for label in labels}
+        )
+
+
+@pytest.mark.parametrize('reconciles', [True, False])
+def test_reconciliation_report_emptied_when_nothing_is_reported(tmp_path, reconciles):
+    """
+    The report of a run reporting no value, matching every one or reconciling
+    none, replaces that of an earlier run.
+    """
+    if reconciles:
+        patients = tmp_path / 'patients.csv'
+        with open(os.path.join(TEST_DIR, 'patients.csv'), encoding='utf-8') as f:
+            # The rows of pid_00001 and pid_00002, which match a concept each.
+            patients.write_text(''.join(f.readlines()[:3]), encoding='utf-8')
+        mapping = mapping_copy(tmp_path, ('test/rml-fnml/reconciliation/patients.csv', patients.as_posix()))
+    else:
+        mapping = os.path.join(TEST_DIR, '..', '..', 'rml-core', 'csv', 'RMLTC0001a', 'mapping.ttl')
+    report = tmp_path / 'report.jsonl'
+    report.write_text('a report of an earlier run\n', encoding='utf-8')
+
+    morph_kgc.materialize(with_report(config(
+        f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}', mapping=mapping,
+    ), report))
+
+    assert report.read_text(encoding='utf-8') == ''
+
+
+def test_reconciliation_report_path_not_writable(tmp_path):
+    """A report path that cannot be written to is an error as the configuration is read."""
+    not_a_directory = tmp_path / 'file'
+    not_a_directory.write_text('', encoding='utf-8')
+
+    with pytest.raises(ValueError, match="'reconciliation_report' value .* cannot be created"):
+        morph_kgc.materialize(with_report(config(
+            f'resource_type=SKOS_VOCABULARY\nurl={VOCABULARY}',
+        ), not_a_directory / 'report.jsonl'))
+
+
+def test_reconciliation_report_leaves_out_a_line_not_written_whole(tmp_path, caplog):
+    """
+    A line of outcomes a process could not finish writing (a worker terminated
+    as the run is aborted) is left out of the report, with a warning.
+    """
+    import json
+    from types import SimpleNamespace
+
+    from morph_kgc.functions.outcomes import report_outcomes
+
+    state_dir = tmp_path / 'state'
+    state_dir.mkdir()
+    counts = {'counts': {'NO_MATCH': 1}, 'execution_id': '#E', 'function_iri': 'urn:f'}
+    record = {
+        'key': ['#E', 'NO_MATCH', 'v'],
+        'rule': {'triples_map': '#TM', 'source': 'data.csv', 'data_source': 'DataSource'},
+        'record': {'outcome': 'NO_MATCH', 'value': 'v', 'function_iri': 'urn:f', 'execution_id': '#E'},
+    }
+    (state_dir / 'outcomes-1.jsonl').write_text(
+        f'{json.dumps(counts)}\n{json.dumps(record)}\n{json.dumps(record)[:30]}',
+        encoding='ascii', newline='\n',
+    )
+    report = tmp_path / 'report.jsonl'
+
+    report_outcomes(str(state_dir), SimpleNamespace(
+        reconciliation_report=str(report),
+        data_sources={'DataSource': SimpleNamespace(mappings=['mapping.ttl'])},
+    ))
+
+    assert read_report(report) == [{
+        'outcome': 'NO_MATCH', 'value': 'v', 'function_iri': 'urn:f', 'execution_id': '#E',
+        'triples_maps': ['#TM'], 'sources': ['data.csv'], 'data_sources': ['DataSource'],
+        'mappings': ['mapping.ttl'],
+    }]
+    assert [record.getMessage() for record in caplog.records if record.levelname == 'WARNING'] == [
+        f"Line 3 of '{state_dir / 'outcomes-1.jsonl'}' is not a whole outcome, it is left out."
     ]
 
 

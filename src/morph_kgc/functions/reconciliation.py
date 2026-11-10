@@ -519,25 +519,26 @@ def _reconcile_rows(context, values, groups, lookup, outcomes=None) -> list:
     Reconcile *values*, the rows of each group of *groups* (key -> row
     numbers) with a single call to ``lookup(key, values)``, which returns the
     entities each value matches, what they are entities of, the policy for
-    ambiguous values, the way of matching values, and the fields naming what
-    they are entities of in the records of *outcomes*.
+    ambiguous values, the index the values are looked up in, and the fields
+    naming what they are entities of in the records of *outcomes*.
     """
     results = [None] * len(values)
     for key, rows in groups.items():
-        matches, target, ambiguity, matching, fields = lookup(key, [values[row] for row in rows])
+        matches, target, ambiguity, index, fields = lookup(key, [values[row] for row in rows])
         for row, row_matches in zip(rows, matches):
             if outcomes is not None:
                 # Before a value is reconciled, which may abort the run.
-                _report(outcomes, values[row], row_matches, matching, ambiguity, fields)
+                _report(outcomes, values[row], row_matches, index, ambiguity, fields)
             results[row] = _result(context, target, ambiguity, values[row], row_matches)
     return results
 
 
-def _report(outcomes, value, matches, matching, ambiguity, fields) -> None:
+def _report(outcomes, value, matches, index, ambiguity, fields) -> None:
     """
-    Count the outcome of reconciling *value*, and record it when it matches no
-    entity or several (see :mod:`morph_kgc.functions.outcomes`): the value as
-    read, and as looked up, how it was matched, and what it was matched against.
+    Count the outcome of reconciling *value* in *index*, and record it when it
+    matches no entity or several (see :mod:`morph_kgc.functions.outcomes`): the
+    value as read, and as looked up, how it was matched, and what it was matched
+    against.
     """
     if len(matches) == 1:
         outcomes.count("MATCH")
@@ -545,18 +546,23 @@ def _report(outcomes, value, matches, matching, ambiguity, fields) -> None:
     outcome = MULTIPLE_MATCH if matches else NO_MATCH
     outcomes.count(outcome)
 
-    components = list(value) if isinstance(value, (tuple, list)) else None
-    normalized = (
-        None if value is None
-        else [None if component is None else normalize(component, matching) for component in components]
-        if components is not None
-        else normalize(value, matching)
-    )
+    def as_looked_up(component):
+        # The value of a nested function may be of any type (a date, a
+        # decimal...): it is looked up, and so reported, as a string.
+        if component is None:
+            return None, None
+        return str(component), normalize(component, index.matching)
+
+    if index.arity > 1:
+        # A value of each of the components an entity is matched by.
+        reported, normalized = (list(column) for column in zip(*map(as_looked_up, value)))
+    else:
+        reported, normalized = as_looked_up(value)
     record = {
-        "value": components if components is not None else value,
+        "value": reported,
         "normalized_value": normalized,
         **fields,
-        "matching": matching,
+        "matching": index.matching,
     }
     if matches:
         record["ambiguity"] = ambiguity
@@ -607,7 +613,7 @@ def reconcile_vocabulary_concept(
             index.lookup_many(values, row_attributes),
             f"resource '{name}'",
             _row_ambiguity(row_ambiguity, context.ambiguity(name)),
-            index.matching,
+            index,
             {"resource": name},
         )
 
@@ -797,7 +803,7 @@ def reconcile_entity_over_sparql(
             index.lookup_many(values),
             f"SPARQL endpoint '{row_endpoint}'",
             _row_ambiguity(row_ambiguity, context.ambiguity(row_endpoint)),
-            index.matching,
+            index,
             {
                 "endpoint": row_endpoint,
                 "query_hash": sha256(row_query.encode("utf-8")).hexdigest(),

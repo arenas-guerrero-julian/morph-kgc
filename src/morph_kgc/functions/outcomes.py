@@ -23,6 +23,12 @@ execution, and writes one line per distinct record to the file the
 'reconciliation_report' option names, whatever the number of processes and of
 rows holding the value.
 
+A function reports the values it is called with, which are those of the rows
+that reach the term it computes: not those of a row any referenced column of
+the rule is missing in (na_values), nor those of a row an earlier term of the
+rule yields no value for (a subject reconciled to no entity, for instance,
+before its object is).
+
 Lifecycle
 ---------
 CURRENT_RULE
@@ -96,10 +102,15 @@ class Outcomes:
     def record(self, outcome: str, key, **fields) -> None:
         """
         Record a value handled with *outcome*, told apart from the others of
-        the execution by *key* (JSON-serializable), described by *fields*.
-        Each record is written once by each process, for each mapping rule.
+        the execution by *key*, described by *fields* (both JSON-serializable,
+        anything else written as a string). Each record is written once by each
+        process, for each mapping rule, and for each set of candidates, which
+        the report gathers.
         """
-        identity = json.dumps([self.execution_id, outcome, key, self._rule], sort_keys=True)
+        identity = json.dumps(
+            [self.execution_id, outcome, key, self._rule, sorted(map(str, fields.get("candidates", ())))],
+            sort_keys=True, default=str,
+        )
         with _WRITTEN_LOCK:
             written = _WRITTEN.setdefault(self._state_dir, set())
             if identity in written:
@@ -125,9 +136,9 @@ class Outcomes:
                 "counts": self._counts,
                 "execution_id": self.execution_id,
                 "function_iri": self.function_iri,
-            })
+            }, default=str)
         ]
-        lines += [json.dumps(record) for record in self._records]
+        lines += [json.dumps(record, default=str) for record in self._records]
         path = os.path.join(
             self._state_dir, f"{OUTCOMES_FILE_PREFIX}{os.getpid()}{OUTCOMES_FILE_SUFFIX}",
         )
@@ -150,16 +161,22 @@ def report_outcomes(state_dir: str, config) -> None:
     for each execution, and write the de-duplicated records to the
     'reconciliation_report' file, when the configuration names one: a line per
     distinct record, in JSON, its mapping rules gathered in lists. The file is
-    written (empty if need be) whenever it is named, so that it never holds
-    the report of an earlier run.
+    written (empty if need be) whenever it is named, so that once the rules are
+    materialized it never holds the report of an earlier run. A line a process
+    could not finish writing (a worker terminated as the run is aborted) is
+    left out.
     """
     counts: dict[tuple[str, str], dict[str, int]] = {}
     records: dict[str, dict] = {}
     files = sorted(glob.glob(os.path.join(glob.escape(state_dir), f"{OUTCOMES_FILE_PREFIX}*"))) if state_dir else []
     for path in files:
         with open(path, encoding="ascii") as outcomes_file:
-            for line in outcomes_file:
-                entry = json.loads(line)
+            for number, line in enumerate(outcomes_file, start=1):
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    LOGGER.warning(f"Line {number} of '{path}' is not a whole outcome, it is left out.")
+                    continue
                 if "counts" in entry:
                     execution = counts.setdefault((entry["execution_id"], entry["function_iri"]), {})
                     for outcome, rows in entry["counts"].items():
