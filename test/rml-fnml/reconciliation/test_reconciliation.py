@@ -3102,6 +3102,76 @@ def test_same_query_matched_two_ways_is_sent_once(tmp_path):
     assert objects_of(g_morph, 'enrolledIn') == UNAMBIGUOUS_STUDIES | {lowercased}
 
 
+def test_executions_sending_the_same_query_share_one_answer(tmp_path, caplog):
+    """
+    Four executions sending the same query to the same endpoint, two matching
+    values exactly and two case-insensitively, send it once, which is logged,
+    and its answer is indexed for each way of matching. An execution sending
+    another query sends it on its own.
+    """
+    with open(os.path.join(TEST_DIR, 'clinical_trials.csv'), encoding='utf-8') as f:
+        rows = f.read().replace('NCT07667218', 'nct07667218')
+    (tmp_path / 'clinical_trials.csv').write_text(rows, encoding='utf-8')
+    executions = {
+        'Exact1': ('EXACT', STUDIES_QUERY), 'Exact2': ('EXACT', STUDIES_QUERY),
+        'CaseInsensitive1': ('CASE-INSENSITIVE', STUDIES_QUERY),
+        'CaseInsensitive2': ('CASE-INSENSITIVE', STUDIES_QUERY),
+        'Drugs': ('EXACT', DRUGS_QUERY),
+    }
+    mapping = tmp_path / 'mapping.ttl'
+    mapping.write_text(
+        '@prefix rml: <http://w3id.org/rml/> .\n'
+        '@prefix grel: <http://users.ugent.be/~bjdmeest/function/grel.ttl#> .\n'
+        '@prefix morph-fn: <urn:morph:function:> .\n'
+        '@base <http://example.com/base/> .\n\n'
+        '<#PatientsMapping> a rml:TriplesMap ;\n'
+        '    rml:logicalSource [\n'
+        f'        rml:source "{str(tmp_path / "clinical_trials.csv").replace(chr(92), "/")}" ;\n'
+        '        rml:referenceFormulation rml:CSV\n'
+        '    ] ;\n'
+        + ''.join(
+            f'    rml:predicateObjectMap [ rml:predicate <https://example.org/ontology/{name}> ; '
+            f'rml:objectMap [ rml:functionExecution <#{name}> ; rml:termType rml:IRI ] ] ;\n'
+            for name in executions
+        )
+        + '    rml:subjectMap [ rml:template "urn:id:{patient_id}" ] .\n\n'
+        + ''.join(
+            f'<#{name}> rml:function morph-fn:reconcileEntityOverSPARQL ;\n'
+            '    rml:input [ rml:parameter morph-fn:sparqlEndpointUrl ; '
+            f'rml:inputValue "{MAPPING_ENDPOINT}" ] ;\n'
+            f'    rml:input [ rml:parameter morph-fn:sparqlQuery ; rml:inputValue """{query}""" ] ;\n'
+            '    rml:input [ rml:parameter grel:valueParam ; rml:inputValueMap [ rml:reference '
+            f'"{"drug" if name == "Drugs" else "clinical_trial_id"}" ] ] ;\n'
+            f'    rml:input [ rml:parameter morph-fn:matching ; rml:inputValue "{matching}" ] .\n'
+            for name, (matching, query) in executions.items()
+        ),
+        encoding='utf-8',
+    )
+    with VocabularyServer() as server:
+        g_morph = morph_kgc.materialize(sparql_config(
+            endpoint_resource(f'{server.url}/sparql'), mapping=str(mapping),
+        ))
+
+        assert sorted(server.requests) == sorted([('/sparql', STUDIES_QUERY), ('/sparql', DRUGS_QUERY)])
+
+    # The identifier of p1, lower-cased, is only matched case-insensitively.
+    lowercased = ('urn:id:p1', 'https://data.com/id/1')
+    for name in ('Exact1', 'Exact2'):
+        assert objects_of(g_morph, name) == UNAMBIGUOUS_STUDIES
+    for name in ('CaseInsensitive1', 'CaseInsensitive2'):
+        assert objects_of(g_morph, name) == UNAMBIGUOUS_STUDIES | {lowercased}
+    shared = [record.getMessage() for record in caplog.records if 'send the same query' in record.getMessage()]
+    assert shared == [
+        "Executions 'http://example.com/base/#CaseInsensitive1', "
+        "'http://example.com/base/#CaseInsensitive2', 'http://example.com/base/#Exact1' and "
+        "'http://example.com/base/#Exact2' of function "
+        "'urn:morph:function:reconcileEntityOverSPARQL' send the same query to SPARQL "
+        f"endpoint '{MAPPING_ENDPOINT}': it is sent once, and its answer is indexed for "
+        "case-insensitive and exact matching."
+    ]
+    assert all(record.levelname == 'INFO' for record in caplog.records if 'send the same query' in record.getMessage())
+
+
 @pytest.mark.parametrize('matching, expected', [
     ('EXACT', {('urn:id:p2', 'https://data.com/id/7')}),
     ('LOWERCASE', DIAGNOSES),
