@@ -58,7 +58,11 @@ in the configuration file, not in the mapping::
 
 It is a constant: what values are matched against is indexed before any data
 is read. Executions matching the same vocabulary differently share a single
-download of it, and both functions match values in the same ways.
+download of it. Both functions match values in the same ways, normalizing them
+themselves, both those they are matched against and those they reconcile: the
+same data, mapping and way of matching values give the same triples whether a
+vocabulary is read from a file or queried from a SPARQL endpoint holding it,
+the query returning its labels as they are.
 
 ``reconcileEntityOverSPARQL`` reconciles against the entities of any knowledge
 graph a SPARQL endpoint answers for. The mapping gives the endpoint and the

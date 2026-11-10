@@ -118,6 +118,12 @@ but for two characters: `LowerCaseFilter` lower-cases `İ` as `i`, where
 `σ`, where `str.lower()` gives `ς`. `CASE-INSENSITIVE` matches more, which may
 turn a value matching a single concept into an ambiguous one.
 
+`urn:morph:function:reconcileEntityOverSPARQL` matches values in the same ways,
+with the same results: the same data, mapping and way of matching values give
+the same triples whether the vocabulary is read from a file or queried from a
+SPARQL endpoint holding it (see
+[`../reconciliation-sparql`](../reconciliation-sparql/README.md)).
+
 ## Ambiguous values
 
 A value matching several concepts, such as a label that is the preferred label
