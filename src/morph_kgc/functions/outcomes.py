@@ -26,7 +26,8 @@ and of rows holding the value. The values themselves are never logged.
 A record gives the outcome, the value as read and as looked up, the function
 and its execution, the triples map, what the value was matched against (a
 resource, or an endpoint and the hash of its query), the entities it matched
-when several, and the source and mapping files of the triples map. A value an
+when several, and the source of the triples map and the mapping files
+declaring it. A value an
 execution handles for several triples maps (or against several resources) is
 one record, whose field names each of them, joined by ', '.
 
@@ -108,6 +109,7 @@ class Outcomes:
             "triples_map": rule.triples_map_id,
             "source": rule.logical_source.value,
             "data_source": rule.logical_source.config_section_name,
+            "mapping": [path for path in rule.mapping_files.split("\n") if path],
         }
         self._counts: dict[str, int] = {}
         self._records: list[dict] = []
@@ -231,7 +233,8 @@ def _gather(copies: dict, written: dict, rule: dict | None, mappings: dict) -> N
     if rule is not None:
         fields["triples_map"] = rule["triples_map"]
         fields["source"] = rule["source"]
-        fields["mapping"] = mappings.get(rule["data_source"], [])
+        # The files declaring the triples map, or else those of its section.
+        fields["mapping"] = rule.get("mapping") or mappings.get(rule["data_source"], [])
     for field, value in fields.items():
         values = copies.setdefault(field, [])
         if field == "mapping" or field in UNITED_FIELDS:
@@ -261,11 +264,11 @@ def _record(copies: dict) -> dict:
 
 def _summary(execution_id: str, function_iri: str, execution: dict, distinct: dict) -> str:
     """The summary of what *execution* reported, with its distinct records."""
+    # Every count of the outcomes of reconciliation, zero ones included, and
+    # those of any other outcome a function reports.
     parts = []
     for outcome in [*OUTCOME_NAMES, *sorted(set(execution) - set(OUTCOME_NAMES))]:
-        if outcome not in execution:
-            continue
-        part = f"{execution[outcome]} {OUTCOME_NAMES.get(outcome, outcome)}"
+        part = f"{execution.get(outcome, 0)} {OUTCOME_NAMES.get(outcome, outcome)}"
         if (execution_id, outcome) in distinct:
             part += f" ({distinct[(execution_id, outcome)]} distinct)"
         parts.append(part)

@@ -1777,12 +1777,20 @@ def ambiguous_config(mapping=MAPPING, resource_options='', processes=1, configur
 
 def logged_outcomes(caplog):
     """
-    The records of the log about the values reconciled, at any level: none, as
-    they go to the reconciliation report.
+    The records of the log about the values reconciled, at any level, however
+    worded (naming an outcome, a value or an entity it matched): none, as they
+    go to the reconciliation report.
     """
+    words = (
+        'MULTIPLE_MATCH', 'NO_MATCH', AMBIGUOUS_LABEL, NOT_A_DISEASE, NARCOLEPSY, ADCA_DN,
+        'NCT07667218', 'https://data.com/id/',
+    )
     return [
         record.getMessage() for record in caplog.records
-        if 'MULTIPLE_MATCH' in record.getMessage() or 'NO_MATCH' in record.getMessage()
+        if any(word in record.getMessage() for word in words)
+        # The URL a query is fetched from, logged when debugging, holds its text,
+        # which may name a value.
+        and not record.getMessage().startswith('Fetching ')
     ]
 
 
@@ -4066,6 +4074,38 @@ def test_reconciliation_report_joins_the_triples_maps_of_a_value(tmp_path, proce
     )]
 
 
+@pytest.mark.parametrize('processes', [1, 4])
+def test_reconciliation_report_names_the_mapping_files_declaring_the_triples_maps(tmp_path, processes):
+    """
+    'mapping' names the files declaring the triples maps reconciling a value,
+    joined when they are several, and not the other files of the section.
+    """
+    with open(MAPPING, encoding='utf-8') as f:
+        text = f.read()
+    prefixes = ''.join(line for line in text.splitlines(keepends=True) if line.startswith('@'))
+    patients, rest = text.split('<#DiseaseResourceMapping>', 1)
+    first, second, other = tmp_path / 'patients.ttl', tmp_path / 'diseases.ttl', tmp_path / 'other.ttl'
+    first.write_text(patients, encoding='utf-8', newline='\n')
+    second.write_text(prefixes + '<#DiseaseResourceMapping>' + rest, encoding='utf-8', newline='\n')
+    other.write_text(
+        prefixes + '<#Other> a rml:TriplesMap ;\n'
+        '    rml:logicalSource [ rml:source "test/rml-fnml/reconciliation/patients.csv" ;'
+        ' rml:referenceFormulation rml:CSV ] ;\n'
+        '    rml:subjectMap [ rml:template "urn:other:{pid}" ; rml:class sio:SIO_000393 ] .\n',
+        encoding='utf-8', newline='\n',
+    )
+    report = tmp_path / 'report.jsonl'
+
+    morph_kgc.materialize(ambiguous_config(
+        f'{first},{second},{other}', processes=processes, configuration=f'reconciliation_report={report}',
+    ))
+
+    records = read_report(report)
+    assert sorted(record['outcome'] for record in records) == ['MULTIPLE_MATCH', 'NO_MATCH']
+    # The execution, declared in the second file, is used by a triples map of each.
+    assert {record['mapping'] for record in records} == {', '.join(sorted([str(first), str(second)]))}
+
+
 def test_reconciliation_report_one_record_per_resource(tmp_path):
     """
     A value an execution matches to no concept of either of the resources its
@@ -4217,7 +4257,7 @@ def test_reconciliation_report_of_a_list_a_nested_function_returns(tmp_path):
 
 
 @pytest.mark.parametrize('reconciles', [True, False])
-def test_reconciliation_report_emptied_when_nothing_is_reported(tmp_path, reconciles):
+def test_reconciliation_report_emptied_when_nothing_is_reported(tmp_path, caplog, reconciles):
     """
     The report of a run reporting no value, matching every one or reconciling
     none, replaces that of an earlier run.
@@ -4238,6 +4278,11 @@ def test_reconciliation_report_emptied_when_nothing_is_reported(tmp_path, reconc
     ), report))
 
     assert report.read_text(encoding='utf-8') == ''
+    # The summary gives every count, the zero ones as well.
+    assert summaries(caplog) == ([
+        f"Execution '{DISEASE_EXECUTION}' of function '{VOCABULARY_FUNCTION}' handled 6 "
+        "value(s): 6 matched, 0 unmatched, 0 ambiguous."
+    ] if reconciles else [])
 
 
 def load_with_report(report):

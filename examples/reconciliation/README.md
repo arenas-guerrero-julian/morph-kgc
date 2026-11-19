@@ -189,7 +189,7 @@ vocabulary `disease_vocabulary_ambiguous.ttl` of the tests and `ambiguity=NONE`
 | `triples_map` | the triples map reconciling the value. |
 | `resource` | the resource reconciled against; `endpoint` and `query_hash` (SHA-256 of the query) for a SPARQL endpoint. |
 | `candidates` | for `MULTIPLE_MATCH`: the entities the value matches. |
-| `source`, `mapping` | the logical source of the triples map, and the mapping files of the section of the configuration file declaring it. |
+| `source`, `mapping` | the logical source of the triples map (its file path, or its query or table), and the mapping file declaring it. |
 
 An execution used by several triples maps, as the one of this example, records
 a value once: `triples_map` names each of them, sorted and joined by `, `, and
@@ -207,10 +207,10 @@ maps for the report to hold both.
 
 The values themselves are never logged. A summary of each execution is logged
 (`INFO`), counting the rows each mapping rule reconciled, without its
-duplicates, and the distinct values reported:
+duplicates, matched, unmatched and ambiguous, and the distinct values reported:
 
 ```
-Execution 'http://example.com/base/#DiseaseReconciliationExecution' of function 'urn:morph:function:reconciliation:reconcileVocabularyConcept' handled 6 value(s): 3 matched, 3 ambiguous (1 distinct).
+Execution 'http://example.com/base/#DiseaseReconciliationExecution' of function 'urn:morph:function:reconciliation:reconcileVocabularyConcept' handled 6 value(s): 3 matched, 0 unmatched, 3 ambiguous (1 distinct).
 ```
 
 ## YARRRML
