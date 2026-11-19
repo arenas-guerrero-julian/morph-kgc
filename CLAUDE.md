@@ -220,7 +220,6 @@ Other related changes:
 - It needs SQLAlchemy and PyYAML, which is not declared as a dependency.
 
 **Packaging**
-- The Dockerfile is stale: it uses Python 3.9, while the project requires `>=3.10`.
 - `utils.triples_to_file` and `utils.configure_logger` are dead code.
 - The `examples/` scripts are not tested; `examples/dict` is broken as shipped.
 
