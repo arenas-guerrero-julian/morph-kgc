@@ -61,7 +61,7 @@ CI (`.github/workflows/ci.yml`) runs `pytest` on ubuntu, windows and macos with 
    - `references.collect_references` lists the source columns the rule needs.
    - `load.load_data` calls `source.get_adapter(format_).get_data(...)`, then turns every value into `str`, drops rows holding na_values and drops duplicates.
    - For a referencing object map, `join.merge_data` inner-joins child and parent. Parent columns get the `parent_` prefix.
-   - `terms.materialize_terms` fills the `subject`, `predicate` and `object` columns: IRI encoding, literal escaping, lang/datatype/direction, FNML and `<<( s p o )>>` triple terms.
+   - `terms.materialize_terms` fills the `subject`, `predicate` and `object` columns: IRI encoding, literal escaping, lang/datatype/direction, FNML and `<<( s p o )>>` triple terms. Blank-node labels go through `terms.blank_node_label` (ASCII letters, digits and `-` kept, every other UTF-8 byte written `_XX`), so any value gives a valid, distinct label.
    - `assemble.assemble_triples` builds the `triple` column. The graph term is added only when the output is N-QUADS; with N-TRIPLES, graph maps are ignored.
 
    A rule with no references does not read its source; it materializes from a single dummy row.
@@ -207,7 +207,6 @@ Other related changes:
 - Unknown function IRIs raise KeyError only when a rule using them executes.
 - Parameter IRIs the decorator does not declare are silently ignored.
 - Function-valued object maps default to literals; reconciliation needs `rml:termType rml:IRI`.
-- Known broken built-in: `built-in.ttl#hash_iri` raises NameError, because `sha256` is imported only inside another function in `grel/other_functions.py`.
 - Several IRIs are registered twice, and the later definition wins: math_mod, string_contains, string_trim, string_md5, string_sha1, unicodestring-s.
 - Python function names do not always match the IRI. For example, `string_chomp` is implemented by a function named `string_contains`.
 - Never `eval` data. Use `grel/safe_eval.safe_eval_expression`.
